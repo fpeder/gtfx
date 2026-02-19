@@ -1,0 +1,7 @@
+build/
+.Xil
+xsim*
+*jou
+*log
+*str
+*pb
