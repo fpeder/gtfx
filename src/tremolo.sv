@@ -291,49 +291,60 @@ module tremolo #(
     // =========================================================================
     // 3. GAIN COMPUTATION
     //
-    // gain_q16 = (65535 - depth_norm) + depth_norm * lfo_norm
-    //          = 65535 - depth_norm * (65535 - lfo_norm)
+    // gain_q16 is a 17-bit unsigned value representing [0.0, 1.0] in Q1.16:
+    //   0x00000 = 0.0  (full attenuation)
+    //   0x10000 = 1.0  (unity gain, bit 16 set)
     //
-    // depth_norm = depth_val * 257  (maps 0..255 -> 0..65535)
+    // Formula:  gain = 1.0 - depth_norm * (1.0 - lfo_norm)
     //
-    // depth_norm * (65535 - lfo_norm) is 32-bit; take top 16 bits (>> 16)
-    // to get back to Q16, then subtract from 65535.
+    // depth_norm [16:0] in Q0.16:  depth_val * 257 -> [0, 0xFFFF]
+    //   depth=0   -> 0x00000  => no reduction => gain = 0x10000 (1.0 exactly)
+    //   depth=255 -> 0x0FFFF  => full range
     //
-    // gain_q16 is unsigned 16-bit [0, 65535] = [0.0, 1.0).
+    // one_minus_lfo = 0x10000 - lfo_norm  (17-bit, range [0x0002, 0x10000])
+    //
+    // mod_reduction = depth_norm * one_minus_lfo
+    //   max = 0xFFFF * 0x10000 = 0xFFFF_0000  (fits in 33 bits, held in 34)
+    //   >> 16 extracts the Q0.16 reduction, range [0x0000, 0xFFFF]
+    //   NOTE: must shift >> 16, NOT >> 17.  depth_norm is at most 16 significant
+    //   bits (0xFFFF), so the product is at most 33 bits; bit 33 is always 0.
+    //   Shifting >> 17 would discard the MSB of the 16-bit reduction, halving it.
+    //
+    // gain = 0x10000 - (mod_reduction >> 16)
+    //   min = 0x10000 - 0xFFFF = 0x00001  (depth=255, lfo=0  -> near silence)
+    //   max = 0x10000 - 0x0000 = 0x10000  (depth=0           -> unity, exact)
     // =========================================================================
-    logic [15:0] depth_norm;       // depth in Q16
-    logic [31:0] mod_depth;        // depth_norm * (1 - lfo_norm), Q32
-    logic [15:0] gain_q16;         // final gain [0, 65535]
+    logic [16:0] depth_norm;      // Q0.16 depth in 17-bit field, range [0, 0xFFFF]
+    logic [16:0] one_minus_lfo;   // (1.0 - lfo_norm) Q0.16, range [2, 0x10000]
+    logic [33:0] mod_reduction;   // depth * (1-lfo), 34-bit
+    logic [16:0] gain_q16_17;     // Q1.16 gain, 17-bit [0x00001, 0x10000]
 
     always_comb begin
-        depth_norm = {depth_val, depth_val[7:0]};  // 0..255 * 257 ≈ 0..65535
-        // (65535 - lfo_norm) is the amount of gain reduction at this LFO phase
-        mod_depth  = depth_norm * (16'hFFFF - lfo_norm);
-        // gain = 1.0 - depth * (1 - lfo)   (Q16)
-        gain_q16   = 16'hFFFF - mod_depth[31:16];
+        depth_norm    = {1'b0, depth_val, depth_val[7:0]};   // depth_val * 257
+        one_minus_lfo = 17'h10000 - {1'b0, lfo_norm};
+        mod_reduction = {17'h0, depth_norm} * {17'h0, one_minus_lfo};
+        gain_q16_17   = 17'h10000 - mod_reduction[32:16];    // >>16, NOT >>17
     end
 
     // =========================================================================
     // 4. AMPLITUDE MODULATION
     //
-    // output = audio_in * gain_q16  (>> 16 to remove Q16 fractional bits)
+    // output = audio_in * gain_q16_17  (>> 16 removes Q16 fractional bits)
     //
     // Overflow analysis:
-    //   |audio_in| <= 2^23 - 1  (full scale)
-    //   gain_q16  <= 0xFFFF = 65535 < 2^16
-    //   |product| <= (2^23 - 1) * (2^16 - 1) < 2^39
-    //   result = product >> 16, so |result| < 2^23 - 1 = SAT_MAX
-    //   => overflow is IMPOSSIBLE; no saturation guard needed.
+    //   |audio_in|   <= 2^23       (24-bit signed full scale)
+    //   gain_q16_17  <= 0x10000 = 2^16
+    //   |product|    <= 2^23 * 2^16 = 2^39  -> fits in 40 bits; result is exact.
     //
-    // product is WIDTH+17 = 41 bits (signed audio × unsigned gain zero-extended).
-    // result bits [WIDTH+15:16] = [39:16] give the 24-bit Q0.23 answer.
+    // product: signed 24-bit × unsigned 17-bit (zero-extended to 18-bit signed)
+    // = 42-bit signed. Result bits [WIDTH+15:16] = [39:16] give 24-bit output.
     // =========================================================================
-    logic signed [WIDTH+16:0]  product;   // 41 bits
+    logic signed [WIDTH+17:0]  product;   // 42 bits
     logic signed [WIDTH-1:0]   am_out;
 
     always_comb begin
-        product = $signed(audio_in) * $signed({1'b0, gain_q16});
-        am_out  = product[WIDTH+15:16];    // truncate Q16 fraction; never overflows
+        product = $signed(audio_in) * $signed({1'b0, gain_q16_17});
+        am_out  = product[WIDTH+15:16];
     end
 
     // =========================================================================

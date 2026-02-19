@@ -171,7 +171,7 @@ module tb_tremolo;
         audio_in  = MID_SCALE_POS;
         wait_samples(4);
 
-        // Allow 1 LSB rounding tolerance
+        // Allow 1 LSB tolerance for Q16 rounding (depth=0 gives gain=0x10000 = 1.0 exactly)
         check("bypass: out ≈ in (pos)", $signed(audio_out) >= ($signed(MID_SCALE_POS) - 1)
                                      && $signed(audio_out) <= ($signed(MID_SCALE_POS) + 1));
 
@@ -301,14 +301,15 @@ module tb_tremolo;
         audio_in  = FULL_SCALE_POS;
         wait_samples(4);
         check("sat: pos FS in, depth=0 -> pos FS out",
-              $signed(audio_out) >= $signed(FULL_SCALE_POS) - 1);
+              $signed(audio_out) == $signed(FULL_SCALE_POS));
 
         audio_in = FULL_SCALE_NEG;
         wait_samples(4);
         check("sat: neg FS in, depth=0 -> neg FS out",
-              $signed(audio_out) <= $signed(FULL_SCALE_NEG) + 1);
+              $signed(audio_out) == $signed(FULL_SCALE_NEG));
 
-        // Full depth + full scale: gain oscillates [0,~1], output must stay in [FS_NEG, FS_POS]
+        // Full depth + full scale: gain oscillates [~0, 1.0]; output stays in [0, FS_POS]
+        // At maximum attenuation gain=0x00001 (1/65536), so trough is ~64 counts, not 0.
         depth_val = 8'd255;
         shape_sel = 0;
         audio_in  = FULL_SCALE_POS;
@@ -319,8 +320,9 @@ module tb_tremolo;
             for (int i = 0; i < SAMPLES_PER_LFO * 2; i++) begin
                 @(posedge clk iff sample_en);
                 @(posedge clk);
+                // Output must be in [0, FS_POS]; never negative, never above input
                 if ($signed(audio_out) > $signed(FULL_SCALE_POS) ||
-                    $signed(audio_out) < 0)
+                    $signed(audio_out) < $signed(24'sh000000))
                     overflow = 1;
             end
             check("sat: full-depth + FS input never overflows or goes negative", !overflow);

@@ -8,6 +8,9 @@ module cmd #(
     input logic rst_n,
     input logic tx_din,
     output logic rx_dout,
+    
+    input  logic [ 3:0] sw_effect, 
+
     // DD3 delay controls
     output logic [7:0] tone_val,
     output logic [7:0] level_val,
@@ -63,6 +66,7 @@ module cmd #(
       .tone_val(tone_val),
       .level_val(level_val),
       .feedback_val(feedback_val),
+      .sw_effect(sw_effect),
       .time_val(time_val),
       .chorus_rate_val(chorus_rate_val),
       .chorus_depth_val(chorus_depth_val),

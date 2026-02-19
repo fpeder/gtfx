@@ -52,6 +52,7 @@ module top (
       .rst_n(resetn),
       .tx_din(uart_tx_din),
       .rx_dout(uart_rx_dout),
+      .sw_effect(sw_effect),
       .tone_val(tone_val),
       .level_val(level_val),
       .feedback_val(feedback_val),

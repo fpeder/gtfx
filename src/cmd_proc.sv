@@ -7,6 +7,11 @@ module cmd_proc (
     input  logic        tx_busy,
     output logic        tx_start,
     output logic [ 7:0] tx_byte,
+    
+    // Switches from top module to identify active effects
+    // sw[0]=trem, sw[1]=pha, sw[2]=cho, sw[3]=dly
+    input  logic [ 3:0] sw_effect, 
+
     // DD3 delay controls
     output logic [ 7:0] tone_val,
     output logic [ 7:0] level_val,
@@ -26,7 +31,6 @@ module cmd_proc (
     output logic [ 7:0] trem_depth_val,
     output logic        trem_shape_val
 );
-
   localparam logic [7:0] CHAR_CR  = 8'h0D;
   localparam logic [7:0] CHAR_LF  = 8'h0A;
   localparam logic [7:0] CHAR_BS  = 8'h08;
@@ -34,21 +38,25 @@ module cmd_proc (
   localparam logic [7:0] CHAR_SPC = 8'h20;
   localparam logic [7:0] CHAR_0   = 8'h30;
   localparam logic [7:0] CHAR_A   = 8'h41;
-
   localparam logic [7:0] MSG_PROMPT[0:5] = '{"A", "r", "t", "y", ">", " "};
   localparam int LEN_PROMPT = 6;
   localparam logic [7:0] MSG_OK[0:3]  = '{"O", "K", 8'h0D, 8'h0A};
   localparam int LEN_OK = 4;
   localparam logic [7:0] MSG_ERR[0:4] = '{"E", "r", "r", 8'h0D, 8'h0A};
   localparam int LEN_ERR = 5;
-
-  typedef enum logic [3:0] {
+  
+  // Expanded enum to 5 bits to safely fit the broken-down STATUS states
+  typedef enum logic [4:0] {
     S_BOOT,
     S_IDLE,
     S_RX_CHAR,
     S_BACKSPACE,
     S_CHECK_CMD,
-    S_PREP_STATUS,
+    S_PREP_STATUS_BYP,
+    S_PREP_STATUS_DLY,
+    S_PREP_STATUS_CHO,
+    S_PREP_STATUS_PHA,
+    S_PREP_STATUS_TRM,
     S_PARSE_INIT,
     S_PARSE_LOOP,
     S_TX_START,
@@ -56,7 +64,6 @@ module cmd_proc (
     S_LOAD_PROMPT,
     S_LOAD_STRING
   } state_t;
-
   state_t        state        = S_BOOT;
   state_t        return_state = S_IDLE;
 
@@ -65,7 +72,6 @@ module cmd_proc (
   logic   [ 7:0] tx_buf  [0:63];
   logic   [ 5:0] tx_len  = 0;
   logic   [ 5:0] tx_idx  = 0;
-
   // ---- Delay registers ----
   logic   [ 7:0] reg_tone  = 8'hFF;
   logic   [ 7:0] reg_level = 8'd128;
@@ -78,22 +84,19 @@ module cmd_proc (
   logic   [ 7:0] reg_ch_efx   = 8'd128;
   logic   [ 7:0] reg_ch_eqhi  = 8'd200;
   logic   [ 7:0] reg_ch_eqlo  = 8'd128;
-
   // ---- Phaser registers ----
   logic   [ 7:0] reg_pha_speed = 8'd80;
   logic          reg_pha_fben  = 1'b0;
-
   // ---- Tremolo registers ----
-  logic   [ 7:0] reg_trem_rate  = 8'd60;   // ~3.5 Hz default
-  logic   [ 7:0] reg_trem_depth = 8'd180;  // fairly deep
-  logic          reg_trem_shape = 1'b0;    // 0=sine, 1=triangle
+  logic   [ 7:0] reg_trem_rate  = 8'd60;
+  logic   [ 7:0] reg_trem_depth = 8'd180;
+  logic          reg_trem_shape = 1'b0;
 
   logic   [31:0] parse_acc = 0;
   logic   [ 5:0] parse_ptr = 0;
   logic   [ 3:0] target_reg = 0;
   logic          rx_pending = 0;
   logic   [ 7:0] rx_latch   = 0;
-
   assign tone_val         = reg_tone;
   assign level_val        = reg_level;
   assign feedback_val     = reg_fb;
@@ -119,6 +122,8 @@ module cmd_proc (
       cmd_idx    <= 0;
       tx_start   <= 0;
       rx_pending <= 0;
+      tx_byte    <= 0;
+      rx_latch   <= 0;
     end else begin
       if (rx_valid) begin
         rx_pending <= 1;
@@ -178,43 +183,23 @@ module cmd_proc (
           end else state <= S_IDLE;
         end
 
-        // ====================================================================
-        // Commands:
-        //   "st"                         -> status
-        //
-        //   "set dly level    XX"        -> target_reg 1
-        //   "set dly feedback XX"        -> target_reg 2
-        //   "set dly time     XXXXXXXX"  -> target_reg 3
-        //   "set dly tone     XX"        -> target_reg 4
-        //
-        //   "set cho rate  XX"           -> target_reg 5
-        //   "set cho depth XX"           -> target_reg 6
-        //   "set cho efx   XX"           -> target_reg 7
-        //   "set cho eqhi  XX"           -> target_reg 8
-        //   "set cho eqlo  XX"           -> target_reg 9
-        //
-        //   "set pha speed XX"           -> target_reg 10
-        //   "set pha fben  X"            -> target_reg 11
-        //
-        //   "set trm rate  XX"           -> target_reg 12
-        //   "set trm depth XX"           -> target_reg 13
-        //   "set trm shape X"            -> target_reg 14  (0=sine, 1=tri)
-        // ====================================================================
         S_CHECK_CMD: begin
           cmd_idx <= 0;
 
           if (cmd_buf[0] == "s" && cmd_buf[1] == "t"
               && (cmd_buf[2] == 8'h00 || cmd_buf[2] == " ")) begin
-            state <= S_PREP_STATUS;
-
+            // Route to appropriate status state machine phase
+            if (sw_effect == 4'b0000) state <= S_PREP_STATUS_BYP;
+            else                      state <= S_PREP_STATUS_DLY;
+            
           end else if (cmd_buf[0]=="s" && cmd_buf[1]=="e" && cmd_buf[2]=="t"
                     && cmd_buf[3]==" "
                     && cmd_buf[4]=="d" && cmd_buf[5]=="l" && cmd_buf[6]=="y"
                     && cmd_buf[7]==" ") begin
-            if      (cmd_buf[8]=="l")                          begin parse_ptr<=14; target_reg<=1;  state<=S_PARSE_INIT; end
-            else if (cmd_buf[8]=="f" && cmd_buf[9]=="e")       begin parse_ptr<=17; target_reg<=2;  state<=S_PARSE_INIT; end
-            else if (cmd_buf[8]=="t" && cmd_buf[9]=="i")       begin parse_ptr<=13; target_reg<=3;  state<=S_PARSE_INIT; end
-            else if (cmd_buf[8]=="t" && cmd_buf[9]=="o")       begin parse_ptr<=14; target_reg<=4;  state<=S_PARSE_INIT; end
+            if      (cmd_buf[8]=="l")                                  begin parse_ptr<=14; target_reg<=1;  state<=S_PARSE_INIT; end
+            else if (cmd_buf[8]=="f" && cmd_buf[9]=="e")               begin parse_ptr<=17; target_reg<=2;  state<=S_PARSE_INIT; end
+            else if (cmd_buf[8]=="t" && cmd_buf[9]=="i")               begin parse_ptr<=13; target_reg<=3;  state<=S_PARSE_INIT; end
+            else if (cmd_buf[8]=="t" && cmd_buf[9]=="o")               begin parse_ptr<=13; target_reg<=4;  state<=S_PARSE_INIT; end
             else begin tx_len<=LEN_ERR; tx_idx<=0; rx_latch<=3; state<=S_LOAD_STRING; return_state<=S_LOAD_PROMPT; end
 
           end else if (cmd_buf[0]=="s" && cmd_buf[1]=="e" && cmd_buf[2]=="t"
@@ -240,9 +225,6 @@ module cmd_proc (
                     && cmd_buf[3]==" "
                     && cmd_buf[4]=="t" && cmd_buf[5]=="r" && cmd_buf[6]=="m"
                     && cmd_buf[7]==" ") begin
-            // "set trm rate  XX"  -> "set trm rate " = 13 chars
-            // "set trm depth XX"  -> "set trm depth " = 14 chars
-            // "set trm shape X"   -> "set trm shape " = 14 chars
             if      (cmd_buf[8]=="r") begin parse_ptr<=13; target_reg<=12; state<=S_PARSE_INIT; end
             else if (cmd_buf[8]=="d") begin parse_ptr<=14; target_reg<=13; state<=S_PARSE_INIT; end
             else if (cmd_buf[8]=="s") begin parse_ptr<=14; target_reg<=14; state<=S_PARSE_INIT; end
@@ -254,54 +236,104 @@ module cmd_proc (
         end
 
         // ====================================================================
-        // Status: 3 lines
-        //   "DLY L:xx F:xx N:xx T:xxxxxxxx\r\n"   [0..30]
-        //   "CHO R:xx D:xx E:xx H:xx L:xx\r\n"    [31..60]
-        //   "PHA S:xx B:x  TRM R:xx D:xx W:x\r\n" [61..??]  -- reuse second tx pass
-        //
-        // Due to tx_buf[0:63] limit we print DLY+CHO in one pass,
-        // then PHA+TRM in a second immediate pass.
+        // Status Output Chain 
+        // Sequentially evaluates sw_effect and queues TX buffers
         // ====================================================================
-        S_PREP_STATUS: begin
-          // Line 1: Delay
-          tx_buf[0] <="D"; tx_buf[1] <="L"; tx_buf[2] <="Y"; tx_buf[3] <=" ";
-          tx_buf[4] <="L"; tx_buf[5] <=":";
-          tx_buf[6] <=n2h(reg_level[7:4]); tx_buf[7] <=n2h(reg_level[3:0]);
-          tx_buf[8] <=" "; tx_buf[9] <="F"; tx_buf[10]<=":";
-          tx_buf[11]<=n2h(reg_fb[7:4]); tx_buf[12]<=n2h(reg_fb[3:0]);
-          tx_buf[13]<=" "; tx_buf[14]<="N"; tx_buf[15]<=":";
-          tx_buf[16]<=n2h(reg_tone[7:4]); tx_buf[17]<=n2h(reg_tone[3:0]);
-          tx_buf[18]<=" "; tx_buf[19]<="T"; tx_buf[20]<=":";
-          tx_buf[21]<=n2h(reg_time[31:28]); tx_buf[22]<=n2h(reg_time[27:24]);
-          tx_buf[23]<=n2h(reg_time[23:20]); tx_buf[24]<=n2h(reg_time[19:16]);
-          tx_buf[25]<=n2h(reg_time[15:12]); tx_buf[26]<=n2h(reg_time[11:8]);
-          tx_buf[27]<=n2h(reg_time[7:4]);   tx_buf[28]<=n2h(reg_time[3:0]);
-          tx_buf[29]<=CHAR_CR; tx_buf[30]<=CHAR_LF;
-          // Line 2: Chorus
-          tx_buf[31]<="C"; tx_buf[32]<="H"; tx_buf[33]<="O"; tx_buf[34]<=" ";
-          tx_buf[35]<="R"; tx_buf[36]<=":";
-          tx_buf[37]<=n2h(reg_ch_rate[7:4]);  tx_buf[38]<=n2h(reg_ch_rate[3:0]);
-          tx_buf[39]<=" "; tx_buf[40]<="D"; tx_buf[41]<=":";
-          tx_buf[42]<=n2h(reg_ch_depth[7:4]); tx_buf[43]<=n2h(reg_ch_depth[3:0]);
-          tx_buf[44]<=" "; tx_buf[45]<="E"; tx_buf[46]<=":";
-          tx_buf[47]<=n2h(reg_ch_efx[7:4]);   tx_buf[48]<=n2h(reg_ch_efx[3:0]);
-          tx_buf[49]<=" "; tx_buf[50]<="H"; tx_buf[51]<=":";
-          tx_buf[52]<=n2h(reg_ch_eqhi[7:4]);  tx_buf[53]<=n2h(reg_ch_eqhi[3:0]);
-          tx_buf[54]<=" "; tx_buf[55]<="L"; tx_buf[56]<=":";
-          tx_buf[57]<=n2h(reg_ch_eqlo[7:4]);  tx_buf[58]<=n2h(reg_ch_eqlo[3:0]);
-          tx_buf[59]<=CHAR_CR; tx_buf[60]<=CHAR_LF;
-          // Line 3: Phaser + Tremolo  (fits in [61..63] only -- 3 chars used as start,
-          // rest on next implicit tx pass; use tx_len=61 and a secondary prep below)
-          // Simplest: use all 64 slots, line 3 starts at index 61.
-          // "PHA S:xx B:x\r\n" = 14 chars -> indices 61..74 -- beyond [0:63].
-          // SOLUTION: Limit status to DLY+CHO (tx_len=61), then immediately
-          // send PHA+TRM line from a second prep state below.
-          tx_len <= 61;
+        S_PREP_STATUS_BYP: begin
+          tx_buf[0]<="B"; tx_buf[1]<="Y"; tx_buf[2]<="P"; tx_buf[3]<="A"; 
+          tx_buf[4]<="S"; tx_buf[5]<="S"; tx_buf[6]<=CHAR_CR; tx_buf[7]<=CHAR_LF;
+          tx_len <= 8;
           tx_idx <= 0;
           return_state <= S_LOAD_PROMPT;
           state <= S_TX_START;
         end
 
+        S_PREP_STATUS_DLY: begin
+          if (sw_effect[3]) begin
+            tx_buf[0] <="D"; tx_buf[1] <="L"; tx_buf[2] <="Y"; tx_buf[3] <=" ";
+            tx_buf[4] <="L"; tx_buf[5] <=":";
+            tx_buf[6] <=n2h(reg_level[7:4]); tx_buf[7] <=n2h(reg_level[3:0]);
+            tx_buf[8] <=" "; tx_buf[9] <="F"; tx_buf[10]<=":";
+            tx_buf[11]<=n2h(reg_fb[7:4]); tx_buf[12]<=n2h(reg_fb[3:0]);
+            tx_buf[13]<=" "; tx_buf[14]<="N"; tx_buf[15]<=":";
+            tx_buf[16]<=n2h(reg_tone[7:4]); tx_buf[17]<=n2h(reg_tone[3:0]);
+            tx_buf[18]<=" "; tx_buf[19]<="T"; tx_buf[20]<=":";
+            tx_buf[21]<=n2h(reg_time[31:28]); tx_buf[22]<=n2h(reg_time[27:24]);
+            tx_buf[23]<=n2h(reg_time[23:20]); tx_buf[24]<=n2h(reg_time[19:16]);
+            tx_buf[25]<=n2h(reg_time[15:12]); tx_buf[26]<=n2h(reg_time[11:8]);
+            tx_buf[27]<=n2h(reg_time[7:4]);   tx_buf[28]<=n2h(reg_time[3:0]);
+            tx_buf[29]<=CHAR_CR; tx_buf[30]<=CHAR_LF;
+            tx_len <= 31;
+            tx_idx <= 0;
+            return_state <= S_PREP_STATUS_CHO;
+            state <= S_TX_START;
+          end else begin
+            state <= S_PREP_STATUS_CHO;
+          end
+        end
+
+        S_PREP_STATUS_CHO: begin
+          if (sw_effect[2]) begin
+            tx_buf[0]<="C"; tx_buf[1]<="H"; tx_buf[2]<="O"; tx_buf[3]<=" ";
+            tx_buf[4]<="R"; tx_buf[5]<=":";
+            tx_buf[6]<=n2h(reg_ch_rate[7:4]);  tx_buf[7]<=n2h(reg_ch_rate[3:0]);
+            tx_buf[8]<=" "; tx_buf[9]<="D"; tx_buf[10]<=":";
+            tx_buf[11]<=n2h(reg_ch_depth[7:4]); tx_buf[12]<=n2h(reg_ch_depth[3:0]);
+            tx_buf[13]<=" "; tx_buf[14]<="E"; tx_buf[15]<=":";
+            tx_buf[16]<=n2h(reg_ch_efx[7:4]);   tx_buf[17]<=n2h(reg_ch_efx[3:0]);
+            tx_buf[18]<=" "; tx_buf[19]<="H"; tx_buf[20]<=":";
+            tx_buf[21]<=n2h(reg_ch_eqhi[7:4]);  tx_buf[22]<=n2h(reg_ch_eqhi[3:0]);
+            tx_buf[23]<=" "; tx_buf[24]<="L"; tx_buf[25]<=":";
+            tx_buf[26]<=n2h(reg_ch_eqlo[7:4]);  tx_buf[27]<=n2h(reg_ch_eqlo[3:0]);
+            tx_buf[28]<=CHAR_CR; tx_buf[29]<=CHAR_LF;
+            tx_len <= 30;
+            tx_idx <= 0;
+            return_state <= S_PREP_STATUS_PHA;
+            state <= S_TX_START;
+          end else begin
+            state <= S_PREP_STATUS_PHA;
+          end
+        end
+
+        S_PREP_STATUS_PHA: begin
+          if (sw_effect[1]) begin
+            tx_buf[0] <="P"; tx_buf[1] <="H"; tx_buf[2] <="A"; tx_buf[3] <=" ";
+            tx_buf[4] <="S"; tx_buf[5] <=":";
+            tx_buf[6] <=n2h(reg_pha_speed[7:4]); tx_buf[7] <=n2h(reg_pha_speed[3:0]);
+            tx_buf[8] <=" "; tx_buf[9] <="B"; tx_buf[10]<=":";
+            tx_buf[11]<= reg_pha_fben ? "1" : "0";
+            tx_buf[12]<=CHAR_CR; tx_buf[13]<=CHAR_LF;
+            tx_len <= 14;
+            tx_idx <= 0;
+            return_state <= S_PREP_STATUS_TRM;
+            state <= S_TX_START;
+          end else begin
+            state <= S_PREP_STATUS_TRM;
+          end
+        end
+
+        S_PREP_STATUS_TRM: begin
+          if (sw_effect[0]) begin
+            tx_buf[0]<="T"; tx_buf[1]<="R"; tx_buf[2]<="M"; tx_buf[3]<=" ";
+            tx_buf[4]<="R"; tx_buf[5]<=":";
+            tx_buf[6]<=n2h(reg_trem_rate[7:4]); tx_buf[7]<=n2h(reg_trem_rate[3:0]);
+            tx_buf[8]<=" "; tx_buf[9]<="D"; tx_buf[10]<=":";
+            tx_buf[11]<=n2h(reg_trem_depth[7:4]); tx_buf[12]<=n2h(reg_trem_depth[3:0]);
+            tx_buf[13]<=" "; tx_buf[14]<="W"; tx_buf[15]<=":";
+            tx_buf[16]<= reg_trem_shape ? "1" : "0";
+            tx_buf[17]<=CHAR_CR; tx_buf[18]<=CHAR_LF;
+            tx_len <= 19;
+            tx_idx <= 0;
+            return_state <= S_LOAD_PROMPT;
+            state <= S_TX_START;
+          end else begin
+            state <= S_LOAD_PROMPT;
+          end
+        end
+
+        // ====================================================================
+        // Parse Engine
+        // ====================================================================
         S_PARSE_INIT: begin
           parse_acc <= 0;
           state <= S_PARSE_LOOP;
@@ -339,7 +371,8 @@ module cmd_proc (
             else if (target_reg == 13) reg_trem_depth <= parse_acc[7:0];
             else if (target_reg == 14) reg_trem_shape <= parse_acc[0];
             tx_len <= LEN_OK; tx_idx <= 0; rx_latch <= 2;
-            state <= S_LOAD_STRING; return_state <= S_LOAD_PROMPT;
+            state <= S_LOAD_STRING;
+            return_state <= S_LOAD_PROMPT;
           end
         end
 
