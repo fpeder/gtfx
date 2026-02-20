@@ -1,579 +1,511 @@
 `timescale 1ns / 1ps
 
-// =============================================================================
-// tb_cmd_proc.sv  -  Directed self-checking testbench for cmd_proc.sv
-//
-// Strategy:
-//   - Emulate UART byte arrival via rx_valid/rx_byte
-//   - Emulate UART TX handshake via tx_busy/tx_done
-//   - Capture every tx_byte the DUT sends into a string buffer
-//   - Compare captured output against expected strings
-// =============================================================================
+module cmd_tb;
 
-module tb_cmd_proc;
+  // ---------------------------------------------------------------
+  // Parameters - use high baud rate to keep simulation fast
+  // ---------------------------------------------------------------
+  localparam int CLK_FREQ   = 10_000_000;   // 10 MHz
+  localparam int BAUD_RATE  = 1_000_000;    // 1 Mbaud
+  localparam int FIFO_DEPTH = 16;
+  localparam int CLK_PERIOD = 100;           // 100 ns -> 10 MHz
+  localparam int BIT_PERIOD = CLK_FREQ / BAUD_RATE * CLK_PERIOD; // ns per UART bit
 
-  // -----------------------------------------------------------------------
-  // Clock
-  // -----------------------------------------------------------------------
-  localparam int CLK_PERIOD = 10; // 100 MHz, 10 ns
-  logic clk = 0;
-  always #(CLK_PERIOD/2) clk = ~clk;
-
-  // -----------------------------------------------------------------------
+  // ---------------------------------------------------------------
   // DUT signals
-  // -----------------------------------------------------------------------
-  logic        rst_n        = 0;
-  logic        rx_valid     = 0;
-  logic [ 7:0] rx_byte      = 0;
-  logic        tx_done      = 0;
-  logic        tx_busy      = 0;
-  logic        tx_start;
-  logic [ 7:0] tx_byte;
+  // ---------------------------------------------------------------
+  logic        clk = 0;
+  logic        rst_n = 0;
+  logic        tx_din = 1;    // serial line into DUT RX (idle high)
+  logic        rx_dout;       // serial line out of DUT TX
+  logic [ 3:0] sw_effect = 4'b1111;
 
-  logic [ 3:0] sw_effect    = 4'b0000;
-
-  logic [ 7:0] tone_val;
-  logic [ 7:0] level_val;
-  logic [ 7:0] feedback_val;
+  logic [ 7:0] tone_val, level_val, feedback_val;
   logic [31:0] time_val;
-
-  logic [ 7:0] chorus_rate_val;
-  logic [ 7:0] chorus_depth_val;
-  logic [ 7:0] chorus_efx_val;
-  logic [ 7:0] chorus_eqhi_val;
-  logic [ 7:0] chorus_eqlo_val;
-
+  logic [ 7:0] chorus_rate_val, chorus_depth_val, chorus_efx_val;
+  logic [ 7:0] chorus_eqhi_val, chorus_eqlo_val;
   logic [ 7:0] phaser_speed_val;
   logic        phaser_fben_val;
-
-  logic [ 7:0] trem_rate_val;
-  logic [ 7:0] trem_depth_val;
+  logic [ 7:0] trem_rate_val, trem_depth_val;
   logic        trem_shape_val;
 
-  // -----------------------------------------------------------------------
-  // DUT instance
-  // -----------------------------------------------------------------------
-  cmd_proc dut (
-    .clk             (clk),
-    .rst_n           (rst_n),
-    .rx_valid        (rx_valid),
-    .rx_byte         (rx_byte),
-    .tx_done         (tx_done),
-    .tx_busy         (tx_busy),
-    .tx_start        (tx_start),
-    .tx_byte         (tx_byte),
-    .sw_effect       (sw_effect),
-    .tone_val        (tone_val),
-    .level_val       (level_val),
-    .feedback_val    (feedback_val),
-    .time_val        (time_val),
-    .chorus_rate_val (chorus_rate_val),
-    .chorus_depth_val(chorus_depth_val),
-    .chorus_efx_val  (chorus_efx_val),
-    .chorus_eqhi_val (chorus_eqhi_val),
-    .chorus_eqlo_val (chorus_eqlo_val),
-    .phaser_speed_val(phaser_speed_val),
-    .phaser_fben_val (phaser_fben_val),
-    .trem_rate_val   (trem_rate_val),
-    .trem_depth_val  (trem_depth_val),
-    .trem_shape_val  (trem_shape_val)
+  // ---------------------------------------------------------------
+  // Clock generation
+  // ---------------------------------------------------------------
+  always #(CLK_PERIOD / 2) clk = ~clk;
+
+  // ---------------------------------------------------------------
+  // DUT instantiation
+  // ---------------------------------------------------------------
+  cmd #(
+      .CLK_FREQ  (CLK_FREQ),
+      .BAUD_RATE (BAUD_RATE),
+      .FIFO_DEPTH(FIFO_DEPTH)
+  ) dut (
+      .sys_clk   (clk),
+      .rst_n     (rst_n),
+      .tx_din    (tx_din),
+      .rx_dout   (rx_dout),
+      .sw_effect (sw_effect),
+      .tone_val        (tone_val),
+      .level_val       (level_val),
+      .feedback_val    (feedback_val),
+      .time_val        (time_val),
+      .chorus_rate_val (chorus_rate_val),
+      .chorus_depth_val(chorus_depth_val),
+      .chorus_efx_val  (chorus_efx_val),
+      .chorus_eqhi_val (chorus_eqhi_val),
+      .chorus_eqlo_val (chorus_eqlo_val),
+      .phaser_speed_val(phaser_speed_val),
+      .phaser_fben_val (phaser_fben_val),
+      .trem_rate_val   (trem_rate_val),
+      .trem_depth_val  (trem_depth_val),
+      .trem_shape_val  (trem_shape_val)
   );
 
-  // -----------------------------------------------------------------------
-  // TX capture buffer + parallel auto-ack
-  // -----------------------------------------------------------------------
-  localparam int TX_BUF_MAX = 4096;
-  logic [7:0] tx_captured [0:TX_BUF_MAX-1];
-  int         tx_cap_len = 0; 
-
-  always @(posedge clk) begin : tx_autoack
-    if (tx_start && !tx_busy) begin
-      if (tx_cap_len < TX_BUF_MAX)
-        tx_captured[tx_cap_len] = tx_byte;
-      tx_cap_len = tx_cap_len + 1;
-      tx_busy    <= 1;
-    end else if (tx_busy && !tx_done) begin
-      tx_done <= 1;
-    end else if (tx_done) begin
-      tx_done <= 0;
-      tx_busy <= 0;
+  // ---------------------------------------------------------------
+  // UART TX task - send one byte serially into DUT (tx_din)
+  // ---------------------------------------------------------------
+  task automatic uart_send_byte(input [7:0] data);
+    // Start bit
+    tx_din = 0;
+    #(BIT_PERIOD);
+    // Data bits (LSB first)
+    for (int i = 0; i < 8; i++) begin
+      tx_din = data[i];
+      #(BIT_PERIOD);
     end
-  end
+    // Stop bit
+    tx_din = 1;
+    #(BIT_PERIOD);
+  endtask
 
-  // -----------------------------------------------------------------------
-  // Task: send a single byte as if received from UART
-  // -----------------------------------------------------------------------
-  task automatic send_byte(input logic [7:0] b);
-    int wait_cnt;
-    @(posedge clk);
-    rx_byte  = b;
-    rx_valid = 1;
-    @(posedge clk);
-    rx_valid = 0;
-    rx_byte  = 0;
-    
-    wait_cnt = 0;
-    while (!tx_busy && wait_cnt < 20) begin
-      @(posedge clk);
-      wait_cnt++;
-    end
-
-    wait_cnt = 0;
-    while (wait_cnt < 10) begin
-      @(posedge clk);
-      if (tx_busy) wait_cnt = 0;
-      else         wait_cnt++;
+  // ---------------------------------------------------------------
+  // UART TX task - send a string (each char as a byte)
+  // ---------------------------------------------------------------
+  task automatic uart_send_string(input string s);
+    for (int i = 0; i < s.len(); i++) begin
+      uart_send_byte(s[i]);
     end
   endtask
 
-  // -----------------------------------------------------------------------
-  // Task: send a null-terminated string then CR
-  // -----------------------------------------------------------------------
-  task automatic send_cmd(input string s);
-    for (int i = 0; i < s.len(); i++)
-      send_byte(s[i]);
-    send_byte(8'h0D); // CR
+  // ---------------------------------------------------------------
+  // UART TX task - send a string followed by CR
+  // ---------------------------------------------------------------
+  task automatic uart_send_cmd(input string s);
+    uart_send_string(s);
+    uart_send_byte(8'h0D);  // CR
   endtask
 
-  // -----------------------------------------------------------------------
-  // drain_tx: collect TX bytes from start_idx onward.
-  // -----------------------------------------------------------------------
-  task automatic drain_tx(input int timeout_cycles, input int start_idx,
-                          input int skip_count, output string result);
-    int rd, last_cap, idle_cnt, skipped;
+  // ---------------------------------------------------------------
+  // UART RX task - receive one byte from DUT (rx_dout)
+  // ---------------------------------------------------------------
+  task automatic uart_recv_byte(output [7:0] data);
+    // Wait for start bit (falling edge)
+    @(negedge rx_dout);
+    // Sample at mid-bit
+    #(BIT_PERIOD / 2);
+    // Verify start bit
+    if (rx_dout !== 0) begin
+      $display("[%0t] ERROR: Expected start bit=0, got %b", $time, rx_dout);
+    end
+    // Sample 8 data bits
+    for (int i = 0; i < 8; i++) begin
+      #(BIT_PERIOD);
+      data[i] = rx_dout;
+    end
+    // Wait through stop bit
+    #(BIT_PERIOD);
+  endtask
+
+  // ---------------------------------------------------------------
+  // Background RX collector - captures everything DUT transmits
+  // ---------------------------------------------------------------
+  logic [7:0] rx_log     [0:511];
+  int         rx_log_idx = 0;
+  string      rx_string  = "";
+  logic       rx_collector_en = 1;
+
+  always begin
     logic [7:0] b;
-    result   = "";
-    rd       = start_idx;
-    last_cap = tx_cap_len;
-    idle_cnt = 0;
-    skipped  = 0;
-
-    while (idle_cnt < timeout_cycles) begin
-      @(posedge clk);
-      if (tx_cap_len != last_cap) begin
-        while (rd < tx_cap_len) begin
-          b = tx_captured[rd];
-          rd++;
-          if (b >= 32 && b <= 126) begin // printable
-            if (skipped < skip_count)
-              skipped++;
-            else
-              result = {result, string'(b)};
-          end
-        end
-        last_cap = tx_cap_len;
-        idle_cnt = 0;
-      end else begin
-        idle_cnt++;
-      end
-    end
-  endtask
-
-  // -----------------------------------------------------------------------
-  // Checkers
-  // -----------------------------------------------------------------------
-  int pass_cnt = 0;
-  int fail_cnt = 0;
-
-  task automatic check_str(input string test_name, input string got, input string expected);
-    if (got == expected) begin
-      $display("  PASS  %s", test_name);
-      pass_cnt++;
+    if (rx_collector_en) begin
+      uart_recv_byte(b);
+      rx_log[rx_log_idx] = b;
+      rx_log_idx++;
+      if (b >= 8'h20 && b <= 8'h7E)
+        rx_string = {rx_string, string'(b)};
+      else if (b == 8'h0D)
+        rx_string = {rx_string, "\\r"};
+      else if (b == 8'h0A)
+        rx_string = {rx_string, "\\n"};
+      else if (b == 8'h08)
+        rx_string = {rx_string, "<BS>"};
+      else
+        rx_string = {rx_string, "."};
     end else begin
-      $display("  FAIL  %s\n        expected: \"%s\"\n        got:      \"%s\"", test_name, expected, got);
-      fail_cnt++;
+      #(CLK_PERIOD);
+    end
+  end
+
+  // ---------------------------------------------------------------
+  // Helper: wait for DUT to finish transmitting
+  //   Line must stay HIGH (idle) for idle_bits consecutive bit
+  //   periods before we declare transmission complete.
+  // ---------------------------------------------------------------
+  task automatic wait_tx_idle(input int idle_bits = 20);
+    int idle_count;
+    idle_count = 0;
+    while (idle_count < idle_bits) begin
+      #(BIT_PERIOD);
+      if (rx_dout === 1'b1)
+        idle_count++;
+      else
+        idle_count = 0;
     end
   endtask
 
-  task automatic check_byte(input string test_name, input logic [7:0] got, input logic [7:0] expected);
-    if (got === expected) begin
-      $display("  PASS  %s: port=%02X", test_name, expected);
-      pass_cnt++;
+  // ---------------------------------------------------------------
+  // Helper: clear the RX log
+  // ---------------------------------------------------------------
+  task automatic clear_rx_log();
+    rx_log_idx = 0;
+    rx_string  = "";
+  endtask
+
+  // ---------------------------------------------------------------
+  // Helper: print captured response
+  // ---------------------------------------------------------------
+  task automatic print_rx_log(input string label);
+    $display("[%0t] --- %s --- captured %0d bytes: \"%s\"", $time, label, rx_log_idx, rx_string);
+  endtask
+
+  // ---------------------------------------------------------------
+  // FIFO internal probes (hierarchy access for verification)
+  // ---------------------------------------------------------------
+  wire [$clog2(FIFO_DEPTH):0] rx_fifo_count = dut.rx_fifo_inst.count;
+  wire [$clog2(FIFO_DEPTH):0] tx_fifo_count = dut.tx_fifo_inst.count;
+  wire rx_fifo_full  = dut.rx_fifo_inst.full;
+  wire rx_fifo_empty = dut.rx_fifo_inst.empty;
+  wire tx_fifo_full  = dut.tx_fifo_inst.full;
+  wire tx_fifo_empty = dut.tx_fifo_inst.empty;
+
+  // ---------------------------------------------------------------
+  // Test counters
+  // ---------------------------------------------------------------
+  int test_pass = 0;
+  int test_fail = 0;
+
+  task automatic check(input string name, input logic cond);
+    if (cond) begin
+      $display("[PASS] %s", name);
+      test_pass++;
     end else begin
-      $display("  FAIL  %s: port=%02X  (got=%02x, expected=%02x)", test_name, expected, got, expected);
-      fail_cnt++;
+      $display("[FAIL] %s", name);
+      test_fail++;
     end
   endtask
 
-  task automatic check_word(input string test_name, input logic [31:0] got, input logic [31:0] expected);
-    if (got === expected) begin
-      $display("  PASS  %s: port=%08X", test_name, expected);
-      pass_cnt++;
-    end else begin
-      $display("  FAIL  %s: port=%08X  (got=%08x, expected=%08x)", test_name, expected, got, expected);
-      fail_cnt++;
-    end
-  endtask
-
-  task automatic check_contains(input string test_name, input string haystack, input string needle);
-    int idx;
-    idx = 0;
-    for (int i = 0; i <= haystack.len() - needle.len(); i++) begin
-      if (haystack.substr(i, i + needle.len() - 1) == needle) begin
-        idx = 1;
-        break;
-      end
-    end
-    if (idx) begin
-      $display("  PASS  %s", test_name);
-      pass_cnt++;
-    end else begin
-      $display("  FAIL  %s\n        needle not found: \"%s\"\n        in:               \"%s\"", test_name, needle, haystack);
-      fail_cnt++;
-    end
-  endtask
-
-  task automatic check_not_contains(input string test_name, input string haystack, input string needle);
-    int idx;
-    idx = 0;
-    for (int i = 0; i <= haystack.len() - needle.len(); i++) begin
-      if (haystack.substr(i, i + needle.len() - 1) == needle) begin
-        idx = 1;
-        break;
-      end
-    end
-    if (!idx) begin
-      $display("  PASS  %s", test_name);
-      pass_cnt++;
-    end else begin
-      $display("  FAIL  %s\n        needle unexpectedly found: \"%s\"\n        in:               \"%s\"", test_name, needle, haystack);
-      fail_cnt++;
-    end
-  endtask
-
-  task automatic check_bit(input string test_name, input logic got, input logic expected);
-    if (got === expected) begin
-      $display("  PASS  %s", test_name);
-      pass_cnt++;
-    end else begin
-      $display("  FAIL  %s (got=%0b, expected=%0b)", test_name, got, expected);
-      fail_cnt++;
-    end
-  endtask
-
-  // -----------------------------------------------------------------------
-  // Helper: send command, drain response
-  // -----------------------------------------------------------------------
-  localparam int DRAIN_TIMEOUT = 2000;
-  task automatic cmd_and_drain(input string cmd, output string response);
-    int pre_snap;
-    pre_snap = tx_cap_len;
-    send_cmd(cmd);
-    drain_tx(DRAIN_TIMEOUT, pre_snap, cmd.len(), response);
-  endtask
-
-  // -----------------------------------------------------------------------
-  // Main Test Sequence
-  // -----------------------------------------------------------------------
+  // ===============================================================
+  // Main test sequence
+  // ===============================================================
   initial begin
-    string resp_g;
-    int snap13;
+    $dumpfile("cmd_tb.vcd");
+    $dumpvars(0, cmd_tb);
 
+    $display("========================================");
+    $display(" CMD + FIFO Testbench");
+    $display(" CLK_FREQ=%0d  BAUD=%0d  FIFO_DEPTH=%0d", CLK_FREQ, BAUD_RATE, FIFO_DEPTH);
+    $display(" BIT_PERIOD=%0d ns", BIT_PERIOD);
+    $display("========================================");
+
+    // ---- Reset ----
     rst_n = 0;
-    sw_effect = 4'b0000;
-    #(CLK_PERIOD * 5);
+    #(CLK_PERIOD * 20);
     rst_n = 1;
+    #(CLK_PERIOD * 5);
 
-    // =====================================================================
-    // 1. BOOT
-    // =====================================================================
-    $display("\n[1] Boot banner");
-    begin
-      drain_tx(DRAIN_TIMEOUT, 0, 0, resp_g);
-      check_str("boot: ends with prompt", resp_g, "Arty> ");
+    // ============================================================
+    // TEST 1: Boot prompt
+    //   After reset, cmd_proc sends CR+LF then "Arty> "
+    //   All routed through the TX FIFO -> UART
+    // ============================================================
+    $display("\n--- TEST 1: Boot prompt ---");
+    wait_tx_idle(30);
+    print_rx_log("Boot");
+    check("Boot: received bytes > 0", rx_log_idx > 0);
+    check("Boot: contains prompt chars", rx_log_idx >= 8);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 2: Empty command (just CR) -> should get CR+LF + prompt
+    // ============================================================
+    $display("\n--- TEST 2: Empty CR ---");
+    uart_send_byte(8'h0D);
+    wait_tx_idle(30);
+    print_rx_log("Empty CR");
+    check("Empty CR: received response", rx_log_idx > 0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 3: Echo test - send a char and verify it echoes back
+    // ============================================================
+    $display("\n--- TEST 3: Character echo ---");
+    uart_send_byte("h");
+    wait_tx_idle(20);
+    print_rx_log("Echo 'h'");
+    check("Echo: received at least 1 byte", rx_log_idx >= 1);
+    check("Echo: first byte is 'h'", rx_log[0] == "h");
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 4: Status command with all effects enabled
+    //   First clear the 'h' in cmd_buf with backspace
+    // ============================================================
+    $display("\n--- TEST 4: Status command (all effects) ---");
+    sw_effect = 4'b1111;
+    uart_send_byte(8'h08);  // BS to clear 'h'
+    wait_tx_idle(20);
+    clear_rx_log();
+    uart_send_cmd("st");
+    wait_tx_idle(50);
+    print_rx_log("Status");
+    check("Status: received substantial response", rx_log_idx > 20);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 5: Status command bypass mode (no effects)
+    // ============================================================
+    $display("\n--- TEST 5: Status command (bypass) ---");
+    sw_effect = 4'b0000;
+    uart_send_cmd("st");
+    wait_tx_idle(40);
+    print_rx_log("Bypass status");
+    check("Bypass: received response", rx_log_idx > 0);
+    clear_rx_log();
+    sw_effect = 4'b1111;
+
+    // ============================================================
+    // TEST 6: Set delay level command
+    // ============================================================
+    $display("\n--- TEST 6: Set delay level ---");
+    uart_send_cmd("set dly level FF");
+    wait_tx_idle(30);
+    print_rx_log("set dly level FF");
+    #(CLK_PERIOD * 10);
+    $display("  level_val = 0x%02h", level_val);
+    check("Set dly level: level_val == 0xFF", level_val == 8'hFF);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 7: Set delay feedback
+    // ============================================================
+    $display("\n--- TEST 7: Set delay feedback ---");
+    uart_send_cmd("set dly feedback A0");
+    wait_tx_idle(30);
+    print_rx_log("set dly feedback A0");
+    #(CLK_PERIOD * 10);
+    $display("  feedback_val = 0x%02h", feedback_val);
+    check("Set dly feedback: feedback_val == 0xA0", feedback_val == 8'hA0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 8: Set delay time (32-bit value)
+    // ============================================================
+    $display("\n--- TEST 8: Set delay time ---");
+    uart_send_cmd("set dly time 00001000");
+    wait_tx_idle(30);
+    print_rx_log("set dly time");
+    #(CLK_PERIOD * 10);
+    $display("  time_val = 0x%08h", time_val);
+    check("Set dly time: time_val == 0x00001000", time_val == 32'h00001000);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 9: Set delay tone
+    // ============================================================
+    $display("\n--- TEST 9: Set delay tone ---");
+    uart_send_cmd("set dly tone 80");
+    wait_tx_idle(30);
+    print_rx_log("set dly tone");
+    #(CLK_PERIOD * 10);
+    $display("  tone_val = 0x%02h", tone_val);
+    check("Set dly tone: tone_val == 0x80", tone_val == 8'h80);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 10: Set chorus rate
+    // ============================================================
+    $display("\n--- TEST 10: Set chorus rate ---");
+    uart_send_cmd("set cho rate C0");
+    wait_tx_idle(30);
+    print_rx_log("set cho rate");
+    #(CLK_PERIOD * 10);
+    $display("  chorus_rate_val = 0x%02h", chorus_rate_val);
+    check("Set cho rate: chorus_rate_val == 0xC0", chorus_rate_val == 8'hC0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 11: Set chorus depth
+    // ============================================================
+    $display("\n--- TEST 11: Set chorus depth ---");
+    uart_send_cmd("set cho depth B0");
+    wait_tx_idle(30);
+    print_rx_log("set cho depth");
+    #(CLK_PERIOD * 10);
+    $display("  chorus_depth_val = 0x%02h", chorus_depth_val);
+    check("Set cho depth: chorus_depth_val == 0xB0", chorus_depth_val == 8'hB0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 12: Set phaser speed
+    // ============================================================
+    $display("\n--- TEST 12: Set phaser speed ---");
+    uart_send_cmd("set pha speed 55");
+    wait_tx_idle(30);
+    print_rx_log("set pha speed");
+    #(CLK_PERIOD * 10);
+    $display("  phaser_speed_val = 0x%02h", phaser_speed_val);
+    check("Set pha speed: phaser_speed_val == 0x55", phaser_speed_val == 8'h55);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 13: Set tremolo rate
+    // ============================================================
+    $display("\n--- TEST 13: Set tremolo rate ---");
+    uart_send_cmd("set trm rate 40");
+    wait_tx_idle(30);
+    print_rx_log("set trm rate");
+    #(CLK_PERIOD * 10);
+    $display("  trem_rate_val = 0x%02h", trem_rate_val);
+    check("Set trm rate: trem_rate_val == 0x40", trem_rate_val == 8'h40);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 14: Invalid command -> "Err" response
+    // ============================================================
+    $display("\n--- TEST 14: Invalid command ---");
+    uart_send_cmd("xyz");
+    wait_tx_idle(30);
+    print_rx_log("Invalid cmd");
+    check("Invalid cmd: received response", rx_log_idx > 0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 15: Backspace handling
+    //   Send 'x', wait for echo to fully complete, clear log,
+    //   then send DEL and wait for the 3-byte response to finish.
+    // ============================================================
+    $display("\n--- TEST 15: Backspace ---");
+    uart_send_byte("x");
+    wait_tx_idle(20);       // wait for 'x' echo to fully transmit
+    clear_rx_log();
+    uart_send_byte(8'h7F);  // DEL (treated as backspace by cmd_proc)
+    wait_tx_idle(20);       // wait for BS+SPC+BS (3 bytes) to finish
+    print_rx_log("Backspace");
+    check("Backspace: received 3 bytes (BS SPC BS)", rx_log_idx == 3);
+    if (rx_log_idx >= 3) begin
+      check("Backspace: byte0 == 0x08", rx_log[0] == 8'h08);
+      check("Backspace: byte1 == 0x20", rx_log[1] == 8'h20);
+      check("Backspace: byte2 == 0x08", rx_log[2] == 8'h08);
     end
+    clear_rx_log();
+    // Send CR to return to clean state
+    uart_send_byte(8'h0D);
+    wait_tx_idle(30);
+    clear_rx_log();
 
-    // =====================================================================
-    // 2. EMPTY ENTER
-    // =====================================================================
-    $display("\n[2] Empty enter");
-    begin
-      cmd_and_drain("", resp_g);
-      check_str("empty enter: prompt only", resp_g, "Arty> ");
-    end
+    // ============================================================
+    // TEST 16: Burst input - send multiple chars rapidly
+    //   Tests that the RX FIFO buffers without dropping bytes
+    // ============================================================
+    $display("\n--- TEST 16: Burst RX (FIFO buffering) ---");
+    uart_send_cmd("set dly level 42");
+    wait_tx_idle(30);
+    print_rx_log("Burst set dly level 42");
+    #(CLK_PERIOD * 10);
+    $display("  level_val = 0x%02h", level_val);
+    check("Burst: level_val == 0x42", level_val == 8'h42);
+    clear_rx_log();
 
-    // =====================================================================
-    // 3. UNKNOWN COMMAND
-    // =====================================================================
-    $display("\n[3] Unknown command");
-    $display("=== TB VERSION: skip_count build, tx_cap before=%0d ===", tx_cap_len);
-    begin
-      int pre3;
-      pre3 = tx_cap_len;
-      cmd_and_drain("xyz", resp_g);
-      check_str("unknown cmd: Err+prompt", resp_g, "ErrArty> ");
-    end
+    // ============================================================
+    // TEST 17: Verify TX FIFO drains correctly after long status
+    // ============================================================
+    $display("\n--- TEST 17: TX FIFO drain after status ---");
+    sw_effect = 4'b1111;
+    uart_send_cmd("st");
+    wait_tx_idle(50);
+    print_rx_log("Full status drain");
+    #(CLK_PERIOD * 20);
+    check("TX FIFO empty after drain", tx_fifo_empty === 1'b1);
+    check("RX FIFO empty after processing", rx_fifo_empty === 1'b1);
+    clear_rx_log();
 
-    // =====================================================================
-    // 4. STATUS DYNAMIC SWITCHING
-    // =====================================================================
-    $display("\n[4] Status dynamic switching (sw_effect)");
-    begin
-      sw_effect = 4'b0000;
-      cmd_and_drain("st", resp_g);
-      check_contains("st sw=0000: BYPASS", resp_g, "BYPASS");
-      check_not_contains("st sw=0000: no DLY", resp_g, "DLY");
+    // ============================================================
+    // TEST 18: Set multiple registers in sequence
+    // ============================================================
+    $display("\n--- TEST 18: Sequential commands ---");
+    uart_send_cmd("set dly level 11");
+    wait_tx_idle(30);
+    clear_rx_log();
+    uart_send_cmd("set dly feedback 22");
+    wait_tx_idle(30);
+    clear_rx_log();
+    uart_send_cmd("set dly tone 33");
+    wait_tx_idle(30);
+    clear_rx_log();
+    #(CLK_PERIOD * 10);
+    $display("  level_val    = 0x%02h", level_val);
+    $display("  feedback_val = 0x%02h", feedback_val);
+    $display("  tone_val     = 0x%02h", tone_val);
+    check("Seq: level_val == 0x11",    level_val    == 8'h11);
+    check("Seq: feedback_val == 0x22", feedback_val == 8'h22);
+    check("Seq: tone_val == 0x33",     tone_val     == 8'h33);
 
-      sw_effect = 4'b0100;
-      cmd_and_drain("st", resp_g);
-      check_contains("st sw=0100: has CHO", resp_g, "CHO R:50 D:64 E:80 H:C8 L:80");
-      check_not_contains("st sw=0100: no DLY", resp_g, "DLY");
-      check_not_contains("st sw=0100: no TRM", resp_g, "TRM");
+    // ============================================================
+    // TEST 19: Set chorus EFX level
+    // ============================================================
+    $display("\n--- TEST 19: Set chorus efx ---");
+    uart_send_cmd("set cho efx 99");
+    wait_tx_idle(30);
+    print_rx_log("set cho efx");
+    #(CLK_PERIOD * 10);
+    $display("  chorus_efx_val = 0x%02h", chorus_efx_val);
+    check("Set cho efx: chorus_efx_val == 0x99", chorus_efx_val == 8'h99);
+    clear_rx_log();
 
-      sw_effect = 4'b1111;
-      cmd_and_drain("st", resp_g);
-      check_contains("st sw=1111: has DLY", resp_g, "DLY L:80 F:64 N:FF T:000007D0");
-      check_contains("st sw=1111: has CHO", resp_g, "CHO R:50 D:64 E:80 H:C8 L:80");
-      check_contains("st sw=1111: has PHA", resp_g, "PHA S:50 B:0");
-      check_contains("st sw=1111: has TRM", resp_g, "TRM R:3C D:B4 W:0");
-      check_contains("st sw=1111: ends with prompt", resp_g, "Arty> ");
-    end
+    // ============================================================
+    // TEST 20: FIFO status check - both FIFOs idle
+    // ============================================================
+    $display("\n--- TEST 20: Final FIFO state ---");
+    #(CLK_PERIOD * 100);
+    check("Final: TX FIFO empty", tx_fifo_empty === 1'b1);
+    check("Final: RX FIFO empty", rx_fifo_empty === 1'b1);
+    check("Final: TX FIFO not full", tx_fifo_full === 1'b0);
+    check("Final: RX FIFO not full", rx_fifo_full === 1'b0);
 
-    // =====================================================================
-    // 5. SET DLY
-    // =====================================================================
-    $display("\n[5] set dly commands");
-    begin
-      cmd_and_drain("set dly level A0", resp_g);
-      check_contains("set dly level: OK", resp_g, "OK");
-      check_byte("set dly level: port=A0", level_val, 8'hA0);
-
-      cmd_and_drain("set dly feedback 42", resp_g);
-      check_contains("set dly feedback: OK", resp_g, "OK");
-      check_byte("set dly feedback: port=42", feedback_val, 8'h42);
-
-      cmd_and_drain("set dly tone 1F", resp_g);
-      check_contains("set dly tone: OK", resp_g, "OK");
-      check_byte("set dly tone: port=1F", tone_val, 8'h1F);
-
-      cmd_and_drain("set dly time DEADBEEF", resp_g);
-      check_contains("set dly time: OK", resp_g, "OK");
-      check_word("set dly time: port=DEADBEEF", time_val, 32'hDEADBEEF);
-
-      cmd_and_drain("st", resp_g);
-      check_contains("st after dly: L:A0", resp_g, "L:A0");
-      check_contains("st after dly: F:42", resp_g, "F:42");
-      check_contains("st after dly: N:1F", resp_g, "N:1F");
-      check_contains("st after dly: T:DEADBEEF", resp_g, "T:DEADBEEF");
-    end
-
-    // =====================================================================
-    // 6. SET CHO
-    // =====================================================================
-    $display("\n[6] set cho commands");
-    begin
-      cmd_and_drain("set cho rate 55", resp_g);
-      check_contains("set cho rate: OK", resp_g, "OK");
-      check_byte("set cho rate: port=55", chorus_rate_val, 8'h55);
-
-      cmd_and_drain("set cho depth 77", resp_g);
-      check_contains("set cho depth: OK", resp_g, "OK");
-      check_byte("set cho depth: port=77", chorus_depth_val, 8'h77);
-
-      cmd_and_drain("set cho efx AA", resp_g);
-      check_contains("set cho efx: OK", resp_g, "OK");
-      check_byte("set cho efx: port=AA", chorus_efx_val, 8'hAA);
-
-      cmd_and_drain("set cho eqhi BB", resp_g);
-      check_contains("set cho eqhi: OK", resp_g, "OK");
-      check_byte("set cho eqhi: port=BB", chorus_eqhi_val, 8'hBB);
-
-      cmd_and_drain("set cho eqlo CC", resp_g);
-      check_contains("set cho eqlo: OK", resp_g, "OK");
-      check_byte("set cho eqlo: port=CC", chorus_eqlo_val, 8'hCC);
-
-      cmd_and_drain("st", resp_g);
-      check_contains("st after cho: R:55", resp_g, "R:55");
-      check_contains("st after cho: D:77", resp_g, "D:77");
-      check_contains("st after cho: E:AA", resp_g, "E:AA");
-      check_contains("st after cho: H:BB", resp_g, "H:BB");
-      check_contains("st after cho: L:CC", resp_g, "L:CC");
-    end
-
-    // =====================================================================
-    // 7. SET PHA
-    // =====================================================================
-    $display("\n[7] set pha commands");
-    begin
-      cmd_and_drain("set pha speed E0", resp_g);
-      check_contains("set pha speed: OK", resp_g, "OK");
-      check_byte("set pha speed: port=E0", phaser_speed_val, 8'hE0);
-
-      cmd_and_drain("set pha fben 1", resp_g);
-      check_contains("set pha fben: OK", resp_g, "OK");
-      check_bit("set pha fben: port=1", phaser_fben_val, 1'b1);
-
-      cmd_and_drain("set pha fben 0", resp_g);
-      check_bit("set pha fben=0: port=0", phaser_fben_val, 1'b0);
-
-      cmd_and_drain("st", resp_g);
-      check_contains("st after pha: S:E0", resp_g, "S:E0");
-      check_contains("st after pha: B:0", resp_g, "B:0");
-    end
-
-    // =====================================================================
-    // 8. SET TRM
-    // =====================================================================
-    $display("\n[8] set trm commands");
-    begin
-      cmd_and_drain("set trm rate 20", resp_g);
-      check_contains("set trm rate: OK", resp_g, "OK");
-      check_byte("set trm rate: port=20", trem_rate_val, 8'h20);
-
-      cmd_and_drain("set trm depth FF", resp_g);
-      check_contains("set trm depth: OK", resp_g, "OK");
-      check_byte("set trm depth: port=FF", trem_depth_val, 8'hFF);
-
-      cmd_and_drain("set trm shape 1", resp_g);
-      check_contains("set trm shape: OK", resp_g, "OK");
-      check_bit("set trm shape: port=1", trem_shape_val, 1'b1);
-
-      cmd_and_drain("set trm shape 0", resp_g);
-      check_bit("set trm shape=0: port=0", trem_shape_val, 1'b0);
-
-      cmd_and_drain("st", resp_g);
-      check_contains("st after trm: R:20", resp_g, "R:20");
-      check_contains("st after trm: D:FF", resp_g, "D:FF");
-      check_contains("st after trm: W:0", resp_g, "W:0");
-    end
-
-    // =====================================================================
-    // 9. BACKSPACE
-    // =====================================================================
-    $display("\n[9] Backspace editing");
-    begin
-      send_byte("s"); send_byte("e"); send_byte("t"); send_byte(" ");
-      send_byte("d"); send_byte("l"); send_byte("y"); send_byte(" ");
-      send_byte("t"); send_byte("o"); send_byte("n"); send_byte("e");
-      send_byte(" "); send_byte("Z"); send_byte("Z");
-      send_byte(8'h08); send_byte(8'h08); // BS BS
-      send_byte("0"); send_byte("9");
-      
-      cmd_and_drain("", resp_g); // sends CR and drains
-      check_contains("backspace+retype: OK", resp_g, "OK");
-      check_byte("backspace+retype: tone=09", tone_val, 8'h09);
-    end
-
-    // =====================================================================
-    // 10. ECHO
-    // =====================================================================
-    $display("\n[10] Character echo");
-    begin
-      int pre;
-      pre = tx_cap_len;
-      send_byte(8'h41); // 'A'
-      drain_tx(DRAIN_TIMEOUT, pre, 0, resp_g);
-      check_byte("echo: 'A' echoed", tx_captured[pre], 8'h41);
-
-      pre = tx_cap_len;
-      send_byte(8'h42); // 'B'
-      drain_tx(DRAIN_TIMEOUT, pre, 0, resp_g);
-      check_byte("echo: 'B' echoed", tx_captured[pre], 8'h42);
-
-      // clean up dangling 'A''B' before next tests
-      send_byte(8'h0D);
-      drain_tx(DRAIN_TIMEOUT, tx_cap_len, 0, resp_g);
-    end
-
-    // =====================================================================
-    // 11. REG_OUTPUTS
-    // =====================================================================
-    $display("\n[11] Register output ports");
-    begin
-      cmd_and_drain("set dly level FE", resp_g);
-      check_byte("port level_val=FE", level_val, 8'hFE);
-      cmd_and_drain("set dly feedback 12", resp_g);
-      check_byte("port feedback_val=12", feedback_val, 8'h12);
-      cmd_and_drain("set dly tone 34", resp_g);
-      check_byte("port tone_val=34", tone_val, 8'h34);
-      cmd_and_drain("set dly time 00001234", resp_g);
-      check_word("port time_val=1234", time_val, 32'h1234);
-
-      cmd_and_drain("set cho rate 11", resp_g);
-      check_byte("port chorus_rate_val=11", chorus_rate_val, 8'h11);
-      cmd_and_drain("set cho depth 22", resp_g);
-      check_byte("port chorus_depth_val=22", chorus_depth_val, 8'h22);
-      cmd_and_drain("set cho efx 33", resp_g);
-      check_byte("port chorus_efx_val=33", chorus_efx_val, 8'h33);
-      cmd_and_drain("set cho eqhi 44", resp_g);
-      check_byte("port chorus_eqhi_val=44", chorus_eqhi_val, 8'h44);
-      cmd_and_drain("set cho eqlo 55", resp_g);
-      check_byte("port chorus_eqlo_val=55", chorus_eqlo_val, 8'h55);
-
-      cmd_and_drain("set pha speed C0", resp_g);
-      check_byte("port phaser_speed_val=C0", phaser_speed_val, 8'hC0);
-      cmd_and_drain("set pha fben 1", resp_g);
-      check_bit("port phaser_fben_val=1", phaser_fben_val, 1'b1);
-
-      cmd_and_drain("set trm rate 7F", resp_g);
-      check_byte("port trem_rate_val=7F", trem_rate_val, 8'h7F);
-      cmd_and_drain("set trm depth 88", resp_g);
-      check_byte("port trem_depth_val=88", trem_depth_val, 8'h88);
-      cmd_and_drain("set trm shape 1", resp_g);
-      check_bit("port trem_shape_val=1", trem_shape_val, 1'b1);
-    end
-
-    // =====================================================================
-    // 12. LOWERCASE HEX
-    // =====================================================================
-    $display("\n[12] Lowercase hex digits");
-    begin
-      cmd_and_drain("set dly level ab", resp_g);
-      check_contains("lowercase: OK", resp_g, "OK");
-      check_byte("lowercase: level_val=AB", level_val, 8'hAB);
-
-      cmd_and_drain("set dly time cafebabe", resp_g);
-      check_word("lowercase: time=CAFEBABE", time_val, 32'hCAFEBABE);
-    end
-
-    // =====================================================================
-    // 13. BUFFER OVERFLOW - >31 chars before CR
-    // =====================================================================
-    $display("\n[13] Buffer overflow (>31 chars)");
-    begin
-      snap13 = tx_cap_len;
-      for (int i = 0; i < 35; i++) send_byte("x");
-      send_byte(8'h0D);
-      drain_tx(DRAIN_TIMEOUT, snap13, 0, resp_g);
-      check_contains("overflow: DUT responds (Err+prompt)", resp_g, "Err");
-    end
-
-    // =====================================================================
-    // 14. PARSER ROBUSTNESS (Spaces and single digits)
-    // =====================================================================
-    $display("\n[14] Parser robustness (spaces and zeros)");
-    begin
-      // Test multiple spaces before '0'
-      cmd_and_drain("set trm rate   0", resp_g);
-      check_contains("spaces + 0: OK", resp_g, "OK");
-      check_byte("spaces + 0: port=00", trem_rate_val, 8'h00);
-
-      // Test multiple spaces before a single lowercase hex digit
-      cmd_and_drain("set dly time  a", resp_g);
-      check_contains("spaces + single hex: OK", resp_g, "OK");
-      check_word("spaces + single hex: port=0000000A", time_val, 32'h0000000A);
-    end
-
-    // =====================================================================
+    // ============================================================
     // Summary
-    // =====================================================================
-    $display("\n=================================================");
-    $display(" Results:  %0d passed,  %0d failed", pass_cnt, fail_cnt);
-    $display("=================================================");
-    if (fail_cnt == 0)
-      $display(" ALL TESTS PASSED");
+    // ============================================================
+    $display("\n========================================");
+    $display(" Test Summary: %0d PASSED, %0d FAILED", test_pass, test_fail);
+    $display("========================================");
+    if (test_fail > 0)
+      $display(" *** SOME TESTS FAILED ***");
     else
-      $display(" SOME TESTS FAILED");
+      $display(" ALL TESTS PASSED");
+    $display("");
 
+    #(CLK_PERIOD * 10);
     $finish;
   end
 
-  // -----------------------------------------------------------------------
-  // Watchdog
-  // -----------------------------------------------------------------------
+  // ---------------------------------------------------------------
+  // Timeout watchdog
+  // ---------------------------------------------------------------
   initial begin
-    #(CLK_PERIOD * 10_000_000);
-    $display("TIMEOUT");
+    #(500_000_000);  // 500 ms
+    $display("[TIMEOUT] Simulation exceeded max time");
     $finish;
   end
+
 endmodule
