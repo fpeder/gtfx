@@ -30,7 +30,7 @@ module tb_cmd_proc;
   logic        tx_start;
   logic [ 7:0] tx_byte;
 
-  logic [ 3:0] sw_effect    = 4'b0000; // ADDED: switch state
+  logic [ 3:0] sw_effect    = 4'b0000;
 
   logic [ 7:0] tone_val;
   logic [ 7:0] level_val;
@@ -62,7 +62,7 @@ module tb_cmd_proc;
     .tx_busy         (tx_busy),
     .tx_start        (tx_start),
     .tx_byte         (tx_byte),
-    .sw_effect       (sw_effect),      // ADDED: bind switch port
+    .sw_effect       (sw_effect),
     .tone_val        (tone_val),
     .level_val       (level_val),
     .feedback_val    (feedback_val),
@@ -223,7 +223,6 @@ module tb_cmd_proc;
     end
   endtask
 
-  // ADDED: Check that a string is NOT present
   task automatic check_not_contains(input string test_name, input string haystack, input string needle);
     int idx;
     idx = 0;
@@ -310,20 +309,17 @@ module tb_cmd_proc;
     // =====================================================================
     $display("\n[4] Status dynamic switching (sw_effect)");
     begin
-      // A. All Off -> Should print BYPASS
       sw_effect = 4'b0000;
       cmd_and_drain("st", resp_g);
       check_contains("st sw=0000: BYPASS", resp_g, "BYPASS");
       check_not_contains("st sw=0000: no DLY", resp_g, "DLY");
 
-      // B. Chorus only (bit 2) -> Should print CHO, but NOT DLY/PHA/TRM
       sw_effect = 4'b0100;
       cmd_and_drain("st", resp_g);
       check_contains("st sw=0100: has CHO", resp_g, "CHO R:50 D:64 E:80 H:C8 L:80");
       check_not_contains("st sw=0100: no DLY", resp_g, "DLY");
       check_not_contains("st sw=0100: no TRM", resp_g, "TRM");
 
-      // C. All On -> Should print all 4 lines
       sw_effect = 4'b1111;
       cmd_and_drain("st", resp_g);
       check_contains("st sw=1111: has DLY", resp_g, "DLY L:80 F:64 N:FF T:000007D0");
@@ -331,8 +327,6 @@ module tb_cmd_proc;
       check_contains("st sw=1111: has PHA", resp_g, "PHA S:50 B:0");
       check_contains("st sw=1111: has TRM", resp_g, "TRM R:3C D:B4 W:0");
       check_contains("st sw=1111: ends with prompt", resp_g, "Arty> ");
-      
-      // Leave sw_effect = 1111 so the rest of the tests can successfully read back 'st' lines
     end
 
     // =====================================================================
@@ -542,6 +536,22 @@ module tb_cmd_proc;
       send_byte(8'h0D);
       drain_tx(DRAIN_TIMEOUT, snap13, 0, resp_g);
       check_contains("overflow: DUT responds (Err+prompt)", resp_g, "Err");
+    end
+
+    // =====================================================================
+    // 14. PARSER ROBUSTNESS (Spaces and single digits)
+    // =====================================================================
+    $display("\n[14] Parser robustness (spaces and zeros)");
+    begin
+      // Test multiple spaces before '0'
+      cmd_and_drain("set trm rate   0", resp_g);
+      check_contains("spaces + 0: OK", resp_g, "OK");
+      check_byte("spaces + 0: port=00", trem_rate_val, 8'h00);
+
+      // Test multiple spaces before a single lowercase hex digit
+      cmd_and_drain("set dly time  a", resp_g);
+      check_contains("spaces + single hex: OK", resp_g, "OK");
+      check_word("spaces + single hex: port=0000000A", time_val, 32'h0000000A);
     end
 
     // =====================================================================
