@@ -1,7 +1,20 @@
+// ============================================================================
+// top.sv — AXI-Stream Audio Effects Pipeline
+//
+// Signal chain:  ADC → [tremolo] → [phaser] → [chorus] → [delay] → DAC
+//
+// Every inter-module link uses AXI-Stream (tdata/tvalid/tready).
+// Audio bus: tdata[47:0] = { left[23:0], right[23:0] }
+// UART bus:  tdata[7:0]  = one byte  (inside cmd.sv)
+//
+// Each effect wrapper instantiates the ORIGINAL UNCHANGED core internally.
+// ============================================================================
+
 module top (
     input logic sys_clk,
     input logic resetn,
-    //
+
+    // I2S
     output logic i2s2_tx_mclk,
     output logic i2s2_tx_lrclk,
     output logic i2s2_tx_sclk,
@@ -9,26 +22,25 @@ module top (
     output logic i2s2_rx_mclk,
     output logic i2s2_rx_lrclk,
     output logic i2s2_rx_sclk,
-    input logic i2s2_rx,
-    //
-    input logic uart_tx_din,
+    input  logic i2s2_rx,
+
+    // UART
+    input  logic uart_tx_din,
     output logic uart_rx_dout,
-    //
-    input logic [1:0] btns,
+
+    // Buttons & LEDs
+    input  logic [1:0] btns,
     output logic [3:0] led,
-    //
-    // Effect enables (independent, one bit per effect):
-    //   sw[0] = tremolo enable
-    //   sw[1] = phaser  enable
-    //   sw[2] = chorus  enable
-    //   sw[3] = delay   enable
-    // Signal chain order: dry -> tremolo -> phaser -> chorus -> delay -> out
+
+    // Effect enables
     input logic [3:0] sw_effect
 );
 
-  // ---------------------------------------------------------------------------
+  import axis_audio_pkg::*;
+
+  // ===========================================================================
   // Command processor (sys_clk domain)
-  // ---------------------------------------------------------------------------
+  // ===========================================================================
   logic [ 7:0] tone_val;
   logic [ 7:0] level_val;
   logic [ 7:0] feedback_val;
@@ -47,7 +59,7 @@ module top (
   cmd #(
       .CLK_FREQ (100_000_000),
       .BAUD_RATE(115_200)
-  ) cmd (
+  ) cmd_inst (
       .sys_clk(sys_clk),
       .rst_n(resetn),
       .tx_din(uart_tx_din),
@@ -69,9 +81,9 @@ module top (
       .trem_shape_val(trem_shape_val)
   );
 
-  // ---------------------------------------------------------------------------
+  // ===========================================================================
   // Audio clock (12.288 MHz)
-  // ---------------------------------------------------------------------------
+  // ===========================================================================
   logic clk_audio, locked;
 
   clk_wiz_0 clk_wiz (
@@ -81,9 +93,9 @@ module top (
       .clk_out1(clk_audio)
   );
 
-  // ---------------------------------------------------------------------------
-  // CDC: sys_clk -> clk_audio (double-flop)
-  // ---------------------------------------------------------------------------
+  // ===========================================================================
+  // CDC: sys_clk → clk_audio (double-flop)
+  // ===========================================================================
   logic [7:0]  tone_val_s,       tone_val_audio;
   logic [7:0]  level_val_s,      level_val_audio;
   logic [7:0]  fb_val_s,         fb_val_audio;
@@ -118,177 +130,203 @@ module top (
     sw_s            <= sw_effect;       sw_audio         <= sw_s;
   end
 
-  // ---------------------------------------------------------------------------
-  // I2S driver (clk_audio domain)
-  // ---------------------------------------------------------------------------
-  logic [23:0] din_l, din_r;
-  logic [23:0] dout_l, dout_r;
+  // ===========================================================================
+  // AXI-Stream Audio I/O (wraps i2s2 internally)
+  // ===========================================================================
+  logic [47:0] axis_src_tdata;
+  logic        axis_src_tvalid;
+  logic        axis_src_tready;
 
-  audio audio_inst (
-      .clk_audio(clk_audio),
-      .resetn(resetn),
-      .tx_mclk(i2s2_tx_mclk),
-      .tx_lrclk(i2s2_tx_lrclk),
-      .tx_sclk(i2s2_tx_sclk),
-      .tx_serial(i2s2_tx),
-      .rx_mclk(i2s2_rx_mclk),
-      .rx_lrclk(i2s2_rx_lrclk),
-      .rx_sclk(i2s2_rx_sclk),
-      .rx_serial(i2s2_rx),
-      .din_l(din_l),
-      .din_r(din_r),
-      .dout_l(dout_l),
-      .dout_r(dout_r)
+  logic [47:0] axis_sink_tdata;
+  logic        axis_sink_tvalid;
+  logic        axis_sink_tready;
+
+  audio_axis #(.AUDIO_W(24)) audio_inst (
+      .clk_audio    (clk_audio),
+      .resetn       (resetn),
+      .tx_mclk      (i2s2_tx_mclk),
+      .tx_lrclk     (i2s2_tx_lrclk),
+      .tx_sclk      (i2s2_tx_sclk),
+      .tx_serial    (i2s2_tx),
+      .rx_mclk      (i2s2_rx_mclk),
+      .rx_lrclk     (i2s2_rx_lrclk),
+      .rx_sclk      (i2s2_rx_sclk),
+      .rx_serial    (i2s2_rx),
+      .m_axis_tdata (axis_src_tdata),
+      .m_axis_tvalid(axis_src_tvalid),
+      .m_axis_tready(axis_src_tready),
+      .s_axis_tdata (axis_sink_tdata),
+      .s_axis_tvalid(axis_sink_tvalid),
+      .s_axis_tready(axis_sink_tready)
   );
-
-  // ---------------------------------------------------------------------------
-  // sample_en: lrclk rising-edge detect, clk_audio domain
-  // ---------------------------------------------------------------------------
-  logic lrclk_prev;
-  logic sample_en;
-
-  always_ff @(posedge clk_audio) begin
-    lrclk_prev <= i2s2_tx_lrclk;
-  end
-  assign sample_en = i2s2_tx_lrclk & ~lrclk_prev;
 
   // ===========================================================================
-  // EFFECT CHAIN:  dry -> [tremolo] -> [phaser] -> [chorus] -> [delay] -> out
-  //
-  // Each stage has a bypass mux controlled by its sw_audio bit.
-  // Tremolo is mono (same gain applied to both L and R at the end).
-  // The chain carries L; R branches off after chorus for stereo spread.
+  //  EFFECT CHAIN:  src → [tremolo] → [phaser] → [chorus] → [delay] → sink
   // ===========================================================================
 
-  // ---- Stage 1 : Tremolo (mono; sw_audio[0]) --------------------------------
-  logic signed [23:0] trem_out;
+  // ---- Stage 0: Tremolo (sw_audio[0]) ------------------------------------
+  logic [47:0] axis_efx0_tdata;
+  logic        axis_efx0_tvalid, axis_efx0_tready;
+  logic [47:0] axis_stg0_tdata;
+  logic        axis_stg0_tvalid, axis_stg0_tready;
+  logic        axis_byp0_tready;
 
-  tremolo #(
-      .WIDTH(24)
-  ) tremolo_inst (
-      .clk      (clk_audio),
-      .rst_n    (resetn),
-      .sample_en(sample_en),
-      .rate_val (trem_rate_audio),
-      .depth_val(trem_depth_audio),
-      .shape_sel(trem_shape_audio),
-      .audio_in (dout_l),
-      .audio_out(trem_out)
+  tremolo_axis tremolo_inst (
+      .clk            (clk_audio),
+      .rst_n          (resetn),
+      .s_axis_tdata   (axis_src_tdata),
+      .s_axis_tvalid  (axis_src_tvalid),
+      .s_axis_tready  (),
+      .m_axis_tdata   (axis_efx0_tdata),
+      .m_axis_tvalid  (axis_efx0_tvalid),
+      .m_axis_tready  (axis_efx0_tready),
+      .rate_val       (trem_rate_audio),
+      .depth_val      (trem_depth_audio),
+      .shape_sel      (trem_shape_audio)
   );
 
-  // sw[0]=1 -> insert tremolo; sw[0]=0 -> bypass
-  logic signed [23:0] post_trem;
-  assign post_trem = sw_audio[0] ? trem_out : dout_l;
-
-  // ---- Stage 2 : Phaser (mono; sw_audio[1]) ---------------------------------
-  logic signed [23:0] phaser_out;
-
-  phaser #(
-      .WIDTH(24)
-  ) phaser_inst (
-      .clk        (clk_audio),
-      .rst_n      (resetn),
-      .sample_en  (sample_en),
-      .speed_val  (pha_speed_audio),
-      .feedback_en(pha_fben_audio),
-      .audio_in   (post_trem),
-      .audio_out  (phaser_out)
+  axis_bypass_mux mux0 (
+      .enable            (sw_audio[0]),
+      .s_axis_byp_tdata  (axis_src_tdata),
+      .s_axis_byp_tvalid (axis_src_tvalid),
+      .s_axis_byp_tready (axis_byp0_tready),
+      .s_axis_efx_tdata  (axis_efx0_tdata),
+      .s_axis_efx_tvalid (axis_efx0_tvalid),
+      .s_axis_efx_tready (axis_efx0_tready),
+      .m_axis_tdata      (axis_stg0_tdata),
+      .m_axis_tvalid     (axis_stg0_tvalid),
+      .m_axis_tready     (axis_stg0_tready)
   );
 
-  // sw[1]=1 -> insert phaser; sw[1]=0 -> bypass
-  logic signed [23:0] post_phaser;
-  assign post_phaser = sw_audio[1] ? phaser_out : post_trem;
+  assign axis_src_tready = sw_audio[0] ? 1'b1 : axis_byp0_tready;
 
-  // ---- Stage 3 : Chorus (mono in, stereo out; sw_audio[2]) -----------------
-  logic signed [23:0] chorus_out_l, chorus_out_r;
+  // ---- Stage 1: Phaser (sw_audio[1]) ------------------------------------
+  logic [47:0] axis_efx1_tdata;
+  logic        axis_efx1_tvalid, axis_efx1_tready;
+  logic [47:0] axis_stg1_tdata;
+  logic        axis_stg1_tvalid, axis_stg1_tready;
+  logic        axis_byp1_tready;
 
-  chorus #(
+  phaser_axis phaser_inst (
+      .clk            (clk_audio),
+      .rst_n          (resetn),
+      .s_axis_tdata   (axis_stg0_tdata),
+      .s_axis_tvalid  (axis_stg0_tvalid),
+      .s_axis_tready  (),
+      .m_axis_tdata   (axis_efx1_tdata),
+      .m_axis_tvalid  (axis_efx1_tvalid),
+      .m_axis_tready  (axis_efx1_tready),
+      .speed_val      (pha_speed_audio),
+      .feedback_en    (pha_fben_audio)
+  );
+
+  axis_bypass_mux mux1 (
+      .enable            (sw_audio[1]),
+      .s_axis_byp_tdata  (axis_stg0_tdata),
+      .s_axis_byp_tvalid (axis_stg0_tvalid),
+      .s_axis_byp_tready (axis_byp1_tready),
+      .s_axis_efx_tdata  (axis_efx1_tdata),
+      .s_axis_efx_tvalid (axis_efx1_tvalid),
+      .s_axis_efx_tready (axis_efx1_tready),
+      .m_axis_tdata      (axis_stg1_tdata),
+      .m_axis_tvalid     (axis_stg1_tvalid),
+      .m_axis_tready     (axis_stg1_tready)
+  );
+
+  assign axis_stg0_tready = sw_audio[1] ? 1'b1 : axis_byp1_tready;
+
+  // ---- Stage 2: Chorus (sw_audio[2]) ------------------------------------
+  logic [47:0] axis_efx2_tdata;
+  logic        axis_efx2_tvalid, axis_efx2_tready;
+  logic [47:0] axis_stg2_tdata;
+  logic        axis_stg2_tvalid, axis_stg2_tready;
+  logic        axis_byp2_tready;
+
+  chorus_axis #(
       .SAMPLE_RATE(48_000),
       .DATA_WIDTH (24),
       .DELAY_MAX  (512)
   ) chorus_inst (
-      .clk        (clk_audio),
-      .rst_n      (resetn),
-      .sample_en  (sample_en),
-      .audio_in   (post_phaser),
-      .audio_out_l(chorus_out_l),
-      .audio_out_r(chorus_out_r),
-      .rate       (ch_rate_audio),
-      .depth      (ch_depth_audio),
-      .effect_lvl (ch_efx_audio),
-      .e_q_hi     (ch_eqhi_audio),
-      .e_q_lo     (ch_eqlo_audio)
+      .clk            (clk_audio),
+      .rst_n          (resetn),
+      .s_axis_tdata   (axis_stg1_tdata),
+      .s_axis_tvalid  (axis_stg1_tvalid),
+      .s_axis_tready  (),
+      .m_axis_tdata   (axis_efx2_tdata),
+      .m_axis_tvalid  (axis_efx2_tvalid),
+      .m_axis_tready  (axis_efx2_tready),
+      .rate           (ch_rate_audio),
+      .depth          (ch_depth_audio),
+      .effect_lvl     (ch_efx_audio),
+      .e_q_hi         (ch_eqhi_audio),
+      .e_q_lo         (ch_eqlo_audio)
   );
 
-  // sw[2]=1 -> insert chorus; sw[2]=0 -> bypass (R mirrors L)
-  logic signed [23:0] post_chorus_l, post_chorus_r;
-  assign post_chorus_l = sw_audio[2] ? chorus_out_l : post_phaser;
-  assign post_chorus_r = sw_audio[2] ? chorus_out_r : post_phaser;
-
-  // ---- Stage 4 : DD3 Delay (wet-only output; sw_audio[3]) ------------------
-  logic signed [23:0] delay_wet;
-
-  dd3 #(
-      .WIDTH(24)
-  ) delay_inst (
-      .clk         (clk_audio),
-      .rst_n       (resetn),
-      .sample_en   (sample_en),
-      .tone_val    (tone_val_audio),
-      .level_val   (level_val_audio),
-      .feedback_val(fb_val_audio),
-      .time_val    (time_val_audio),
-      .audio_in    (post_chorus_l),
-      .audio_out   (delay_wet)
+  axis_bypass_mux mux2 (
+      .enable            (sw_audio[2]),
+      .s_axis_byp_tdata  (axis_stg1_tdata),
+      .s_axis_byp_tvalid (axis_stg1_tvalid),
+      .s_axis_byp_tready (axis_byp2_tready),
+      .s_axis_efx_tdata  (axis_efx2_tdata),
+      .s_axis_efx_tvalid (axis_efx2_tvalid),
+      .s_axis_efx_tready (axis_efx2_tready),
+      .m_axis_tdata      (axis_stg2_tdata),
+      .m_axis_tvalid     (axis_stg2_tvalid),
+      .m_axis_tready     (axis_stg2_tready)
   );
 
-  // Mix wet echo with post-chorus signal (stereo, saturating)
-  logic signed [24:0] dly_sum_l, dly_sum_r;
-  logic signed [23:0] delay_mixed_l, delay_mixed_r;
+  assign axis_stg1_tready = sw_audio[2] ? 1'b1 : axis_byp2_tready;
 
-  always_comb begin
-    dly_sum_l = $signed({post_chorus_l[23], post_chorus_l})
-              + $signed({delay_wet[23],     delay_wet});
-    dly_sum_r = $signed({post_chorus_r[23], post_chorus_r})
-              + $signed({delay_wet[23],     delay_wet});
+  // ---- Stage 3: DD3 Delay (sw_audio[3]) ---------------------------------
+  logic [47:0] axis_efx3_tdata;
+  logic        axis_efx3_tvalid, axis_efx3_tready;
+  logic [47:0] axis_stg3_tdata;
+  logic        axis_stg3_tvalid, axis_stg3_tready;
+  logic        axis_byp3_tready;
 
-    delay_mixed_l = (dly_sum_l > 25'sh7FFFFF)  ?  24'sh7FFFFF :
-                    (dly_sum_l < -25'sh800000)  ? -24'sh800000 :
-                     dly_sum_l[23:0];
-    delay_mixed_r = (dly_sum_r > 25'sh7FFFFF)  ?  24'sh7FFFFF :
-                    (dly_sum_r < -25'sh800000)  ? -24'sh800000 :
-                     dly_sum_r[23:0];
-  end
+  dd3_axis delay_inst (
+      .clk            (clk_audio),
+      .rst_n          (resetn),
+      .s_axis_tdata   (axis_stg2_tdata),
+      .s_axis_tvalid  (axis_stg2_tvalid),
+      .s_axis_tready  (),
+      .m_axis_tdata   (axis_efx3_tdata),
+      .m_axis_tvalid  (axis_efx3_tvalid),
+      .m_axis_tready  (axis_efx3_tready),
+      .tone_val       (tone_val_audio),
+      .level_val      (level_val_audio),
+      .feedback_val   (fb_val_audio),
+      .time_val       (time_val_audio)
+  );
 
-  // sw[3]=1 -> insert delay; sw[3]=0 -> bypass
-  logic signed [23:0] post_delay_l, post_delay_r;
-  assign post_delay_l = sw_audio[3] ? delay_mixed_l : post_chorus_l;
-  assign post_delay_r = sw_audio[3] ? delay_mixed_r : post_chorus_r;
+  axis_bypass_mux mux3 (
+      .enable            (sw_audio[3]),
+      .s_axis_byp_tdata  (axis_stg2_tdata),
+      .s_axis_byp_tvalid (axis_stg2_tvalid),
+      .s_axis_byp_tready (axis_byp3_tready),
+      .s_axis_efx_tdata  (axis_efx3_tdata),
+      .s_axis_efx_tvalid (axis_efx3_tvalid),
+      .s_axis_efx_tready (axis_efx3_tready),
+      .m_axis_tdata      (axis_stg3_tdata),
+      .m_axis_tvalid     (axis_stg3_tvalid),
+      .m_axis_tready     (axis_stg3_tready)
+  );
 
-  // ---------------------------------------------------------------------------
-  // Final output
-  // When all switches off -> full dry bypass on both channels
-  // ---------------------------------------------------------------------------
-  always_comb begin
-    if (sw_audio == 4'b0000) begin
-      din_l = dout_l;
-      din_r = dout_r;
-    end else begin
-      din_l = post_delay_l;
-      din_r = post_delay_r;
-    end
-  end
+  assign axis_stg2_tready = sw_audio[3] ? 1'b1 : axis_byp3_tready;
 
-  // ---------------------------------------------------------------------------
-  // LED indicators
-  //   led[0] = tremolo active
-  //   led[1] = phaser  active
-  //   led[2] = chorus  active
-  //   led[3] = delay   active
-  // ---------------------------------------------------------------------------
-  assign led[0] = sw_effect[0];  // tremolo
-  assign led[1] = sw_effect[1];  // phaser
-  assign led[2] = sw_effect[2];  // chorus
-  assign led[3] = sw_effect[3];  // delay
+  // ===========================================================================
+  // Pipeline output → DAC
+  // ===========================================================================
+  assign axis_sink_tdata  = axis_stg3_tdata;
+  assign axis_sink_tvalid = axis_stg3_tvalid;
+  assign axis_stg3_tready = axis_sink_tready;
+
+  // ===========================================================================
+  // LEDs
+  // ===========================================================================
+  assign led[0] = sw_effect[0];
+  assign led[1] = sw_effect[1];
+  assign led[2] = sw_effect[2];
+  assign led[3] = sw_effect[3];
 
 endmodule

@@ -54,9 +54,9 @@ module dd3 #(
 
     localparam ADDR_WIDTH = $clog2(RAM_DEPTH);
     logic [ADDR_WIDTH-1:0] wr_ptr      = 0;
-    logic [ADDR_WIDTH-1:0] rd_ptr      = 0;
+    logic [ADDR_WIDTH-1:0] rd_ptr;      //= 0;
     logic [ADDR_WIDTH-1:0] wr_ptr_next;
-    logic [ADDR_WIDTH-1:0] rd_ptr_next;
+    //logic [ADDR_WIDTH-1:0] rd_ptr_next;
     logic [ADDR_WIDTH-1:0] delay_samples;
 
     initial begin
@@ -108,9 +108,9 @@ module dd3 #(
         wr_ptr_next = (wr_ptr == ADDR_WIDTH'(RAM_DEPTH - 1)) ? '0 : wr_ptr + 1'b1;
 
         if (wr_ptr_next >= delay_samples)
-            rd_ptr_next = wr_ptr_next - delay_samples;
+            rd_ptr = wr_ptr - delay_samples;
         else
-            rd_ptr_next = ADDR_WIDTH'(RAM_DEPTH) + wr_ptr_next - delay_samples;
+            rd_ptr = ADDR_WIDTH'(RAM_DEPTH) + wr_ptr - delay_samples;
     end
 
     // =========================================================================
@@ -172,7 +172,7 @@ module dd3 #(
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             wr_ptr        <= '0;
-            rd_ptr        <= '0;
+            //rd_ptr        <= '0;
             lpf_state     <= '0;
             audio_out_reg <= '0;
             ram_read_data <= '0;
@@ -180,7 +180,7 @@ module dd3 #(
             ram_read_data <= ram[rd_ptr];
             ram[wr_ptr]   <= fb_saturated;
             wr_ptr        <= wr_ptr_next;
-            rd_ptr        <= rd_ptr_next;
+            //rd_ptr        <= rd_ptr_next;
             lpf_state     <= lpf_state_next;
             audio_out_reg <= out_saturated;
         end

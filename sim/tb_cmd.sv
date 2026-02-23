@@ -1,6 +1,6 @@
 `timescale 1ns / 1ps
 
-module cmd_tb;
+module tb_cmd;
 
   // ---------------------------------------------------------------
   // Parameters - use high baud rate to keep simulation fast
@@ -209,7 +209,7 @@ module cmd_tb;
   // Main test sequence
   // ===============================================================
   initial begin
-    $dumpfile("cmd_tb.vcd");
+    $dumpfile("tb_cmd.vcd");
     $dumpvars(0, cmd_tb);
 
     $display("========================================");
