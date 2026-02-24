@@ -122,21 +122,16 @@ module phaser #(
 
         // Stage 0 input is audio_in directly
         stage_in[0] = audio_in;
-        // Stage 1 input: registered stage 0 output + feedback
-        // Use y_prev[0] (registered) so each stage processes one sample at a
-        // time; without this the impulse would traverse all 4 stages
-        // combinatorially in a single sample_en cycle, causing the first
-        // output after an impulse to be ~SAT_MAX instead of ~SAT_MAX/2,
-        // and collapsing the impulse-response energy into a single sample.
-        stage1_sum  = $signed(y_prev[0]) + $signed(fb_val);
+        // Stage 1 input: stage 0 output + feedback
+        stage1_sum  = $signed(y_next[0]) + $signed(fb_val);
         if      (stage1_sum > $signed({1'b0, SAT_MAX})) stage1_sat = SAT_MAX;
         else if (stage1_sum < $signed({1'b1, SAT_MIN})) stage1_sat = SAT_MIN;
         else                                             stage1_sat = stage1_sum[WIDTH-1:0];
         stage_in[1] = stage1_sat;
 
-        // Stages 2 and 3 use registered outputs of the preceding stage
-        stage_in[2] = y_prev[1];
-        stage_in[3] = y_prev[2];
+        // Stages 2 and 3 are fed directly from previous stage
+        stage_in[2] = y_next[1];
+        stage_in[3] = y_next[2];
     end
 
     // =========================================================================
