@@ -25,8 +25,8 @@ module cmd_proc_v2 (
   //    0x10..0x17 : Slot 2 (chorus)   [0]=rate [1]=depth [2]=efx [3]=eqhi [4]=eqlo
   //    0x18..0x1F : Slot 3 (dd3)      [0]=tone [1]=level [2]=feedback [3..6]=time(LE)
   //
-  //  Infrastructure:
-  //    0x40..0x45 : route[0..5]
+  //  Infrastructure (symmetric 5-port: 0=ADC/DAC, 1=TRM, 2=PHA, 3=CHO, 4=DLY):
+  //    0x40..0x44 : route[0..4]
   //    0x48..0x4B : bypass[0..3]
   //
   // CLI format: set <efx> <prm> <hex>     (all qualifiers 3 chars)
@@ -99,10 +99,11 @@ module cmd_proc_v2 (
   logic        rx_pending = 0;
   logic [ 7:0] rx_latch = 0;
   logic [ 1:0] time_wr_idx = 0;
+  logic [ 4:0] cdc_wait = 0;        // delay counter between writes for CDC crossing
 
   // Shadow registers for status display
   logic [7:0] shadow [0:31];       // mirrors 0x00..0x1F
-  logic [7:0] shadow_route [0:5];  // mirrors route[0..5]
+  logic [7:0] shadow_route [0:4];  // mirrors route[0..4]
   logic [7:0] shadow_byp [0:3];    // mirrors bypass[0..3]
 
   // Write bus
@@ -171,7 +172,7 @@ module cmd_proc_v2 (
       // Slot 3 (dd3): ton=FF lvl=80 fdb=64 tim=000007D0 (LE: D0,07,00,00)
       shadow[24] <= 8'hFF; shadow[25] <= 8'h80; shadow[26] <= 8'h64;
       shadow[27] <= 8'hD0; shadow[28] <= 8'h07;
-      for (int i = 0; i < 6;  i++) shadow_route[i] <= (i < 5) ? 8'(i) : 8'd4;
+      for (int i = 0; i < 5;  i++) shadow_route[i] <= (i == 0) ? 8'd4 : 8'(i - 1);
       for (int i = 0; i < 4;  i++) shadow_byp[i] <= '0;
     end else begin
       wr_en_reg <= 1'b0;
@@ -330,19 +331,82 @@ module cmd_proc_v2 (
         // ============================================================
 
         // ---- Routes ----
+        // Symmetric: 0=ADC 1=TRM 2=PHA 3=CHO 4=DLY 5=DAC
+        // Skip route[0] (ADC sink is dummy), show ports 1-5
         S_ST_ROUTE: begin
           automatic int p = 0;
-          // "RTE: 0>0 1>1 2>2 3>3 4>4 5>4 \r\n"
-          tx_buf[p] <= "R"; p++;
-          tx_buf[p] <= "T"; p++;
-          tx_buf[p] <= "E"; p++;
-          tx_buf[p] <= ":"; p++;
-          for (int i = 0; i < 6; i++) begin
-            tx_buf[p] <= n2h(i[3:0]);                  p++;
-            tx_buf[p] <= ">";                           p++;
-            tx_buf[p] <= n2h(shadow_route[i][3:0]);    p++;
-            tx_buf[p] <= " ";                           p++;
-          end
+
+          // TRM (port 1)
+          tx_buf[p]<="T"; p++; tx_buf[p]<="R"; p++; tx_buf[p]<="M"; p++;
+          tx_buf[p]<="<"; p++;
+          case (shadow_route[1][2:0])
+            3'd0: begin tx_buf[p]<="A"; p++; tx_buf[p]<="D"; p++; tx_buf[p]<="C"; p++; end
+            3'd1: begin tx_buf[p]<="T"; p++; tx_buf[p]<="R"; p++; tx_buf[p]<="M"; p++; end
+            3'd2: begin tx_buf[p]<="P"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="A"; p++; end
+            3'd3: begin tx_buf[p]<="C"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="O"; p++; end
+            3'd4: begin tx_buf[p]<="D"; p++; tx_buf[p]<="L"; p++; tx_buf[p]<="Y"; p++; end
+            3'd5: begin tx_buf[p]<="D"; p++; tx_buf[p]<="A"; p++; tx_buf[p]<="C"; p++; end
+            default: begin tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; end
+          endcase
+          tx_buf[p]<=" "; p++;
+
+          // PHA (port 2)
+          tx_buf[p]<="P"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="A"; p++;
+          tx_buf[p]<="<"; p++;
+          case (shadow_route[2][2:0])
+            3'd0: begin tx_buf[p]<="A"; p++; tx_buf[p]<="D"; p++; tx_buf[p]<="C"; p++; end
+            3'd1: begin tx_buf[p]<="T"; p++; tx_buf[p]<="R"; p++; tx_buf[p]<="M"; p++; end
+            3'd2: begin tx_buf[p]<="P"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="A"; p++; end
+            3'd3: begin tx_buf[p]<="C"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="O"; p++; end
+            3'd4: begin tx_buf[p]<="D"; p++; tx_buf[p]<="L"; p++; tx_buf[p]<="Y"; p++; end
+            3'd5: begin tx_buf[p]<="D"; p++; tx_buf[p]<="A"; p++; tx_buf[p]<="C"; p++; end
+            default: begin tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; end
+          endcase
+          tx_buf[p]<=" "; p++;
+
+          // CHO (port 3)
+          tx_buf[p]<="C"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="O"; p++;
+          tx_buf[p]<="<"; p++;
+          case (shadow_route[3][2:0])
+            3'd0: begin tx_buf[p]<="A"; p++; tx_buf[p]<="D"; p++; tx_buf[p]<="C"; p++; end
+            3'd1: begin tx_buf[p]<="T"; p++; tx_buf[p]<="R"; p++; tx_buf[p]<="M"; p++; end
+            3'd2: begin tx_buf[p]<="P"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="A"; p++; end
+            3'd3: begin tx_buf[p]<="C"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="O"; p++; end
+            3'd4: begin tx_buf[p]<="D"; p++; tx_buf[p]<="L"; p++; tx_buf[p]<="Y"; p++; end
+            3'd5: begin tx_buf[p]<="D"; p++; tx_buf[p]<="A"; p++; tx_buf[p]<="C"; p++; end
+            default: begin tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; end
+          endcase
+          tx_buf[p]<=" "; p++;
+
+          // DLY (port 4)
+          tx_buf[p]<="D"; p++; tx_buf[p]<="L"; p++; tx_buf[p]<="Y"; p++;
+          tx_buf[p]<="<"; p++;
+          case (shadow_route[4][2:0])
+            3'd0: begin tx_buf[p]<="A"; p++; tx_buf[p]<="D"; p++; tx_buf[p]<="C"; p++; end
+            3'd1: begin tx_buf[p]<="T"; p++; tx_buf[p]<="R"; p++; tx_buf[p]<="M"; p++; end
+            3'd2: begin tx_buf[p]<="P"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="A"; p++; end
+            3'd3: begin tx_buf[p]<="C"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="O"; p++; end
+            3'd4: begin tx_buf[p]<="D"; p++; tx_buf[p]<="L"; p++; tx_buf[p]<="Y"; p++; end
+            3'd5: begin tx_buf[p]<="D"; p++; tx_buf[p]<="A"; p++; tx_buf[p]<="C"; p++; end
+            default: begin tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; end
+          endcase
+          tx_buf[p]<=" "; p++;
+
+          // DAC (port 5)
+          tx_buf[p]<="D"; p++; tx_buf[p]<="A"; p++; tx_buf[p]<="C"; p++;
+          tx_buf[p]<="<"; p++;
+          case (shadow_route[5][2:0])
+            3'd0: begin tx_buf[p]<="A"; p++; tx_buf[p]<="D"; p++; tx_buf[p]<="C"; p++; end
+            3'd1: begin tx_buf[p]<="T"; p++; tx_buf[p]<="R"; p++; tx_buf[p]<="M"; p++; end
+            3'd2: begin tx_buf[p]<="P"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="A"; p++; end
+            3'd3: begin tx_buf[p]<="C"; p++; tx_buf[p]<="H"; p++; tx_buf[p]<="O"; p++; end
+            3'd4: begin tx_buf[p]<="D"; p++; tx_buf[p]<="L"; p++; tx_buf[p]<="Y"; p++; end
+            3'd5: begin tx_buf[p]<="D"; p++; tx_buf[p]<="A"; p++; tx_buf[p]<="C"; p++; end
+            default: begin tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; tx_buf[p]<="?"; p++; end
+          endcase
+          tx_buf[p]<=CHAR_CR; p++;
+          tx_buf[p]<=CHAR_LF; p++;
+
           // "BYP: 0 0 0 0\r\n"  - show effective bypass (hw switch inverted OR register)
           tx_buf[p] <= "B"; p++;
           tx_buf[p] <= "Y"; p++;
@@ -492,7 +556,7 @@ module cmd_proc_v2 (
               wr_en_reg   <= 1'b1;
               if (parse_acc[15:8] < 8'h20)
                 shadow[parse_acc[12:8]] <= parse_acc[7:0];
-              else if (parse_acc[15:8] >= 8'h40 && parse_acc[15:8] < 8'h46)
+              else if (parse_acc[15:8] >= 8'h40 && parse_acc[15:8] < 8'h45)
                 shadow_route[parse_acc[10:8]] <= parse_acc[7:0];
               else if (parse_acc[15:8] >= 8'h48 && parse_acc[15:8] < 8'h4C)
                 shadow_byp[parse_acc[9:8]] <= parse_acc[7:0];
@@ -515,7 +579,7 @@ module cmd_proc_v2 (
           // Update shadows
           if (target_addr < 8'h20)
             shadow[target_addr[4:0]] <= parse_acc[7:0];
-          else if (target_addr >= 8'h40 && target_addr < 8'h46)
+          else if (target_addr >= 8'h40 && target_addr < 8'h45)
             shadow_route[target_addr[2:0]] <= parse_acc[7:0];
           else if (target_addr >= 8'h48 && target_addr < 8'h4C)
             shadow_byp[target_addr[1:0]] <= parse_acc[7:0];
@@ -524,20 +588,33 @@ module cmd_proc_v2 (
         end
 
         // ---- 32-bit time: 4 sequential byte writes (LE) ----
+        // ---- 32-bit time: 4 byte writes with CDC wait between each ----
+        // Each write needs ~25 sys_clk cycles for the toggle to cross
+        // the CDC into the audio domain before the next write.
         S_WRITE_TIME: begin
-          wr_addr_reg <= target_addr + {6'd0, time_wr_idx};
-          case (time_wr_idx)
-            2'd0: begin wr_data_reg <= parse_acc[7:0];   shadow[target_addr[4:0]+0] <= parse_acc[7:0];   end
-            2'd1: begin wr_data_reg <= parse_acc[15:8];  shadow[target_addr[4:0]+1] <= parse_acc[15:8];  end
-            2'd2: begin wr_data_reg <= parse_acc[23:16]; shadow[target_addr[4:0]+2] <= parse_acc[23:16]; end
-            2'd3: begin wr_data_reg <= parse_acc[31:24]; shadow[target_addr[4:0]+3] <= parse_acc[31:24]; end
-          endcase
-          wr_en_reg <= 1'b1;
-          if (time_wr_idx == 2'd3) begin
-            tx_len<=LEN_OK; tx_idx<=0; rx_latch<=2;
-            state<=S_LOAD_STRING; return_state<=S_LOAD_PROMPT;
+          if (cdc_wait != 0) begin
+            // Waiting for CDC to settle
+            cdc_wait <= cdc_wait - 1;
+          end else if (!wr_en_reg) begin
+            // Drive phase: assert wr_en with current byte
+            wr_addr_reg <= target_addr + {6'd0, time_wr_idx};
+            case (time_wr_idx)
+              2'd0: begin wr_data_reg <= parse_acc[7:0];   shadow[target_addr[4:0]+0] <= parse_acc[7:0];   end
+              2'd1: begin wr_data_reg <= parse_acc[15:8];  shadow[target_addr[4:0]+1] <= parse_acc[15:8];  end
+              2'd2: begin wr_data_reg <= parse_acc[23:16]; shadow[target_addr[4:0]+2] <= parse_acc[23:16]; end
+              2'd3: begin wr_data_reg <= parse_acc[31:24]; shadow[target_addr[4:0]+3] <= parse_acc[31:24]; end
+            endcase
+            wr_en_reg <= 1'b1;
           end else begin
-            time_wr_idx <= time_wr_idx + 1;
+            // Gap phase: deassert wr_en, start CDC wait, advance
+            wr_en_reg <= 1'b0;
+            if (time_wr_idx == 2'd3) begin
+              tx_len<=LEN_OK; tx_idx<=0; rx_latch<=2;
+              state<=S_LOAD_STRING; return_state<=S_LOAD_PROMPT;
+            end else begin
+              time_wr_idx <= time_wr_idx + 1;
+              cdc_wait <= 5'd31;  // wait 32 sys_clk cycles (~320ns) for CDC
+            end
           end
         end
 

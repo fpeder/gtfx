@@ -127,7 +127,7 @@ module dd3 #(
     always_comb begin
         lpf_diff       = $signed(ram_read_data) - $signed(lpf_state);
         lpf_product    = lpf_diff * $signed(tone_coeff);
-        lpf_increment  = lpf_product[WIDTH+10:8];
+        lpf_increment  = lpf_product >>> 8;
         lpf_state_next = $signed(lpf_state) + lpf_increment;
     end
 

@@ -15,7 +15,7 @@
 //   0x10..0x17 : Slot 2 registers
 //   0x18..0x1F : Slot 3 registers
 //   ...
-//   0x40..0x45 : route[0] .. route[N_XBAR-1]   (crossbar routing)
+//   0x40..0x44 : route[0] .. route[N_XBAR-1]   (crossbar routing)
 //   0x48..0x4B : bypass[0] .. bypass[N_SLOTS-1]
 //
 // The route and bypass registers are stored locally and exposed as outputs.
@@ -68,14 +68,18 @@ module ctrl_bus #(
     logic bypass_regs [N_SLOTS];
 
     // ---- Default routing: linear chain ----
-    // Master ports:  0=ADC, 1=slot0_out, 2=slot1_out, 3=slot2_out, 4=slot3_out
-    // Slave ports:   0=slot0_in, 1=slot1_in, 2=slot2_in, 3=slot3_in, 4=(unused), 5=DAC
+    // Symmetric port map: 0=ADC 1=TRM 2=PHA 3=CHO 4=DLY 5=DAC
     //
-    // Default: route[0]=0(ADC), route[1]=1(slot0), ..., route[N_XBAR-1]=N_SLOTS(last slot out)
+    // route[0] = 0 (don't care - ADC sink is dummy)
+    // route[1] = 0 → TRM ← ADC
+    // route[2] = 1 → PHA ← TRM
+    // route[3] = 2 → CHO ← PHA
+    // route[4] = 3 → DLY ← CHO
+    // route[5] = 4 → DAC ← DLY
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             for (int i = 0; i < N_XBAR; i++)
-                route_regs[i] <= (i < N_XBAR - 1) ? SEL_W'(i) : SEL_W'(N_SLOTS);
+                route_regs[i] <= (i == 0) ? SEL_W'(N_SLOTS) : SEL_W'(i - 1);
             for (int i = 0; i < N_SLOTS; i++)
                 bypass_regs[i] <= 1'b0;
         end else if (wr_en) begin
@@ -106,12 +110,13 @@ module ctrl_bus #(
         end
 
         if (wr_en && wr_addr < ADDR_W'(SLOT_END)) begin
-            automatic int slot_idx = int'(wr_addr) / REGS_PER;
-            automatic int reg_idx  = int'(wr_addr) % REGS_PER;
-            if (slot_idx < N_SLOTS) begin
-                slot_wr[slot_idx]    = 1'b1;
-                slot_addr[slot_idx]  = reg_idx[$clog2(REGS_PER)-1:0];
-                slot_wdata[slot_idx] = wr_data;
+            for (int s = 0; s < N_SLOTS; s++) begin
+                if (wr_addr >= ADDR_W'(s * REGS_PER) &&
+                    wr_addr <  ADDR_W'((s + 1) * REGS_PER)) begin
+                    slot_wr[s]    = 1'b1;
+                    slot_addr[s]  = wr_addr[$clog2(REGS_PER)-1:0];
+                    slot_wdata[s] = wr_data;
+                end
             end
         end
     end

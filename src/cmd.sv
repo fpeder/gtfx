@@ -1,10 +1,10 @@
 `timescale 1ns / 1ps
 
 // ============================================================================
-// cmd.sv — Command subsystem with flat register write bus output
+// cmd.sv - Command subsystem with flat register write bus output
 //
 // Internal: uart_axis → axis_fifo (RX) → cmd_proc_v2 → axis_fifo (TX) → uart_axis
-// Output: wr_en / wr_addr / wr_data — single-cycle write pulses to ctrl_bus
+// Output: wr_en / wr_addr / wr_data - single-cycle write pulses to ctrl_bus
 // ============================================================================
 
 module cmd #(
@@ -87,13 +87,38 @@ module cmd #(
   assign proc_tx_done   = proc_tx_start & proc_tx_tready;
 
   // ---- Command Processor v2 ----
+  logic       proc_wr_en;
+  logic [7:0] proc_wr_addr;
+  logic [7:0] proc_wr_data;
+
   cmd_proc_v2 proc (
       .clk(sys_clk), .rst_n(rst_n),
       .rx_valid(proc_rx_valid), .rx_byte(proc_rx_byte),
       .tx_start(proc_tx_start), .tx_byte(proc_tx_byte),
       .tx_busy(proc_tx_busy),   .tx_done(proc_tx_done),
       .sw_effect(sw_effect),
-      .wr_en(wr_en), .wr_addr(wr_addr), .wr_data(wr_data)
+      .wr_en(proc_wr_en), .wr_addr(proc_wr_addr), .wr_data(proc_wr_data)
   );
+
+  // ---- Toggle CDC: convert wr_en pulse → toggle + held addr/data ----
+  // The toggle flips each time proc fires a write.  The audio side detects
+  // the flip and captures addr/data which are held stable from this clock.
+  logic       wr_toggle = 0;
+  logic [7:0] wr_addr_hold = 0;
+  logic [7:0] wr_data_hold = 0;
+
+  always_ff @(posedge sys_clk) begin
+    if (!rst_n)
+      wr_toggle <= 1'b0;
+    else if (proc_wr_en) begin
+      wr_toggle    <= ~wr_toggle;
+      wr_addr_hold <= proc_wr_addr;
+      wr_data_hold <= proc_wr_data;
+    end
+  end
+
+  assign wr_en   = wr_toggle;     // reuse port: now carries toggle, not pulse
+  assign wr_addr = wr_addr_hold;
+  assign wr_data = wr_data_hold;
 
 endmodule
