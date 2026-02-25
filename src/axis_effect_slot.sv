@@ -167,9 +167,9 @@ module axis_effect_slot #(
         end else if (EFFECT_TYPE == 3) begin : gen_dd3
             logic signed [AUDIO_W-1:0] wet_out;
 
-            // Reconstruct 32-bit time_val from 4 consecutive 8-bit registers (LE)
-            logic [31:0] time_val_32;
-            assign time_val_32 = {regs[6], regs[5], regs[4], regs[3]};
+            // Reconstruct 16-bit time_val from 2 consecutive 8-bit registers (LE)
+            logic [15:0] time_val_16;
+            assign time_val_16 = {regs[4], regs[3]};
 
             dd3 #(
                 .WIDTH    (AUDIO_W),
@@ -181,7 +181,7 @@ module axis_effect_slot #(
                 .tone_val     (regs[0]),
                 .level_val    (regs[1]),
                 .feedback_val (regs[2]),
-                .time_val     (time_val_32),
+                .time_val     (time_val_16),
                 .audio_in     (audio_in_reg),
                 .audio_out    (wet_out)
             );

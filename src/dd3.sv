@@ -29,7 +29,7 @@ module dd3 #(
     input  logic [7:0]       tone_val,
     input  logic [7:0]       level_val,
     input  logic [7:0]       feedback_val,
-    input  logic [31:0]      time_val,
+    input  logic [15:0]      time_val,
 
     // Audio - clk domain
     // audio_out carries wet signal only; caller adds dry separately
@@ -127,7 +127,7 @@ module dd3 #(
     always_comb begin
         lpf_diff       = $signed(ram_read_data) - $signed(lpf_state);
         lpf_product    = lpf_diff * $signed(tone_coeff);
-        lpf_increment  = lpf_product >>> 8;
+        lpf_increment  = lpf_product[WIDTH+10:8];
         lpf_state_next = $signed(lpf_state) + lpf_increment;
     end
 
