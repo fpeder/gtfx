@@ -1,6 +1,11 @@
 // ============================================================================
 // top.sv - AXI-Stream Audio Effects Pipeline with Routing Matrix
 //
+// Uses the ORIGINAL audio.sv (thin i2s2 wrapper) for I2S - no audio_axis.
+// ADC/DAC data is bridged to/from the AXI-Stream crossbar with simple
+// pack/unpack wires and a sample_en edge detect, matching the proven
+// original design's I2S interface exactly.
+//
 // Symmetric 5-port crossbar (N_XBAR = N_SLOTS + 1):
 //
 //   Port  Master (source)     Slave (sink)
@@ -11,16 +16,9 @@
 //    3    Slot 2 (chorus)     Slot 2 input
 //    4    Slot 3 (delay)      Slot 3 input
 //
-// route[k] = which master feeds slave port k.
-// Source and sink use the SAME numbering:
-//   0=ADC/DAC  1=TRM  2=PHA  3=CHO  4=DLY
-//
 // Default linear chain:
-//   route[0] = 4  →  DAC    ← DLY out
-//   route[1] = 0  →  TRM in ← ADC
-//   route[2] = 1  →  PHA in ← TRM out
-//   route[3] = 2  →  CHO in ← PHA out
-//   route[4] = 3  →  DLY in ← CHO out
+//   route[0]=4 DAC←DLY  route[1]=0 TRM←ADC  route[2]=1 PHA←TRM
+//   route[3]=2 CHO←PHA  route[4]=3 DLY←CHO
 // ============================================================================
 
 module top #(
@@ -53,7 +51,7 @@ module top #(
 
     import axis_audio_pkg::*;
 
-    localparam int N_XBAR = N_SLOTS + 1;  // 5 ports: ADC/DAC + 4 slots
+    localparam int N_XBAR = N_SLOTS + 1;
     localparam int SEL_W  = $clog2(N_XBAR);
 
     // =========================================================================
@@ -84,17 +82,13 @@ module top #(
         .tx_din   (uart_tx_din),
         .rx_dout  (uart_rx_dout),
         .sw_effect(sw_effect),
-        .wr_en    (cmd_wr_toggle),   // toggle signal (not a pulse)
-        .wr_addr  (cmd_wr_addr),     // held stable between toggles
-        .wr_data  (cmd_wr_data)      // held stable between toggles
+        .wr_en    (cmd_wr_toggle),
+        .wr_addr  (cmd_wr_addr),
+        .wr_data  (cmd_wr_data)
     );
 
     // =========================================================================
     // CDC: sys_clk → clk_audio (toggle handshake)
-    //
-    // cmd.sv flips wr_toggle on each register write and holds addr/data stable.
-    // We double-flop the toggle, XOR-detect the change to produce a 1-cycle
-    // write pulse in the audio domain.
     // =========================================================================
     logic       tog_s1, tog_s2, tog_prev;
     logic [7:0] addr_s1, addr_s2;
@@ -104,10 +98,20 @@ module top #(
     logic [7:0] wr_data_audio;
 
     always_ff @(posedge clk_audio) begin
-        tog_s1  <= cmd_wr_toggle;   tog_s2  <= tog_s1;
-        addr_s1 <= cmd_wr_addr;     addr_s2 <= addr_s1;
-        data_s1 <= cmd_wr_data;     data_s2 <= data_s1;
-        tog_prev <= tog_s2;
+        if (!resetn) begin
+            tog_s1   <= 1'b0;
+            tog_s2   <= 1'b0;
+            tog_prev <= 1'b0;
+            addr_s1  <= 8'd0;
+            addr_s2  <= 8'd0;
+            data_s1  <= 8'd0;
+            data_s2  <= 8'd0;
+        end else begin
+            tog_s1  <= cmd_wr_toggle;   tog_s2  <= tog_s1;
+            addr_s1 <= cmd_wr_addr;     addr_s2 <= addr_s1;
+            data_s1 <= cmd_wr_data;     data_s2 <= data_s1;
+            tog_prev <= tog_s2;
+        end
     end
 
     assign wr_en_audio   = tog_s2 ^ tog_prev;
@@ -157,31 +161,80 @@ module top #(
     end
 
     // =========================================================================
-    // AXI-Stream Audio I/O
+    // I2S Audio - uses original audio.sv (proven working i2s2 wrapper)
+    // =========================================================================
+    logic [23:0] din_l, din_r;     // TX to DAC
+    logic [23:0] dout_l, dout_r;   // RX from ADC
+
+    audio #(.AUDIO_W(24)) audio_inst (
+        .clk_audio (clk_audio),
+        .resetn    (resetn),
+        .tx_mclk   (i2s2_tx_mclk),
+        .tx_lrclk  (i2s2_tx_lrclk),
+        .tx_sclk   (i2s2_tx_sclk),
+        .tx_serial (i2s2_tx),
+        .rx_mclk   (i2s2_rx_mclk),
+        .rx_lrclk  (i2s2_rx_lrclk),
+        .rx_sclk   (i2s2_rx_sclk),
+        .rx_serial (i2s2_rx),
+        .din_l     (din_l),
+        .din_r     (din_r),
+        .dout_l    (dout_l),
+        .dout_r    (dout_r)
+    );
+
+    // ---- sample_en: lrclk rising-edge detect (same as original top.sv) ----
+    logic lrclk_prev, sample_en;
+    always_ff @(posedge clk_audio) begin
+        lrclk_prev <= i2s2_tx_lrclk;
+    end
+    assign sample_en = i2s2_tx_lrclk & ~lrclk_prev;
+
+    // =========================================================================
+    // ADC → AXI-Stream master (port 0)
+    //
+    // On sample_en, pack stereo ADC data and assert tvalid for 1 cycle.
     // =========================================================================
     logic [47:0] adc_tdata;
-    logic        adc_tvalid, adc_tready;
-    logic [47:0] dac_tdata;
-    logic        dac_tvalid, dac_tready;
+    logic        adc_tvalid;
 
-    audio_axis #(.AUDIO_W(24)) audio_inst (
-        .clk_audio    (clk_audio),
-        .resetn       (resetn),
-        .tx_mclk      (i2s2_tx_mclk),
-        .tx_lrclk     (i2s2_tx_lrclk),
-        .tx_sclk      (i2s2_tx_sclk),
-        .tx_serial    (i2s2_tx),
-        .rx_mclk      (i2s2_rx_mclk),
-        .rx_lrclk     (i2s2_rx_lrclk),
-        .rx_sclk      (i2s2_rx_sclk),
-        .rx_serial    (i2s2_rx),
-        .m_axis_tdata (adc_tdata),
-        .m_axis_tvalid(adc_tvalid),
-        .m_axis_tready(adc_tready),
-        .s_axis_tdata (dac_tdata),
-        .s_axis_tvalid(dac_tvalid),
-        .s_axis_tready(dac_tready)
-    );
+    always_ff @(posedge clk_audio) begin
+        if (!resetn) begin
+            adc_tdata  <= '0;
+            adc_tvalid <= 1'b0;
+        end else begin
+            adc_tvalid <= sample_en;
+            if (sample_en)
+                adc_tdata <= pack_stereo($signed(dout_l), $signed(dout_r));
+        end
+    end
+
+    // =========================================================================
+    // DAC ← AXI-Stream slave (port 0)
+    //
+    // Whenever the crossbar delivers valid data, latch it for I2S TX.
+    // din_l/din_r are continuous register outputs read by i2s2 at load_tx.
+    // =========================================================================
+    logic [47:0] dac_tdata;
+    logic        dac_tvalid;
+
+    // *** ACTIVE DIAGNOSTIC BYPASS ***
+    // Hardwired ADC→DAC passthrough - no crossbar, no AXI-Stream, no slots.
+    // If noise is gone with this, the bug is in the new infrastructure.
+    // If noise persists, the bug is in audio.sv / i2s2 / clock / board.
+    // Comment out these 2 lines and uncomment the always_ff below to restore.
+    //assign din_l = dout_l;
+    //assign din_r = dout_r;
+
+     always_ff @(posedge clk_audio) begin
+         if (!resetn) begin
+             din_l <= '0;
+             din_r <= '0;
+         end else if (dac_tvalid) begin
+             din_l <= unpack_left(dac_tdata);
+             din_r <= unpack_right(dac_tdata);
+         end
+     end
 
     // =========================================================================
     // Crossbar (5 symmetric ports)
@@ -207,26 +260,21 @@ module top #(
         .s_tready(xbar_s_tready)
     );
 
-    // ---- Port 0: ADC (master) + DAC (slave) ----
+    // ---- Port 0: ADC master + DAC slave ----
     assign xbar_m_tdata [0] = adc_tdata;
     assign xbar_m_tvalid[0] = adc_tvalid;
-    assign adc_tready       = xbar_m_tready[0];
+    // adc_tready not used (fire-and-forget)
 
-    assign dac_tdata        = xbar_s_tdata [0];
-    assign dac_tvalid       = xbar_s_tvalid[0];
-    assign xbar_s_tready[0] = dac_tready;
+    assign dac_tdata         = xbar_s_tdata [0];
+    assign dac_tvalid        = xbar_s_tvalid[0];
+    assign xbar_s_tready[0]  = 1'b1;  // DAC always accepts
 
     // =========================================================================
     // Effect Slots
-    //
-    // Slot i occupies crossbar port (i+1):
-    //   Slot input  ← crossbar slave port  (i+1)
-    //   Slot output → crossbar master port (i+1)
     // =========================================================================
 
     localparam int EFFECT_TYPES [N_SLOTS] = '{0, 1, 2, 3};
 
-    //                                                          reg7   reg6   reg5   reg4   reg3   reg2   reg1   reg0
     localparam logic [63:0] INIT_SLOT0 = {8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'hB4, 8'h3C};
     localparam logic [63:0] INIT_SLOT1 = {8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h50};
     localparam logic [63:0] INIT_SLOT2 = {8'h00, 8'h00, 8'h00, 8'h80, 8'hC8, 8'h80, 8'h64, 8'h50};

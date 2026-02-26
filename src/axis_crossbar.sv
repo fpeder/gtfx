@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // ============================================================================
-// axis_crossbar.sv — N-port AXI-Stream routing crossbar
+// axis_crossbar.sv - N-port AXI-Stream routing crossbar
 //
 // Pure combinational switch: each output (slave) port has a SEL_W-bit route
 // register that selects which input (master) port it reads from.
@@ -11,9 +11,9 @@
 //   - Slave  ports are OUTPUTS from the crossbar (sinks pull data out)
 //
 // Port indexing convention:
-//   port 0           = ADC source (master only — feeds data in)
+//   port 0           = ADC source (master only - feeds data in)
 //   port 1..N_SLOTS  = effect slots (both master and slave)
-//   port N_SLOTS+1   = DAC sink (slave only — consumes data out)
+//   port N_SLOTS+1   = DAC sink (slave only - consumes data out)
 //
 // Multiple sinks may select the same master (fan-out).
 // tready is OR-reduced across all sinks selecting a given master.
@@ -23,7 +23,7 @@
 // ============================================================================
 
 module axis_crossbar #(
-    parameter int N_PORTS = 6,
+    parameter int N_PORTS = 5,
     parameter int DATA_W  = 48,
     parameter int SEL_W   = $clog2(N_PORTS)
 )(

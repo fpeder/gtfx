@@ -26,7 +26,7 @@ module ctrl_bus #(
     parameter int N_SLOTS    = 4,
     parameter int REGS_PER   = 8,
     parameter int REG_W      = 8,
-    parameter int N_XBAR     = N_SLOTS + 2,
+    parameter int N_XBAR     = N_SLOTS + 1,
     parameter int SEL_W      = $clog2(N_XBAR),
     parameter int ADDR_W     = 8          // flat address width
 )(
@@ -78,8 +78,9 @@ module ctrl_bus #(
     // route[5] = 4 → DAC ← DLY
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            for (int i = 0; i < N_XBAR; i++)
-                route_regs[i] <= (i == 0) ? SEL_W'(N_SLOTS) : SEL_W'(i - 1);
+            route_regs[0] <= SEL_W'(N_SLOTS);  // DAC ← last slot
+            for (int i = 1; i < N_XBAR; i++)
+                route_regs[i] <= SEL_W'(i - 1);   // slot[i] ← slot[i-1] or ADC
             for (int i = 0; i < N_SLOTS; i++)
                 bypass_regs[i] <= 1'b0;
         end else if (wr_en) begin
