@@ -5,8 +5,7 @@
 //  - Dedicated `tx_msg_sel` enum replaces the rx_latch-as-message-selector hack
 //  - `send_msg()` task centralises the repetitive {tx_len, tx_idx, rx_latch,
 //    state, return_state} boilerplate that appeared ~10 times
-//  - `send_err()` / `send_ok()` / `send_prompt()` one-liner wrappers for the
-//    three most common response sequences
+//  - `send_err()` / `send_prompt()` one-liner wrappers (OK response removed)
 //  - `emit_port_src()` task eliminates the 5× duplicate case block in S_ST_ROUTE
 //  - `emit_param()` task eliminates character-by-character tx_buf packing that
 //    was copy-pasted across all status states
@@ -16,6 +15,8 @@
 //  - `default` branch added to the state case to prevent latch inference
 //  - All magic numbers replaced with named localparam constants
 //  - State enum widened to 6 bits and kept contiguous for easy expansion
+//  - OK response removed; successful writes go directly back to prompt
+//  - "status" command remapped to single character ';'
 // =============================================================================
 
 module cmd_proc_v2 (
@@ -65,6 +66,9 @@ module cmd_proc_v2 (
   //   set dly lvl <hex>       → 0x19
   //   set dly fdb <hex>       → 0x1A
   //   set dly tim <hex8>      → 0x1B..0x1C (2 writes, LE)
+  //
+  //  Successful writes return directly to prompt (no OK response).
+  //  Status is triggered by a single ';' character (no Enter needed).
   // ===========================================================================
 
   // ---------------------------------------------------------------------------
@@ -107,8 +111,6 @@ module cmd_proc_v2 (
   // ---------------------------------------------------------------------------
   localparam logic [7:0] MSG_PROMPT [0:2] = '{">"," "," "};
   localparam int         LEN_PROMPT = 2;
-  localparam logic [7:0] MSG_OK  [0:3]   = '{"O","K", CHAR_CR, CHAR_LF};
-  localparam int         LEN_OK   = 4;
   localparam logic [7:0] MSG_ERR [0:4]   = '{"E","r","r", CHAR_CR, CHAR_LF};
   localparam int         LEN_ERR  = 5;
 
@@ -142,10 +144,9 @@ module cmd_proc_v2 (
   // ---------------------------------------------------------------------------
   // Message selector - replaces the rx_latch-overload in the original
   // ---------------------------------------------------------------------------
-  typedef enum logic [1:0] {
-    MSG_SEL_PROMPT = 2'd0,
-    MSG_SEL_OK     = 2'd1,
-    MSG_SEL_ERR    = 2'd2
+  typedef enum logic {
+    MSG_SEL_PROMPT = 1'd0,
+    MSG_SEL_ERR    = 1'd1
   } msg_sel_t;
 
   msg_sel_t tx_msg_sel = MSG_SEL_PROMPT;
@@ -302,12 +303,11 @@ module cmd_proc_v2 (
   endtask
 
   // ===========================================================================
-  // TX sequencing macros implemented as tasks
+  // TX sequencing tasks
   //
-  // send_msg():   load a canned message then transmit it, returning to `ret`
-  // send_ok():    shorthand for OK + prompt
-  // send_err():   shorthand for Err + prompt
-  // send_prompt():shorthand for just the prompt
+  // send_msg():    load a canned message then transmit it, returning to `ret`
+  // send_err():    shorthand for Err + prompt
+  // send_prompt(): shorthand for just the prompt
   // ===========================================================================
 
   task automatic send_msg(
@@ -320,10 +320,6 @@ module cmd_proc_v2 (
     tx_idx       <= '0;
     state        <= S_LOAD_STRING;
     return_state <= ret;
-  endtask
-
-  task automatic send_ok();
-    send_msg(MSG_SEL_OK, LEN_OK, S_LOAD_PROMPT);
   endtask
 
   task automatic send_err();
@@ -368,9 +364,17 @@ module cmd_proc_v2 (
       shadow[24] <= 8'hFF; shadow[25] <= 8'h80; shadow[26] <= 8'h64;
       shadow[27] <= 8'hD0; shadow[28] <= 8'h07;
 
-      // Default route: port0←4, port1←0, port2←1, port3←2, port4←3
-      for (int i = 0; i < 5; i++)
-        shadow_route[i] <= (i == 0) ? 8'd4 : 8'(i - 1);
+      // Default route: symmetric chain ADC→TRM→PHA→CHO→DLY→DAC
+      //   route[0] = DAC source  ← DLY (4)
+      //   route[1] = TRM source  ← ADC (0)
+      //   route[2] = PHA source  ← TRM (1)
+      //   route[3] = CHO source  ← PHA (2)
+      //   route[4] = DLY source  ← CHO (3)
+      shadow_route[0] <= 8'd4;  // DAC ← DLY
+      shadow_route[1] <= 8'd0;  // TRM ← ADC
+      shadow_route[2] <= 8'd1;  // PHA ← TRM
+      shadow_route[3] <= 8'd2;  // CHO ← PHA
+      shadow_route[4] <= 8'd3;  // DLY ← CHO
 
       for (int i = 0; i < 4; i++) shadow_byp[i] <= '0;
 
@@ -430,6 +434,16 @@ module cmd_proc_v2 (
             end
             state <= S_TX_START;
 
+          end else if (rx_latch == ";") begin
+            // Instant status trigger - no Enter required, clears pending line
+            cmd_idx <= '0;
+            tx_buf[0] <= CHAR_CR;
+            tx_buf[1] <= CHAR_LF;
+            tx_len    <= 2;
+            tx_idx    <= '0;
+            return_state <= S_ST_ROUTE;
+            state <= S_TX_START;
+
           end else if (rx_latch == CHAR_BS || rx_latch == CHAR_DEL) begin
             state <= S_BACKSPACE;
 
@@ -471,21 +485,19 @@ module cmd_proc_v2 (
         // S_CHECK_CMD: dispatch on command verb
         //
         // Command buffer layout:
-        //   "status"                → status dump
         //   "wr <AABB>"            → raw write (addr=AA data=BB)
         //   "set <EFX> <PRM> <V>"  → register write
         //     EFX positions 4..6, PRM positions 8..10, VAL from pos 12
         //   "set rte <N> <V>"      → route write
         //   "set byp <N> <V>"      → bypass write
+        //
+        //  Note: ';' is handled in S_RX_CHAR directly (no line buffer needed)
         // ============================================================
         S_CHECK_CMD: begin
           cmd_idx      <= '0;
           target_is_time <= '0;
 
-          if (str_match(0, "status")) begin
-            state <= S_ST_ROUTE;
-
-          end else if (m3(0, "w","r"," ")) begin
+          if (m3(0, "w","r"," ")) begin
             // Raw write: "wr <AABB>" - parse 4 hex digits into parse_acc[15:0]
             parse_ptr   <= 3;
             target_addr <= ADDR_RAW_SENTINEL;
@@ -581,14 +593,13 @@ module cmd_proc_v2 (
             // DLY input
             tx_buf[p] <= "D"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "Y"; p++;
             tx_buf[p] <= "<"; p++;
-            emit_port_src(shadow_route[4][2:0], p);  // NOTE: route[4] is valid (array [0:4])
+            emit_port_src(shadow_route[4][2:0], p);
             tx_buf[p] <= " "; p++;
 
-            // DAC source = whoever drives port 4 output; shown as route[4] downstream.
-            // In this design the DAC mux selector is route[4] itself (the DLY output port).
+            // DAC source - route[0] is the dedicated DAC mux selector
             tx_buf[p] <= "D"; p++; tx_buf[p] <= "A"; p++; tx_buf[p] <= "C"; p++;
             tx_buf[p] <= "<"; p++;
-            emit_port_src(shadow_route[4][2:0], p);
+            emit_port_src(shadow_route[0][2:0], p);
             st_nl(p);
           end
 
@@ -730,7 +741,7 @@ module cmd_proc_v2 (
               wr_data_reg <= parse_acc[7:0];
               wr_en_reg   <= 1'b1;
               update_shadow(parse_acc[15:8], parse_acc[7:0]);
-              send_ok();
+              send_prompt();
 
             end else if (target_is_time) begin
               // 16-bit LE time write
@@ -752,7 +763,7 @@ module cmd_proc_v2 (
           wr_data_reg <= parse_acc[7:0];
           wr_en_reg   <= 1'b1;
           update_shadow(target_addr, parse_acc[7:0]);
-          send_ok();
+          send_prompt();
         end
 
         // ============================================================
@@ -783,7 +794,7 @@ module cmd_proc_v2 (
             // Gap phase: deassert wr_en, advance or finish
             wr_en_reg <= '0;
             if (time_wr_idx) begin
-              send_ok();
+              send_prompt();
             end else begin
               time_wr_idx <= 1'b1;
               cdc_wait    <= 5'(CDC_WAIT_CYCLES);
@@ -808,7 +819,6 @@ module cmd_proc_v2 (
           if (tx_idx < tx_len) begin
             case (tx_msg_sel)
               MSG_SEL_PROMPT: tx_buf[tx_idx] <= MSG_PROMPT[tx_idx];
-              MSG_SEL_OK:     tx_buf[tx_idx] <= MSG_OK    [tx_idx];
               MSG_SEL_ERR:    tx_buf[tx_idx] <= MSG_ERR   [tx_idx];
               default:        tx_buf[tx_idx] <= MSG_ERR   [tx_idx];
             endcase
