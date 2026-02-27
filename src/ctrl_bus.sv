@@ -1,16 +1,17 @@
 `timescale 1ns / 1ps
 
 // ============================================================================
-// ctrl_bus.sv - Centralised control register file
+// ctrl_bus.sv - Centralised control register file (shared config RAM)
 //
-// Single write port from cmd_proc.  Decodes addresses into:
-//   - Per-slot control registers (forwarded to each slot's local reg file)
-//   - Crossbar route registers
-//   - Per-slot bypass flags
+// All slot parameters live in a single flat array:
+//   cfg_mem[slot * REGS_PER + reg_idx]
+//
+// This array is exposed as an output so every axis_effect_slot can read its
+// own slice combinationally - no per-slot write strobes needed.
 //
 // Address map (flat, 8-bit addresses):
 //
-//   0x00..0x07 : Slot 0 registers  (CTRL_REGS_PER_SLOT = 8)
+//   0x00..0x07 : Slot 0 registers  (REGS_PER = 8)
 //   0x08..0x0F : Slot 1 registers
 //   0x10..0x17 : Slot 2 registers
 //   0x18..0x1F : Slot 3 registers
@@ -18,8 +19,9 @@
 //   0x40..0x44 : route[0] .. route[N_XBAR-1]   (crossbar routing)
 //   0x48..0x4B : bypass[0] .. bypass[N_SLOTS-1]
 //
-// The route and bypass registers are stored locally and exposed as outputs.
-// Slot registers are forwarded via slot_wr / slot_addr / slot_wdata.
+// Compared to the forwarded-write approach:
+//   REMOVED  slot_wr / slot_addr / slot_wdata arrays (N_SLOTS × 3 ports)
+//   ADDED    cfg_mem output - one flat array, slots index it themselves
 // ============================================================================
 
 module ctrl_bus #(
@@ -28,107 +30,113 @@ module ctrl_bus #(
     parameter int REG_W      = 8,
     parameter int N_XBAR     = N_SLOTS + 1,
     parameter int SEL_W      = $clog2(N_XBAR),
-    parameter int ADDR_W     = 8          // flat address width
+    parameter int ADDR_W     = 8,
+    // Total config memory depth
+    parameter int CFG_DEPTH  = N_SLOTS * REGS_PER
 )(
-    input  logic             clk,
-    input  logic             rst_n,
+    input  logic              clk,
+    input  logic              rst_n,
 
-    // Write port (from cmd_proc adapter)
-    input  logic             wr_en,
+    // ---- Write port (from cmd_proc adapter) ----
+    input  logic              wr_en,
     input  logic [ADDR_W-1:0] wr_addr,
-    input  logic [REG_W-1:0] wr_data,
+    input  logic [REG_W-1:0]  wr_data,
 
-    // Read port (optional, active on wr_addr)
-    output logic [REG_W-1:0] rd_data,
+    // ---- Read-back port ----
+    // Registered one cycle after wr_addr is presented.
+    output logic [REG_W-1:0]  rd_data,
 
-    // Per-slot forwarded writes
-    output logic             slot_wr    [N_SLOTS],
-    output logic [$clog2(REGS_PER)-1:0] slot_addr [N_SLOTS],
-    output logic [REG_W-1:0] slot_wdata [N_SLOTS],
+    // ---- Shared config RAM ----
+    // Each slot reads: cfg_mem[SLOT_ID * REGS_PER + reg_idx]
+    // Combinational output; slots see new values the cycle after a write.
+    output logic [REG_W-1:0]  cfg_mem [CFG_DEPTH],
 
-    // Crossbar routing
-    output logic [SEL_W-1:0] route      [N_XBAR],
+    // ---- Crossbar routing ----
+    output logic [SEL_W-1:0]  route   [N_XBAR],
 
-    // Per-slot bypass
-    output logic             bypass     [N_SLOTS]
+    // ---- Per-slot bypass ----
+    output logic              bypass  [N_SLOTS]
 );
 
-    // ---- Address map constants ----
-    localparam int SLOT_BASE   = 0;                             // 0x00
-    localparam int SLOT_END    = N_SLOTS * REGS_PER;            // 0x20 for 4 slots
+    // =========================================================================
+    // Address map constants
+    // =========================================================================
+    localparam int SLOT_END    = N_SLOTS * REGS_PER;   // 0x20 for 4 slots
     localparam int ROUTE_BASE  = 8'h40;
     localparam int ROUTE_END   = ROUTE_BASE + N_XBAR;
     localparam int BYPASS_BASE = 8'h48;
     localparam int BYPASS_END  = BYPASS_BASE + N_SLOTS;
 
-    // ---- Route registers ----
-    logic [SEL_W-1:0] route_regs [N_XBAR];
-
-    // ---- Bypass registers ----
-    logic bypass_regs [N_SLOTS];
-
-    // ---- Default routing: linear chain ----
-    // Symmetric port map: 0=ADC 1=TRM 2=PHA 3=CHO 4=DLY 5=DAC
-    //
-    // route[0] = 0 (don't care - ADC sink is dummy)
-    // route[1] = 0 → TRM ← ADC
-    // route[2] = 1 → PHA ← TRM
-    // route[3] = 2 → CHO ← PHA
-    // route[4] = 3 → DLY ← CHO
-    // route[5] = 4 → DAC ← DLY
+    // =========================================================================
+    // Config RAM  (slot registers)
+    // cfg_mem is an output port driven directly by the register - no internal
+    // shadow copy needed.
+    // =========================================================================
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            route_regs[0] <= SEL_W'(N_SLOTS);  // DAC ← last slot
+            for (int i = 0; i < CFG_DEPTH; i++)
+                cfg_mem[i] <= '0;
+            // Slot 0 (tremolo): rate=0x3C depth=0xB4 shape=0x00
+            cfg_mem[0] <= 8'h3C;
+            cfg_mem[1] <= 8'hB4;
+            // Slot 1 (phaser): speed=0x50 feedback_en=0x00
+            cfg_mem[8] <= 8'h50;
+            // Slot 2 (chorus): rate=0x50 depth=0x64 effect_lvl=0x80 eq_hi=0xC8 eq_lo=0x80
+            cfg_mem[16] <= 8'h50; cfg_mem[17] <= 8'h64; cfg_mem[18] <= 8'h80;
+            cfg_mem[19] <= 8'hC8; cfg_mem[20] <= 8'h80;
+            // Slot 3 (dd3): tone=0xFF level=0x80 feedback=0x64 time=0x07D0 (LE: D0,07)
+            cfg_mem[24] <= 8'hFF; cfg_mem[25] <= 8'h80; cfg_mem[26] <= 8'h64;
+            cfg_mem[27] <= 8'hD0; cfg_mem[28] <= 8'h07;
+        end else if (wr_en && wr_addr < ADDR_W'(SLOT_END)) begin
+            cfg_mem[wr_addr] <= wr_data;
+        end
+    end
+
+    // =========================================================================
+    // Route registers
+    // =========================================================================
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            // Default: linear chain  slot[i] ← slot[i-1] or ADC
+            route[0] <= SEL_W'(N_SLOTS);        // DAC ← last slot
             for (int i = 1; i < N_XBAR; i++)
-                route_regs[i] <= SEL_W'(i - 1);   // slot[i] ← slot[i-1] or ADC
+                route[i] <= SEL_W'(i - 1);
+        end else if (wr_en &&
+                     wr_addr >= ADDR_W'(ROUTE_BASE) &&
+                     wr_addr <  ADDR_W'(ROUTE_END)) begin
+            route[wr_addr - ADDR_W'(ROUTE_BASE)] <= wr_data[SEL_W-1:0];
+        end
+    end
+
+    // =========================================================================
+    // Bypass registers
+    // =========================================================================
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
             for (int i = 0; i < N_SLOTS; i++)
-                bypass_regs[i] <= 1'b0;
-        end else if (wr_en) begin
-            // Route write
-            if (wr_addr >= ADDR_W'(ROUTE_BASE) && wr_addr < ADDR_W'(ROUTE_END))
-                route_regs[wr_addr - ADDR_W'(ROUTE_BASE)] <= wr_data[SEL_W-1:0];
-            // Bypass write
-            if (wr_addr >= ADDR_W'(BYPASS_BASE) && wr_addr < ADDR_W'(BYPASS_END))
-                bypass_regs[wr_addr - ADDR_W'(BYPASS_BASE)] <= wr_data[0];
+                bypass[i] <= 1'b0;
+        end else if (wr_en &&
+                     wr_addr >= ADDR_W'(BYPASS_BASE) &&
+                     wr_addr <  ADDR_W'(BYPASS_END)) begin
+            bypass[wr_addr - ADDR_W'(BYPASS_BASE)] <= wr_data[0];
         end
     end
 
-    // ---- Output route and bypass ----
-    always_comb begin
-        for (int i = 0; i < N_XBAR; i++)
-            route[i] = route_regs[i];
-        for (int i = 0; i < N_SLOTS; i++)
-            bypass[i] = bypass_regs[i];
-    end
-
-    // ---- Slot register forwarding ----
-    // Decode: if wr_addr is in [slot_base, slot_end), forward to correct slot
-    always_comb begin
-        for (int i = 0; i < N_SLOTS; i++) begin
-            slot_wr[i]    = 1'b0;
-            slot_addr[i]  = '0;
-            slot_wdata[i] = '0;
+    // =========================================================================
+    // Read-back  (registered, one cycle latency)
+    // =========================================================================
+    always_ff @(posedge clk) begin
+        if (!rst_n) begin
+            rd_data <= '0;
+        end else begin
+            rd_data <= '0;
+            if (wr_addr < ADDR_W'(SLOT_END))
+                rd_data <= cfg_mem[wr_addr];
+            else if (wr_addr >= ADDR_W'(ROUTE_BASE) && wr_addr < ADDR_W'(ROUTE_END))
+                rd_data <= REG_W'(route[wr_addr - ADDR_W'(ROUTE_BASE)]);
+            else if (wr_addr >= ADDR_W'(BYPASS_BASE) && wr_addr < ADDR_W'(BYPASS_END))
+                rd_data <= REG_W'(bypass[wr_addr - ADDR_W'(BYPASS_BASE)]);
         end
-
-        if (wr_en && wr_addr < ADDR_W'(SLOT_END)) begin
-            for (int s = 0; s < N_SLOTS; s++) begin
-                if (wr_addr >= ADDR_W'(s * REGS_PER) &&
-                    wr_addr <  ADDR_W'((s + 1) * REGS_PER)) begin
-                    slot_wr[s]    = 1'b1;
-                    slot_addr[s]  = wr_addr[$clog2(REGS_PER)-1:0];
-                    slot_wdata[s] = wr_data;
-                end
-            end
-        end
-    end
-
-    // ---- Read-back (optional) ----
-    always_comb begin
-        rd_data = '0;
-        if (wr_addr >= ADDR_W'(ROUTE_BASE) && wr_addr < ADDR_W'(ROUTE_END))
-            rd_data = REG_W'(route_regs[wr_addr - ADDR_W'(ROUTE_BASE)]);
-        else if (wr_addr >= ADDR_W'(BYPASS_BASE) && wr_addr < ADDR_W'(BYPASS_END))
-            rd_data = REG_W'(bypass_regs[wr_addr - ADDR_W'(BYPASS_BASE)]);
     end
 
 endmodule

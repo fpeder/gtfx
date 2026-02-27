@@ -22,7 +22,9 @@
 // ============================================================================
 
 module top #(
-    parameter int N_SLOTS = 4
+    parameter int N_SLOTS  = 4,
+    parameter int REGS_PER = 8,
+    parameter int REG_W    = 8
 )(
     input  logic       sys_clk,
     input  logic       resetn,
@@ -51,8 +53,9 @@ module top #(
 
     import axis_audio_pkg::*;
 
-    localparam int N_XBAR = N_SLOTS + 1;
-    localparam int SEL_W  = $clog2(N_XBAR);
+    localparam int N_XBAR   = N_SLOTS + 1;
+    localparam int SEL_W    = $clog2(N_XBAR);
+    localparam int CFG_DEPTH = N_SLOTS * REGS_PER;
 
     // =========================================================================
     // Clock
@@ -126,32 +129,28 @@ module top #(
     end
 
     // =========================================================================
-    // Control Bus
+    // Control Bus  (shared config RAM)
     // =========================================================================
-    logic             slot_wr    [N_SLOTS];
-    logic [$clog2(8)-1:0] slot_addr [N_SLOTS];
-    logic [7:0]       slot_wdata [N_SLOTS];
+    logic [REG_W-1:0] cfg_mem    [CFG_DEPTH];   // shared config RAM
     logic [SEL_W-1:0] route      [N_XBAR];
     logic             ctrl_bypass[N_SLOTS];
 
     ctrl_bus #(
-        .N_SLOTS (N_SLOTS),
-        .REGS_PER(8),
-        .REG_W   (8),
-        .N_XBAR  (N_XBAR),
-        .SEL_W   (SEL_W)
+        .N_SLOTS  (N_SLOTS),
+        .REGS_PER (REGS_PER),
+        .REG_W    (REG_W),
+        .N_XBAR   (N_XBAR),
+        .SEL_W    (SEL_W)
     ) ctrl_inst (
-        .clk       (clk_audio),
-        .rst_n     (resetn),
-        .wr_en     (wr_en_audio),
-        .wr_addr   (wr_addr_audio),
-        .wr_data   (wr_data_audio),
-        .rd_data   (),
-        .slot_wr   (slot_wr),
-        .slot_addr (slot_addr),
-        .slot_wdata(slot_wdata),
-        .route     (route),
-        .bypass    (ctrl_bypass)
+        .clk     (clk_audio),
+        .rst_n   (resetn),
+        .wr_en   (wr_en_audio),
+        .wr_addr (wr_addr_audio),
+        .wr_data (wr_data_audio),
+        .rd_data (),
+        .cfg_mem (cfg_mem),
+        .route   (route),
+        .bypass  (ctrl_bypass)
     );
 
     logic bypass_merged [N_SLOTS];
@@ -218,23 +217,15 @@ module top #(
     logic [47:0] dac_tdata;
     logic        dac_tvalid;
 
-    // *** ACTIVE DIAGNOSTIC BYPASS ***
-    // Hardwired ADC→DAC passthrough - no crossbar, no AXI-Stream, no slots.
-    // If noise is gone with this, the bug is in the new infrastructure.
-    // If noise persists, the bug is in audio.sv / i2s2 / clock / board.
-    // Comment out these 2 lines and uncomment the always_ff below to restore.
-    //assign din_l = dout_l;
-    //assign din_r = dout_r;
-
-     always_ff @(posedge clk_audio) begin
-         if (!resetn) begin
-             din_l <= '0;
-             din_r <= '0;
-         end else if (dac_tvalid) begin
-             din_l <= unpack_left(dac_tdata);
-             din_r <= unpack_right(dac_tdata);
-         end
-     end
+    always_ff @(posedge clk_audio) begin
+        if (!resetn) begin
+            din_l <= '0;
+            din_r <= '0;
+        end else if (dac_tvalid) begin
+            din_l <= unpack_left(dac_tdata);
+            din_r <= unpack_right(dac_tdata);
+        end
+    end
 
     // =========================================================================
     // Crossbar (5 symmetric ports)
@@ -265,34 +256,25 @@ module top #(
     assign xbar_m_tvalid[0] = adc_tvalid;
     // adc_tready not used (fire-and-forget)
 
-    assign dac_tdata         = xbar_s_tdata [0];
-    assign dac_tvalid        = xbar_s_tvalid[0];
-    assign xbar_s_tready[0]  = 1'b1;  // DAC always accepts
+    assign dac_tdata        = xbar_s_tdata [0];
+    assign dac_tvalid       = xbar_s_tvalid[0];
+    assign xbar_s_tready[0] = 1'b1;  // DAC always accepts
 
     // =========================================================================
     // Effect Slots
     // =========================================================================
-
     localparam int EFFECT_TYPES [N_SLOTS] = '{0, 1, 2, 3};
-
-    localparam logic [63:0] INIT_SLOT0 = {8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'hB4, 8'h3C};
-    localparam logic [63:0] INIT_SLOT1 = {8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h00, 8'h50};
-    localparam logic [63:0] INIT_SLOT2 = {8'h00, 8'h00, 8'h00, 8'h80, 8'hC8, 8'h80, 8'h64, 8'h50};
-    localparam logic [63:0] INIT_SLOT3 = {8'h00, 8'h00, 8'h00, 8'h07, 8'hD0, 8'h64, 8'h80, 8'hFF};
-
-    localparam logic [63:0] SLOT_INITS [0:3] = '{INIT_SLOT0, INIT_SLOT1, INIT_SLOT2, INIT_SLOT3};
 
     for (genvar i = 0; i < N_SLOTS; i++) begin : gen_slot
         axis_effect_slot #(
             .SLOT_ID          (i),
             .EFFECT_TYPE      (EFFECT_TYPES[i]),
             .DATA_W           (48),
-            .CTRL_DEPTH       (8),
-            .CTRL_W           (8),
+            .CTRL_DEPTH       (REGS_PER),
+            .CTRL_W           (REG_W),
             .AUDIO_W          (24),
             .CHORUS_DELAY_MAX (2048),
-            .DD3_RAM_DEPTH    (48000),
-            .INIT_PACKED      (SLOT_INITS[i])
+            .DD3_RAM_DEPTH    (48000)
         ) slot_inst (
             .clk           (clk_audio),
             .rst_n         (resetn),
@@ -302,9 +284,7 @@ module top #(
             .m_axis_tdata  (xbar_m_tdata [i + 1]),
             .m_axis_tvalid (xbar_m_tvalid[i + 1]),
             .m_axis_tready (xbar_m_tready[i + 1]),
-            .ctrl_wr       (slot_wr[i]),
-            .ctrl_addr     (slot_addr[i]),
-            .ctrl_wdata    (slot_wdata[i]),
+            .cfg_slice     (cfg_mem[i*REGS_PER +: REGS_PER]),
             .bypass        (bypass_merged[i])
         );
     end

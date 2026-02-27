@@ -5,7 +5,7 @@
 //
 // Generic wrapper providing:
 //   - AXI-Stream slave (input) and master (output) with 48-bit stereo tdata
-//   - Local register file (written by ctrl_bus)
+//   - Parameters read directly from shared cfg_mem (no local register file)
 //   - sample_en / audio_in / audio_out bridge to the original effect core
 //   - Bypass mux (bypass=1 → straight passthrough, effect still clocked)
 //   - Parameterised effect selection via EFFECT_TYPE
@@ -16,11 +16,23 @@
 //   2 = chorus   (mono in, stereo out)
 //   3 = dd3      (mono in, wet-only out + dry/wet mix)
 //
-// Register map (per slot, 8 bytes):
+// Register map (per slot, 8 bytes, indexed from cfg_mem[SLOT_ID*CTRL_DEPTH]):
 //   tremolo: [0]=rate  [1]=depth  [2]=shape(bit0)
 //   phaser:  [0]=speed [1]=feedback_en(bit0)
 //   chorus:  [0]=rate  [1]=depth  [2]=effect_lvl [3]=eq_hi [4]=eq_lo
-//   dd3:     [0]=tone  [1]=level  [2]=feedback   [3..6]=time(32-bit LE)
+//   dd3:     [0]=tone  [1]=level  [2]=feedback   [3..4]=time(16-bit LE)
+//
+// Key change vs previous version
+// --------------------------------
+// The local register file (regs[]) and the ctrl_wr/ctrl_addr/ctrl_wdata
+// port trio have been removed.  This slot now receives a slice of the
+// shared cfg_mem from ctrl_bus:
+//
+//   input logic [CTRL_W-1:0] cfg_slice [CTRL_DEPTH]
+//
+// ctrl_bus drives cfg_slice = cfg_mem[SLOT_ID*CTRL_DEPTH +: CTRL_DEPTH].
+// Parameters are read directly from cfg_slice - no local copy or alias.
+// Parameters are always up-to-date one cycle after a ctrl_bus write.
 // ============================================================================
 
 module axis_effect_slot #(
@@ -32,10 +44,7 @@ module axis_effect_slot #(
     parameter int AUDIO_W     = 24,
     // Effect-specific parameters
     parameter int CHORUS_DELAY_MAX = 2048,
-    parameter int DD3_RAM_DEPTH    = 48000,
-    // Default register values at reset, packed: {reg7, reg6, ..., reg1, reg0}
-    // Bit layout: INIT_PACKED[7:0]=regs[0], [15:8]=regs[1], ..., [63:56]=regs[7]
-    parameter logic [CTRL_DEPTH*CTRL_W-1:0] INIT_PACKED = '0
+    parameter int DD3_RAM_DEPTH    = 48000
 )(
     input  logic clk,
     input  logic rst_n,
@@ -50,10 +59,9 @@ module axis_effect_slot #(
     output logic               m_axis_tvalid,
     input  logic               m_axis_tready,
 
-    // Control register write port (from ctrl_bus)
-    input  logic               ctrl_wr,
-    input  logic [$clog2(CTRL_DEPTH)-1:0] ctrl_addr,
-    input  logic [CTRL_W-1:0]  ctrl_wdata,
+    // ---- Shared config slice (replaces ctrl_wr/ctrl_addr/ctrl_wdata) ----
+    // Driven by ctrl_bus: cfg_slice = cfg_mem[SLOT_ID*CTRL_DEPTH +: CTRL_DEPTH]
+    input  logic [CTRL_W-1:0]  cfg_slice [CTRL_DEPTH],
 
     // Bypass
     input  logic               bypass
@@ -62,28 +70,14 @@ module axis_effect_slot #(
     import axis_audio_pkg::*;
 
     // =====================================================================
-    // Local register file
-    // =====================================================================
-    logic [CTRL_W-1:0] regs [CTRL_DEPTH];
-
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            for (int i = 0; i < CTRL_DEPTH; i++)
-                regs[i] <= INIT_PACKED[i*CTRL_W +: CTRL_W];
-        end else if (ctrl_wr) begin
-            regs[ctrl_addr] <= ctrl_wdata;
-        end
-    end
-
-    // =====================================================================
     // AXI-Stream → sample_en bridge
     // =====================================================================
     assign s_axis_tready = 1'b1;
     wire beat_in = s_axis_tvalid & s_axis_tready;
 
-    logic                        sample_en_reg;
-    logic signed [AUDIO_W-1:0]   audio_in_reg;
-    logic signed [AUDIO_W-1:0]   dry_l_hold, dry_r_hold;
+    logic                       sample_en_reg;
+    logic signed [AUDIO_W-1:0]  audio_in_reg;
+    logic signed [AUDIO_W-1:0]  dry_l_hold, dry_r_hold;
 
     always_ff @(posedge clk) begin
         if (!rst_n) begin
@@ -116,9 +110,9 @@ module axis_effect_slot #(
                 .clk       (clk),
                 .rst_n     (rst_n),
                 .sample_en (sample_en_reg),
-                .rate_val  (regs[0]),
-                .depth_val (regs[1]),
-                .shape_sel (regs[2][0]),
+                .rate_val  (cfg_slice[0]),
+                .depth_val (cfg_slice[1]),
+                .shape_sel (cfg_slice[2][0]),
                 .audio_in  (audio_in_reg),
                 .audio_out (core_out)
             );
@@ -134,8 +128,8 @@ module axis_effect_slot #(
                 .clk         (clk),
                 .rst_n       (rst_n),
                 .sample_en   (sample_en_reg),
-                .speed_val   (regs[0]),
-                .feedback_en (regs[1][0]),
+                .speed_val   (cfg_slice[0]),
+                .feedback_en (cfg_slice[1][0]),
                 .audio_in    (audio_in_reg),
                 .audio_out   (core_out)
             );
@@ -156,20 +150,20 @@ module axis_effect_slot #(
                 .audio_in   (audio_in_reg),
                 .audio_out_l(effect_out_l),
                 .audio_out_r(effect_out_r),
-                .rate       (regs[0]),
-                .depth      (regs[1]),
-                .effect_lvl (regs[2]),
-                .e_q_hi     (regs[3]),
-                .e_q_lo     (regs[4])
+                .rate       (cfg_slice[0]),
+                .depth      (cfg_slice[1]),
+                .effect_lvl (cfg_slice[2]),
+                .e_q_hi     (cfg_slice[3]),
+                .e_q_lo     (cfg_slice[4])
             );
 
         // ---- DD3 DELAY (type 3): mono in → wet-only out + dry/wet mix ----
         end else if (EFFECT_TYPE == 3) begin : gen_dd3
             logic signed [AUDIO_W-1:0] wet_out;
 
-            // Reconstruct 16-bit time_val from 2 consecutive 8-bit registers (LE)
+            // Reconstruct 16-bit time_val from two consecutive 8-bit registers (LE)
             logic [15:0] time_val_16;
-            assign time_val_16 = {regs[4], regs[3]};
+            assign time_val_16 = {cfg_slice[4], cfg_slice[3]};
 
             dd3 #(
                 .WIDTH    (AUDIO_W),
@@ -178,9 +172,9 @@ module axis_effect_slot #(
                 .clk          (clk),
                 .rst_n        (rst_n),
                 .sample_en    (sample_en_reg),
-                .tone_val     (regs[0]),
-                .level_val    (regs[1]),
-                .feedback_val (regs[2]),
+                .tone_val     (cfg_slice[0]),
+                .level_val    (cfg_slice[1]),
+                .feedback_val (cfg_slice[2]),
                 .time_val     (time_val_16),
                 .audio_in     (audio_in_reg),
                 .audio_out    (wet_out)
@@ -230,16 +224,13 @@ module axis_effect_slot #(
     end
 
     // ---- Bypass mux ----
-    // bypass=1 → forward input directly (combinational, zero latency)
-    // bypass=0 → use effect output (registered, 2-cycle latency)
-    //
-    // When bypassed, the effect still runs (keeping LFO phase etc. alive)
-    // but its output is not selected.
+    // bypass=1 → forward input directly (registered, 1-cycle latency)
+    // bypass=0 → use effect output      (registered, 2-cycle latency)
+    // Effect still runs in bypass to keep LFO phase / delay tails alive.
 
     logic [DATA_W-1:0] byp_data;
     logic              byp_valid;
 
-    // Hold bypass data for one cycle to align with beat_in
     always_ff @(posedge clk) begin
         if (!rst_n) begin
             byp_data  <= '0;
