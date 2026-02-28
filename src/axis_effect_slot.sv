@@ -165,7 +165,7 @@ module axis_effect_slot #(
             logic [15:0] time_val_16;
             assign time_val_16 = {cfg_slice[4], cfg_slice[3]};
 
-            dd3 #(
+            dd3_old #(
                 .WIDTH    (AUDIO_W),
                 .RAM_DEPTH(DD3_RAM_DEPTH)
             ) core (

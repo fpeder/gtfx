@@ -86,7 +86,7 @@ module ctrl_bus #(
             cfg_mem[19] <= 8'hC8; cfg_mem[20] <= 8'h80;
             // Slot 3 (dd3): tone=0xFF level=0x80 feedback=0x64 time=0x07D0 (LE: D0,07)
             cfg_mem[24] <= 8'hFF; cfg_mem[25] <= 8'h80; cfg_mem[26] <= 8'h64;
-            cfg_mem[27] <= 8'hD0; cfg_mem[28] <= 8'h07;
+            cfg_mem[27] <= 8'h00; cfg_mem[28] <= 8'h30;
         end else if (wr_en && wr_addr < ADDR_W'(SLOT_END)) begin
             cfg_mem[wr_addr] <= wr_data;
         end

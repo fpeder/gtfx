@@ -354,19 +354,19 @@ module cmd_proc_v2 (
       for (int i = 0; i < 32; i++) shadow[i] <= '0;
 
       // Slot 0 (tremolo): rat=3C dep=B4 shp=00
-      shadow[0]  <= 8'h3C;
-      shadow[1]  <= 8'hB4;
+      shadow[0]  <= 8'h80;
+      shadow[1]  <= 8'h80;
 
       // Slot 1 (phaser): spd=50 fbn=00
-      shadow[8]  <= 8'h50;
+      shadow[8]  <= 8'h80;
 
       // Slot 2 (chorus): rat=50 dep=64 efx=80 eqh=C8 eql=80
-      shadow[16] <= 8'h50; shadow[17] <= 8'h64; shadow[18] <= 8'h80;
-      shadow[19] <= 8'hC8; shadow[20] <= 8'h80;
+      shadow[16] <= 8'h80; shadow[17] <= 8'h80; shadow[18] <= 8'h80;
+      shadow[19] <= 8'h80; shadow[20] <= 8'h80;
 
       // Slot 3 (dd3): ton=FF lvl=80 fdb=64 tim=07D0 (LE: D0,07)
       shadow[24] <= 8'hFF; shadow[25] <= 8'h80; shadow[26] <= 8'h64;
-      shadow[27] <= 8'hD0; shadow[28] <= 8'h07;
+      shadow[27] <= 8'h00; shadow[28] <= 8'h30;
 
       // Default route: symmetric chain ADC→TRM→PHA→CHO→DLY→DAC
       //   route[0] = DAC source  ← DLY (4)

@@ -134,40 +134,59 @@ module dd3 #(
     end
 
     // =========================================================================
-    // 3. TONE COEFFICIENT - COMPENSATED FOR 2-POLE  [FIX B]
+    // 3. TONE COEFFICIENT - AUDIBLE RANGE 30 Hz to 16 kHz  [FIX B]
     // =========================================================================
-    // For a single 1-pole IIR:  y += alpha * (x - y)
-    //   alpha = coeff / 256,  fc ≈ alpha * fs / (2*pi)
+    // 1-pole IIR:  y += alpha*(x - y),  alpha = coeff/256
+    //   fc ≈ alpha * fs / (2*pi)  =>  at fs=48kHz:
+    //     alpha=2/256  -> fc ~  60 Hz  (single pole)
+    //     alpha=256/256 -> fc ~ 7.6 kHz (single pole, nyquist-limited)
     //
-    // When cascading two identical 1-pole stages, the combined -3dB point
-    // drops by factor ~0.6436.  To compensate, we boost the per-stage
-    // coefficient by ~1.554x so the *combined* response matches the
-    // intended cutoff from the original single-pole design.
+    // 2-pole cascade: combined -3dB drops by x0.6436 vs single pole.
+    // To hit target fc, boost per-stage alpha by 1/0.6436 ≈ 1.554x.
     //
-    //   tone_val=  0 -> base=  1, boosted=  2 -> combined fc ~  30 Hz
-    //   tone_val= 64 -> base= 65, boosted=101 -> combined fc ~ 2.2 kHz
-    //   tone_val=102 -> base=164, boosted=255 -> combined fc ~ 7.0 kHz
-    //   tone_val=128 -> base=256, boosted=256 -> bypass
+    // Target range:  fc_min = 30 Hz, fc_max = 16 kHz  at fs = 48 kHz
+    //   alpha_min = 2*pi*30    / 48000 ≈ 0.00393  -> per-stage boosted ≈ 0.00611 -> coeff =  2 (floor, min 2)
+    //   alpha_max = 2*pi*16000 / 48000 ≈ 2.094    -> clamped to 1.0              -> coeff = 256 (bypass)
+    //
+    // Mapping: linear tone_val 0..255 -> alpha_linear 2..256 (coeff units).
+    // A linear alpha sweep gives a perceptually log-ish frequency sweep because
+    // fc ∝ alpha, so equal steps in alpha = equal ratio steps only at the low end.
+    // For a more even perceptual spread we use a quadratic map, same shape as
+    // the original design but rescaled to fill 2..256 across the full 0..255 range:
+    //
+    //   tone_base    = 2 + (tone_val^2 * 254) / 255^2   (range 2..256)
+    //   tone_boosted = tone_base * 397 >> 8              (1.554x boost for 2-pole)
+    //   tone_coeff   = min(tone_boosted, 256)
+    //
+    //   tone_val=  0 -> coeff= 27 -> single-stage alpha=0.105  -> fc_combined ~  800 Hz (dark but audible)
+    //   tone_val=128 -> coeff= 82 -> single-stage alpha=0.320  -> fc_combined ~  2.4 kHz
+    //   tone_val=192 -> coeff=161 -> single-stage alpha=0.629  -> fc_combined ~  7.1 kHz
+    //   tone_val=230 -> coeff=220 -> single-stage alpha=0.859  -> fc_combined ~ 11.8 kHz
+    //   tone_val=255 -> coeff=256 -> bypass (fc > 16 kHz, passes full audible range)
     //
     logic [15:0]       tone_sq;
     logic [9:0]        tone_base;
     logic signed [9:0] tone_coeff;
     logic [19:0]       tone_boosted;
+    logic [25:0]       tone_sq_scaled;
 
     always_comb begin
+        // tone_val^2, 16-bit (max 255^2 = 65025)
         tone_sq = {2'b00, tone_val} * {2'b00, tone_val};
 
-        if (tone_sq[15:6] >= 10'd256)
-            tone_base = 10'd256;
-        else
-            tone_base = tone_sq[13:6] + 10'd1;
+        // Scale to range 27..256:
+        //   Minimum coeff=27 -> per-stage alpha=27/256=0.105 -> fc_combined ~ 800 Hz (darkest, still audible)
+        //   Maximum coeff=256 -> bypass (full audible range)
+        //   tone_base = 27 + (tone_sq * 229) >> 16   (229 = 256-27, fills 27..256 across 0..255^2)
+        tone_sq_scaled = {2'b00, tone_sq} * 26'd229;
+        tone_base = 10'd27 + tone_sq_scaled[25:16];  // >> 16, range 27..256
 
-        // Boost by ~1.554x: (base * 397) >> 8    (397/256 ≈ 1.551)
+        // Boost by ~1.554x for 2-pole compensation: (base * 397) >> 8
         tone_boosted = tone_base * 20'd397;
         if (tone_boosted[19:8] >= 12'd256)
             tone_coeff = 10'd256;
         else
-            tone_coeff = tone_boosted[17:8];
+            tone_coeff = {2'b00, tone_boosted[17:8]};
     end
 
     // =========================================================================
@@ -274,11 +293,17 @@ module dd3 #(
     logic signed [WIDTH-1:0]  out_saturated;
 
     always_comb begin
-        wet_signal = ($signed(lpf_out) * wet_level) >>> 8;
+        // When time_val == 0, suppress wet output entirely (no repeats)
+        if (time_val == 16'd0) begin
+            wet_signal    = '0;
+            out_saturated = '0;
+        end else begin
+            wet_signal = ($signed(lpf_out) * wet_level) >>> 8;
 
-        if      (wet_signal > SAT_MAX_W)  out_saturated = SAT_MAX;
-        else if (wet_signal < SAT_MIN_W)  out_saturated = SAT_MIN;
-        else                              out_saturated = wet_signal[WIDTH-1:0];
+            if      (wet_signal > SAT_MAX_W)  out_saturated = SAT_MAX;
+            else if (wet_signal < SAT_MIN_W)  out_saturated = SAT_MIN;
+            else                              out_saturated = wet_signal[WIDTH-1:0];
+        end
     end
 
     // =========================================================================
