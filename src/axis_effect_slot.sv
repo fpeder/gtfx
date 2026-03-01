@@ -11,16 +11,21 @@
 //   - Parameterised effect selection via EFFECT_TYPE
 //
 // EFFECT_TYPE values:
-//   0 = tremolo  (mono in, mono out)
-//   1 = phaser   (mono in, mono out)
-//   2 = chorus   (mono in, stereo out)
-//   3 = dd3      (mono in, wet-only out + dry/wet mix)
+//   0 = tremolo        (mono in, mono out,   1-cycle latency)
+//   1 = phaser         (mono in, mono out,   1-cycle latency)
+//   2 = chorus         (mono in, stereo out, 1-cycle latency)
+//   3 = dd3            (mono in, wet+dry mix,1-cycle latency)
+//   4 = tube_distortion(mono in, mono out,   valid_out-driven, 9-cycle latency)
 //
 // Register map (per slot, 8 bytes, indexed from cfg_mem[SLOT_ID*CTRL_DEPTH]):
-//   tremolo: [0]=rate  [1]=depth  [2]=shape(bit0)
-//   phaser:  [0]=speed [1]=feedback_en(bit0)
-//   chorus:  [0]=rate  [1]=depth  [2]=effect_lvl [3]=eq_hi [4]=eq_lo
-//   dd3:     [0]=tone  [1]=level  [2]=feedback   [3..4]=time(16-bit LE)
+//   tremolo:         [0]=rate  [1]=depth  [2]=shape(bit0)           [7]=bypass(bit0)
+//   phaser:          [0]=speed [1]=feedback_en(bit0)                [7]=bypass(bit0)
+//   chorus:          [0]=rate  [1]=depth  [2]=effect_lvl [3..4]=eq  [7]=bypass(bit0)
+//   dd3:             [0]=tone  [1]=level  [2]=feedback [3..4]=time  [7]=bypass(bit0)
+//   tube_distortion: [0]=gain  [1]=bass   [2]=mid [3]=treble [4]=lvl [7]=bypass(bit0)
+//
+// bypass is read directly from cfg_slice[7][0].  The separate bypass input port
+// has been removed; ctrl_bus writes the bypass bit into cfg_mem[slot*CTRL_DEPTH+7].
 //
 // Key change vs previous version
 // --------------------------------
@@ -36,216 +41,276 @@
 // ============================================================================
 
 module axis_effect_slot #(
-    parameter int SLOT_ID     = 0,
-    parameter int EFFECT_TYPE = 0,       // 0=trem, 1=pha, 2=cho, 3=dd3
-    parameter int DATA_W      = 48,
-    parameter int CTRL_DEPTH  = 8,
-    parameter int CTRL_W      = 8,
-    parameter int AUDIO_W     = 24,
+    parameter int SLOT_ID          = 0,
+    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=dd3, 4=tube
+    parameter int DATA_W           = 48,
+    parameter int CTRL_DEPTH       = 8,
+    parameter int CTRL_W           = 8,
+    parameter int AUDIO_W          = 24,
     // Effect-specific parameters
     parameter int CHORUS_DELAY_MAX = 2048,
-    parameter int DD3_RAM_DEPTH    = 48000
-)(
-    input  logic clk,
-    input  logic rst_n,
+    parameter int DD3_RAM_DEPTH    = 32768,
+    parameter int TUBE_LUT_ADDR    = 12,     // tube: 4096-entry LUT
+    parameter int TUBE_FRAC_W      = 12      // tube: interpolation fraction bits
+) (
+    input logic clk,
+    input logic rst_n,
 
     // AXI-Stream slave (input)
-    input  logic [DATA_W-1:0]  s_axis_tdata,
-    input  logic               s_axis_tvalid,
-    output logic               s_axis_tready,
+    input  logic [DATA_W-1:0] s_axis_tdata,
+    input  logic              s_axis_tvalid,
+    output logic              s_axis_tready,
 
     // AXI-Stream master (output)
-    output logic [DATA_W-1:0]  m_axis_tdata,
-    output logic               m_axis_tvalid,
-    input  logic               m_axis_tready,
+    output logic [DATA_W-1:0] m_axis_tdata,
+    output logic              m_axis_tvalid,
+    input  logic              m_axis_tready,
 
     // ---- Shared config slice (replaces ctrl_wr/ctrl_addr/ctrl_wdata) ----
     // Driven by ctrl_bus: cfg_slice = cfg_mem[SLOT_ID*CTRL_DEPTH +: CTRL_DEPTH]
-    input  logic [CTRL_W-1:0]  cfg_slice [CTRL_DEPTH],
-
-    // Bypass
-    input  logic               bypass
+    input logic [CTRL_W-1:0] cfg_slice[CTRL_DEPTH]
 );
 
-    import axis_audio_pkg::*;
+  import axis_audio_pkg::*;
 
-    // =====================================================================
-    // AXI-Stream → sample_en bridge
-    // =====================================================================
-    assign s_axis_tready = 1'b1;
-    wire beat_in = s_axis_tvalid & s_axis_tready;
+  // bypass is stored in cfg_slice[7][0] - written by ctrl_bus when
+  // "set <efx> on/off" is received; no separate port needed.
+  wire bypass = cfg_slice[7][0];
 
-    logic                       sample_en_reg;
-    logic signed [AUDIO_W-1:0]  audio_in_reg;
-    logic signed [AUDIO_W-1:0]  dry_l_hold, dry_r_hold;
+  // =====================================================================
+  // AXI-Stream → sample_en bridge
+  // =====================================================================
+  assign s_axis_tready = 1'b1;
+  wire                       beat_in = s_axis_tvalid & s_axis_tready;
 
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            sample_en_reg <= 1'b0;
-            audio_in_reg  <= '0;
-            dry_l_hold    <= '0;
-            dry_r_hold    <= '0;
-        end else begin
-            sample_en_reg <= beat_in;
-            if (beat_in) begin
-                audio_in_reg <= unpack_left(s_axis_tdata);
-                dry_l_hold   <= unpack_left(s_axis_tdata);
-                dry_r_hold   <= unpack_right(s_axis_tdata);
-            end
-        end
+  logic                      sample_en_reg;
+  logic signed [AUDIO_W-1:0] audio_in_reg;
+  logic signed [AUDIO_W-1:0] dry_l_hold, dry_r_hold;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      sample_en_reg <= 1'b0;
+      audio_in_reg  <= '0;
+      dry_l_hold    <= '0;
+      dry_r_hold    <= '0;
+    end else begin
+      sample_en_reg <= beat_in;
+      if (beat_in) begin
+        audio_in_reg <= unpack_left(s_axis_tdata);
+        dry_l_hold   <= unpack_left(s_axis_tdata);
+        dry_r_hold   <= unpack_right(s_axis_tdata);
+      end
     end
+  end
 
-    // =====================================================================
-    // Effect core (selected by EFFECT_TYPE parameter)
-    // =====================================================================
-    logic signed [AUDIO_W-1:0] effect_out_l;
-    logic signed [AUDIO_W-1:0] effect_out_r;
+  // =====================================================================
+  // Effect core (selected by EFFECT_TYPE parameter)
+  // =====================================================================
+  logic signed [AUDIO_W-1:0] effect_out_l;
+  logic signed [AUDIO_W-1:0] effect_out_r;
+  logic                      effect_valid;  // strobe when effect_out_* is ready
 
-    generate
-        // ---- TREMOLO (type 0): mono in → mono out ----
-        if (EFFECT_TYPE == 0) begin : gen_tremolo
-            logic signed [AUDIO_W-1:0] core_out;
+  generate
+    // ---- TREMOLO (type 0): mono in → mono out ----
+    if (EFFECT_TYPE == 0) begin : gen_tremolo
+      logic signed [AUDIO_W-1:0] core_out;
 
-            tremolo #(.WIDTH(AUDIO_W)) core (
-                .clk       (clk),
-                .rst_n     (rst_n),
-                .sample_en (sample_en_reg),
-                .rate_val  (cfg_slice[0]),
-                .depth_val (cfg_slice[1]),
-                .shape_sel (cfg_slice[2][0]),
-                .audio_in  (audio_in_reg),
-                .audio_out (core_out)
-            );
+      tremolo #(
+          .WIDTH(AUDIO_W)
+      ) core (
+          .clk      (clk),
+          .rst_n    (rst_n),
+          .sample_en(sample_en_reg),
+          .rate_val (cfg_slice[0]),
+          .depth_val(cfg_slice[1]),
+          .shape_sel(cfg_slice[2][0]),
+          .audio_in (audio_in_reg),
+          .audio_out(core_out)
+      );
 
-            assign effect_out_l = core_out;
-            assign effect_out_r = core_out;
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
 
-        // ---- PHASER (type 1): mono in → mono out ----
-        end else if (EFFECT_TYPE == 1) begin : gen_phaser
-            logic signed [AUDIO_W-1:0] core_out;
+      // 1-cycle latency cores use sample_en_reg delayed by 1
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
 
-            phaser #(.WIDTH(AUDIO_W)) core (
-                .clk         (clk),
-                .rst_n       (rst_n),
-                .sample_en   (sample_en_reg),
-                .speed_val   (cfg_slice[0]),
-                .feedback_en (cfg_slice[1][0]),
-                .audio_in    (audio_in_reg),
-                .audio_out   (core_out)
-            );
+      // ---- PHASER (type 1): mono in → mono out ----
+    end else if (EFFECT_TYPE == 1) begin : gen_phaser
+      logic signed [AUDIO_W-1:0] core_out;
 
-            assign effect_out_l = core_out;
-            assign effect_out_r = core_out;
+      phaser #(
+          .WIDTH(AUDIO_W)
+      ) core (
+          .clk        (clk),
+          .rst_n      (rst_n),
+          .sample_en  (sample_en_reg),
+          .speed_val  (cfg_slice[0]),
+          .feedback_en(cfg_slice[1][0]),
+          .audio_in   (audio_in_reg),
+          .audio_out  (core_out)
+      );
 
-        // ---- CHORUS (type 2): mono in → stereo out ----
-        end else if (EFFECT_TYPE == 2) begin : gen_chorus
-            chorus #(
-                .SAMPLE_RATE(48_000),
-                .DATA_WIDTH (AUDIO_W),
-                .DELAY_MAX  (CHORUS_DELAY_MAX)
-            ) core (
-                .clk        (clk),
-                .rst_n      (rst_n),
-                .sample_en  (sample_en_reg),
-                .audio_in   (audio_in_reg),
-                .audio_out_l(effect_out_l),
-                .audio_out_r(effect_out_r),
-                .rate       (cfg_slice[0]),
-                .depth      (cfg_slice[1]),
-                .effect_lvl (cfg_slice[2]),
-                .e_q_hi     (cfg_slice[3]),
-                .e_q_lo     (cfg_slice[4])
-            );
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
 
-        // ---- DD3 DELAY (type 3): mono in → wet-only out + dry/wet mix ----
-        end else if (EFFECT_TYPE == 3) begin : gen_dd3
-            logic signed [AUDIO_W-1:0] wet_out;
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
 
-            // Reconstruct 16-bit time_val from two consecutive 8-bit registers (LE)
-            logic [15:0] time_val_16;
-            assign time_val_16 = {cfg_slice[4], cfg_slice[3]};
+      // ---- CHORUS (type 2): mono in → stereo out ----
+    end else if (EFFECT_TYPE == 2) begin : gen_chorus
+      chorus #(
+          .SAMPLE_RATE(48_000),
+          .DATA_WIDTH (AUDIO_W),
+          .DELAY_MAX  (CHORUS_DELAY_MAX)
+      ) core (
+          .clk        (clk),
+          .rst_n      (rst_n),
+          .sample_en  (sample_en_reg),
+          .audio_in   (audio_in_reg),
+          .audio_out_l(effect_out_l),
+          .audio_out_r(effect_out_r),
+          .rate       (cfg_slice[0]),
+          .depth      (cfg_slice[1]),
+          .effect_lvl (cfg_slice[2]),
+          .e_q_hi     (cfg_slice[3]),
+          .e_q_lo     (cfg_slice[4])
+      );
 
-            dd3_old #(
-                .WIDTH    (AUDIO_W),
-                .RAM_DEPTH(DD3_RAM_DEPTH)
-            ) core (
-                .clk          (clk),
-                .rst_n        (rst_n),
-                .sample_en    (sample_en_reg),
-                .tone_val     (cfg_slice[0]),
-                .level_val    (cfg_slice[1]),
-                .feedback_val (cfg_slice[2]),
-                .time_val     (time_val_16),
-                .audio_in     (audio_in_reg),
-                .audio_out    (wet_out)
-            );
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
 
-            // Dry + wet saturating mix
-            logic signed [AUDIO_W:0] sum_l, sum_r;
-            always_comb begin
-                sum_l = $signed({dry_l_hold[AUDIO_W-1], dry_l_hold})
-                      + $signed({wet_out[AUDIO_W-1],    wet_out});
-                sum_r = $signed({dry_r_hold[AUDIO_W-1], dry_r_hold})
-                      + $signed({wet_out[AUDIO_W-1],    wet_out});
-            end
-            assign effect_out_l = saturate(sum_l);
-            assign effect_out_r = saturate(sum_r);
+      // ---- DD3 DELAY (type 3): mono in → wet-only out + dry/wet mix ----
+    end else if (EFFECT_TYPE == 3) begin : gen_dd3
+      logic signed [AUDIO_W-1:0] wet_out;
 
-        // ---- DEFAULT: passthrough ----
-        end else begin : gen_passthrough
-            assign effect_out_l = dry_l_hold;
-            assign effect_out_r = dry_r_hold;
-        end
-    endgenerate
+      // Reconstruct 16-bit time_val from two consecutive 8-bit registers (LE)
+      logic [15:0] time_val_16;
+      assign time_val_16 = {cfg_slice[4], cfg_slice[3]};
 
-    // =====================================================================
-    // Output capture + bypass mux
-    // =====================================================================
-    logic        sample_en_d1;
-    logic [DATA_W-1:0] efx_data;
-    logic              efx_valid;
+      dd3 #(
+          .WIDTH    (AUDIO_W),
+          .RAM_DEPTH(DD3_RAM_DEPTH)
+      ) core (
+          .clk         (clk),
+          .rst_n       (rst_n),
+          .sample_en   (sample_en_reg),
+          .tone_val    (cfg_slice[0]),
+          .level_val   (cfg_slice[1]),
+          .feedback_val(cfg_slice[2]),
+          .time_val    (time_val_16),
+          .audio_in    (audio_in_reg),
+          .audio_out   (wet_out)
+      );
 
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            sample_en_d1 <= 1'b0;
-            efx_data     <= '0;
-            efx_valid    <= 1'b0;
-        end else begin
-            sample_en_d1 <= sample_en_reg;
+      // Dry + wet saturating mix
+      logic signed [AUDIO_W:0] sum_l, sum_r;
+      always_comb begin
+        sum_l = $signed({dry_l_hold[AUDIO_W-1], dry_l_hold}) +
+            $signed({wet_out[AUDIO_W-1], wet_out});
+        sum_r = $signed({dry_r_hold[AUDIO_W-1], dry_r_hold}) +
+            $signed({wet_out[AUDIO_W-1], wet_out});
+      end
+      assign effect_out_l = saturate(sum_l);
+      assign effect_out_r = saturate(sum_r);
 
-            if (efx_valid && m_axis_tready)
-                efx_valid <= 1'b0;
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
 
-            if (sample_en_d1) begin
-                efx_data  <= pack_stereo(effect_out_l, effect_out_r);
-                efx_valid <= 1'b1;
-            end
-        end
+      // ---- TUBE DISTORTION (type 4): mono in → mono out, valid_out-driven ----
+      //
+      // tube_distortion has a 10-cycle pipelined latency and drives its own
+      // valid_out strobe, used directly as effect_valid.
+      // cfg_slice mapping:
+      //   [0]=gain  [1]=tone_bass  [2]=tone_mid  [3]=tone_treble  [4]=level
+    end else if (EFFECT_TYPE == 4) begin : gen_tube
+      logic signed [AUDIO_W-1:0] core_out;
+      logic                      core_valid;
+
+      tube_distortion #(
+          .DATA_W  (AUDIO_W),
+          .LUT_ADDR(TUBE_LUT_ADDR),
+          .FRAC_W  (TUBE_FRAC_W)
+      ) core (
+          .clk        (clk),
+          .rst_n      (rst_n),
+          .sample_en  (sample_en_reg),
+          .audio_in   (audio_in_reg),
+          .audio_out  (core_out),
+          .valid_out  (core_valid),
+          .gain       (cfg_slice[0]),
+          .tone_bass  (cfg_slice[1]),
+          .tone_mid   (cfg_slice[2]),
+          .tone_treble(cfg_slice[3]),
+          .level      (cfg_slice[4])
+      );
+
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
+      assign effect_valid = core_valid;
+
+      // ---- DEFAULT: passthrough ----
+    end else begin : gen_passthrough
+      assign effect_out_l = dry_l_hold;
+      assign effect_out_r = dry_r_hold;
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
     end
+  endgenerate
 
-    // ---- Bypass mux ----
-    // bypass=1 → forward input directly (registered, 1-cycle latency)
-    // bypass=0 → use effect output      (registered, 2-cycle latency)
-    // Effect still runs in bypass to keep LFO phase / delay tails alive.
+  // =====================================================================
+  // Output capture + bypass mux
+  //
+  // All effect types now use effect_valid as the output strobe.
+  // Types 0-3 (1-cycle latency) produce effect_valid = sample_en_d1,
+  // which is functionally identical to the previous sample_en_d1 logic.
+  // Type 4 (tube) uses valid_out from the core's 9-cycle pipeline.
+  // =====================================================================
+  logic [DATA_W-1:0] efx_data;
+  logic              efx_valid;
 
-    logic [DATA_W-1:0] byp_data;
-    logic              byp_valid;
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      efx_data  <= '0;
+      efx_valid <= 1'b0;
+    end else begin
+      if (efx_valid && m_axis_tready) efx_valid <= 1'b0;
 
-    always_ff @(posedge clk) begin
-        if (!rst_n) begin
-            byp_data  <= '0;
-            byp_valid <= 1'b0;
-        end else begin
-            if (byp_valid && m_axis_tready)
-                byp_valid <= 1'b0;
-            if (beat_in) begin
-                byp_data  <= s_axis_tdata;
-                byp_valid <= 1'b1;
-            end
-        end
+      if (effect_valid) begin
+        efx_data  <= pack_stereo(effect_out_l, effect_out_r);
+        efx_valid <= 1'b1;
+      end
     end
+  end
 
-    assign m_axis_tdata  = bypass ? byp_data  : efx_data;
-    assign m_axis_tvalid = bypass ? byp_valid : efx_valid;
+  // ---- Bypass mux ----
+  // bypass=1 → forward input directly (registered, 1-cycle latency)
+  // bypass=0 → use effect output
+  // Effect still runs in bypass to keep LFO phase / delay tails alive.
+
+  logic [DATA_W-1:0] byp_data;
+  logic              byp_valid;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      byp_data  <= '0;
+      byp_valid <= 1'b0;
+    end else begin
+      if (byp_valid && m_axis_tready) byp_valid <= 1'b0;
+      if (beat_in) begin
+        byp_data  <= s_axis_tdata;
+        byp_valid <= 1'b1;
+      end
+    end
+  end
+
+  assign m_axis_tdata  = bypass ? byp_data : efx_data;
+  assign m_axis_tvalid = bypass ? byp_valid : efx_valid;
 
 endmodule
+

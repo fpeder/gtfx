@@ -29,7 +29,7 @@
 //   [E] Feedback and wet output use *current* filter output (lpf_out),
 //       not stale registered state.
 //
-module dd3 #(
+module dd3_old #(
     parameter WIDTH     = 24,
     parameter RAM_DEPTH = 48000  // 1 second at 48kHz
 ) (

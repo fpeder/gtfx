@@ -146,27 +146,36 @@ module chorus #(
     // --------------------------------------------------------
     // 3.  2-Band EQ (Single Path)
     // --------------------------------------------------------
-    localparam logic [7:0] CROSSOVER_ALPHA = 8'd32;
+    // Crossover is a 1-pole IIR LPF:  lpf += alpha*(x - lpf)
+    //   alpha = 32/256 = 0.125  =>  fc ≈ alpha*fs/(2π) ≈ 955 Hz @ 48 kHz
+    //
+    // Biquad coefficients (Q1.23, FRAC=23):
+    //   b0 =  alpha        = round(0.125  * 2^23) =  1_048_576
+    //   b1 = 0,  b2 = 0
+    //   a1_neg = +(1-alpha) = round(0.875  * 2^23) =  7_340_032
+    //   a2_neg = 0
 
     logic signed [DATA_WIDTH-1:0] wet_raw;
     assign wet_raw = delay_buf[rd_ptr];
 
     logic signed [DATA_WIDTH-1:0] lpf;
-    logic signed [DATA_WIDTH:0]   diff;
-    logic signed [DATA_WIDTH+9:0] fprod;
-    logic signed [DATA_WIDTH-1:0] finc;
 
-    always_comb begin
-        diff  = {wet_raw[DATA_WIDTH-1], wet_raw} - {lpf[DATA_WIDTH-1], lpf};
-        fprod = diff * $signed({1'b0, CROSSOVER_ALPHA});
-        finc  = DATA_WIDTH'(fprod >>> 8);
-    end
-
-    initial lpf = '0; 
-    always_ff @(posedge clk) begin
-        if (!rst_n) lpf <= '0; 
-        else if (sample_en) lpf <= lpf + finc;
-    end
+    biquad_tdf2 #(
+        .DATA_W  (DATA_WIDTH),
+        .COEFF_W (DATA_WIDTH),
+        .FRAC    (DATA_WIDTH - 1)   // Q1.23
+    ) crossover_lpf (
+        .clk     (clk),
+        .rst_n   (rst_n),
+        .en      (sample_en),
+        .x_in    (wet_raw),
+        .y_out   (lpf),
+        .b0      (24'sd1_048_576),
+        .b1      (24'sd0),
+        .b2      (24'sd0),
+        .a1_neg  (24'sd7_340_032),
+        .a2_neg  (24'sd0)
+    );
 
     logic signed [DATA_WIDTH-1:0] low_band;
     logic signed [DATA_WIDTH-1:0] high_band;
@@ -203,16 +212,11 @@ module chorus #(
 
         shifted_l = mix_sum_l >>> 8;
         shifted_r = mix_sum_r >>> 8;
-
-        // Output Saturation (Clipping) to 24-bit bounds
-        if (shifted_l > 35'sd8388607)       mix_l = 24'h7FFFFF;
-        else if (shifted_l < -35'sd8388608) mix_l = 24'h800000;
-        else                                mix_l = DATA_WIDTH'(shifted_l);
-
-        if (shifted_r > 35'sd8388607)       mix_r = 24'h7FFFFF;
-        else if (shifted_r < -35'sd8388608) mix_r = 24'h800000;
-        else                                mix_r = DATA_WIDTH'(shifted_r);
     end
+
+    // Output Saturation (Clipping) to 24-bit bounds
+    saturate #(.IN_W(35), .OUT_W(DATA_WIDTH)) sat_l (.din(shifted_l), .dout(mix_l));
+    saturate #(.IN_W(35), .OUT_W(DATA_WIDTH)) sat_r (.din(shifted_r), .dout(mix_r));
 
     initial begin
         audio_out_l = '0;

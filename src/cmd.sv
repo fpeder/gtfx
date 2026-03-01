@@ -16,7 +16,6 @@ module cmd #(
     input  logic       rst_n,
     input  logic       tx_din,
     output logic       rx_dout,
-    input  logic [3:0] sw_effect,
 
     // Flat register write bus
     output logic       wr_en,
@@ -96,7 +95,6 @@ module cmd #(
       .rx_valid(proc_rx_valid), .rx_byte(proc_rx_byte),
       .tx_start(proc_tx_start), .tx_byte(proc_tx_byte),
       .tx_busy(proc_tx_busy),   .tx_done(proc_tx_done),
-      .sw_effect(sw_effect),
       .wr_en(proc_wr_en), .wr_addr(proc_wr_addr), .wr_data(proc_wr_data)
   );
 

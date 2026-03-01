@@ -59,8 +59,6 @@ module phaser #(
     localparam signed [WIDTH-1:0]  SAT_MIN   = {1'b1, {(WIDTH-1){1'b0}}};
     // Extended width for multiply-accumulate: WIDTH + 16 coefficient bits
     localparam int                 MWIDTH    = WIDTH + 16;
-    localparam signed [MWIDTH-1:0] SAT_MAX_W = {{16{1'b0}}, SAT_MAX};
-    localparam signed [MWIDTH-1:0] SAT_MIN_W = {{16{1'b1}}, SAT_MIN};
     
     // =========================================================================
     // 1. LFO - TRIANGLE WAVE VIA PHASE ACCUMULATOR
@@ -122,17 +120,17 @@ module phaser #(
 
         // Stage 0 input is audio_in directly
         stage_in[0] = audio_in;
-        // Stage 1 input: stage 0 output + feedback
+        // Stage 1 input: stage 0 output + feedback (saturated)
         stage1_sum  = $signed(y_next[0]) + $signed(fb_val);
-        if      (stage1_sum > $signed({1'b0, SAT_MAX})) stage1_sat = SAT_MAX;
-        else if (stage1_sum < $signed({1'b1, SAT_MIN})) stage1_sat = SAT_MIN;
-        else                                             stage1_sat = stage1_sum[WIDTH-1:0];
         stage_in[1] = stage1_sat;
 
         // Stages 2 and 3 are fed directly from previous stage
         stage_in[2] = y_next[1];
         stage_in[3] = y_next[2];
     end
+
+    // Saturate stage1_sum (WIDTH+1 bits) back to WIDTH bits
+    saturate #(.IN_W(WIDTH+1), .OUT_W(WIDTH)) sat_fb (.din(stage1_sum), .dout(stage1_sat));
 
     // =========================================================================
     // 5. ALL-PASS DATAPATH
@@ -159,11 +157,10 @@ module phaser #(
                        - $signed({{16{x_prev[s][WIDTH-1]}}, x_prev[s]})
                        + $signed({{16{y_prev[s][WIDTH-1]}}, y_prev[s]})
                        - $signed(cy[WIDTH+16:16]);
-                       
-                if      (ap_sum > SAT_MAX_W) y_next[s] = SAT_MAX;
-                else if (ap_sum < SAT_MIN_W) y_next[s] = SAT_MIN;
-                else                         y_next[s] = ap_sum[WIDTH-1:0];
             end
+
+            // Saturate ap_sum (MWIDTH bits) back to WIDTH bits
+            saturate #(.IN_W(MWIDTH), .OUT_W(WIDTH)) sat_ap (.din(ap_sum), .dout(y_next[s]));
         end
     endgenerate
 

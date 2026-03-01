@@ -29,4 +29,4 @@ open: $(PROJECT_FILE)
 
 clean:
 	rm -rf $(BUILD_DIR)
-	rm -rf *.log *.jou .Xil usage_statistics_webtalk.*
+	rm -rf *.log *.jou .Xil usage_statistics_webtalk.* *.pb vivado*
