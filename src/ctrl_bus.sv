@@ -125,14 +125,14 @@ module ctrl_bus #(
     // =========================================================================
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            // Default chain: ADC → FLN → TUB → TRM → PHA → CHO → DLY → DAC
+            // Default chain: ADC → TUB → PHA → FLN → CHO → TRM → DLY → DAC
             route[0] <= SEL_W'(4);   // DAC ← DLY  (port 4)
-            route[1] <= SEL_W'(5);   // TRM ← TUB  (port 5)
-            route[2] <= SEL_W'(1);   // PHA ← TRM  (port 1)
-            route[3] <= SEL_W'(2);   // CHO ← PHA  (port 2)
-            route[4] <= SEL_W'(3);   // DLY ← CHO  (port 3)
-            route[5] <= SEL_W'(6);   // TUB ← FLN  (port 6)
-            route[6] <= SEL_W'(0);   // FLN ← ADC  (port 0)
+            route[1] <= SEL_W'(3);   // TRM ← CHO  (port 3)
+            route[2] <= SEL_W'(5);   // PHA ← TUB  (port 5)
+            route[3] <= SEL_W'(6);   // CHO ← FLN  (port 6)
+            route[4] <= SEL_W'(1);   // DLY ← TRM  (port 1)
+            route[5] <= SEL_W'(0);   // TUB ← ADC  (port 0)
+            route[6] <= SEL_W'(2);   // FLN ← PHA  (port 2)
         end else if (wr_en &&
                      wr_addr >= ADDR_W'(ROUTE_BASE) &&
                      wr_addr <  ADDR_W'(ROUTE_END)) begin

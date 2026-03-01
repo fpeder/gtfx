@@ -278,13 +278,10 @@ module axis_effect_slot #(
       assign effect_out_l = core_out;
       assign effect_out_r = core_out;
 
-      // flanger has 2-cycle latency (sample_en → sample_d1 → output)
-      logic sample_en_d1, sample_en_d2;
-      always_ff @(posedge clk) begin
-        sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
-        sample_en_d2 <= (!rst_n) ? 1'b0 : sample_en_d1;
-      end
-      assign effect_valid = sample_en_d2;
+      // 1-cycle latency, same as tremolo / phaser / chorus
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
 
       // ---- DEFAULT: passthrough ----
     end else begin : gen_passthrough

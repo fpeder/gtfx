@@ -49,7 +49,6 @@ from typing import Optional
 
 try:
     import serial as pyserial
-
     HAS_SERIAL = True
 except ImportError:
     HAS_SERIAL = False
@@ -65,7 +64,6 @@ except ImportError:
 
 class Port(IntEnum):
     """Hardware port indices (must match cmd_proc_v2)."""
-
     ADC = 0
     TRM = 1
     PHA = 2
@@ -84,15 +82,15 @@ SOURCE_NODES = [p.name.lower() for p in Port]  # adc … fln
 SINK_NODES = ["dac"] + [p.name.lower() for p in Port if p != Port.ADC]
 SINK_ROUTE_IDX = {tag: i for i, tag in enumerate(SINK_NODES)}
 
-# Default route: ADC→FLN→TUB→TRM→PHA→CHO→DLY→DAC
+# Default route: ADC→TUB→PHA→FLN→CHO→TRM→DLY→DAC
 DEFAULT_ROUTE: list[int] = [
     Port.DLY,  # route[0]  DAC ← DLY
-    Port.TUB,  # route[1]  TRM ← TUB
-    Port.TRM,  # route[2]  PHA ← TRM
-    Port.PHA,  # route[3]  CHO ← PHA
-    Port.CHO,  # route[4]  DLY ← CHO
-    Port.FLN,  # route[5]  TUB ← FLN
-    Port.ADC,  # route[6]  FLN ← ADC
+    Port.CHO,  # route[1]  TRM ← CHO
+    Port.TUB,  # route[2]  PHA ← TUB
+    Port.FLN,  # route[3]  CHO ← FLN
+    Port.TRM,  # route[4]  DLY ← TRM
+    Port.ADC,  # route[5]  TUB ← ADC
+    Port.PHA,  # route[6]  FLN ← PHA
 ]
 
 ROUTE_ADDR_BASE = 0x40  # ctrl_bus base address for route registers
@@ -123,7 +121,6 @@ def trace_chain(route: list[int]) -> list[int]:
 @dataclass
 class Param:
     """Single 8-bit register parameter."""
-
     name: str  # 3-char CLI mnemonic  (e.g. "rat")
     label: str  # Human-readable label (e.g. "Rate")
     addr: int  # ctrl_bus address
@@ -155,7 +152,6 @@ class Param:
 @dataclass
 class Param16(Param):
     """16-bit little-endian parameter (e.g. delay time)."""
-
     lo: int = 0x0000
     hi: int = 0xFFFF
     fmt: str = "hex16"
@@ -178,7 +174,6 @@ class Param16(Param):
 @dataclass
 class EffectSlot:
     """One effect pedal: parameters + bypass state."""
-
     tag: str  # 3-char CLI tag  (e.g. "trm")
     full_name: str  # Display name    (e.g. "Tremolo")
     port: int  # Routing port index (Port enum value)
@@ -196,77 +191,59 @@ class EffectSlot:
 # ── Effect definitions (extend here to add new pedals) ──────────────────────
 
 EFFECT_DEFS: list[EffectSlot] = [
-    EffectSlot(
-        "trm",
-        "Tremolo",
-        Port.TRM,
-        [
-            Param("rat", "Rate", 0x00, 0x3C),
-            Param("dep", "Depth", 0x01, 0xB4),
-            Param("shp", "Shape", 0x02, 0x00),
-        ],
-        bypass_addr=0x07,
-    ),
-    EffectSlot(
-        "pha",
-        "Phaser",
-        Port.PHA,
-        [
-            Param("spd", "Speed", 0x08, 0x50),
-            Param("fbn", "Feedback En", 0x09, 0x00),
-        ],
-        bypass_addr=0x0F,
-    ),
-    EffectSlot(
-        "cho",
-        "Chorus",
-        Port.CHO,
-        [
-            Param("rat", "Rate", 0x10, 0x50),
-            Param("dep", "Depth", 0x11, 0x64),
-            Param("efx", "Effect", 0x12, 0x80),
-            Param("eqh", "EQ High", 0x13, 0xC8),
-            Param("eql", "EQ Low", 0x14, 0x80),
-        ],
-        bypass_addr=0x17,
-    ),
-    EffectSlot(
-        "dly",
-        "Delay (DD3)",
-        Port.DLY,
-        [
-            Param("ton", "Tone", 0x18, 0xFF),
-            Param("lvl", "Level", 0x19, 0x80),
-            Param("fdb", "Feedback", 0x1A, 0x64),
-            Param16("tim", "Time", 0x1B, 0x3000),
-        ],
-        bypass_addr=0x1F,
-    ),
-    EffectSlot(
-        "tub",
-        "Tube Distortion",
-        Port.TUB,
-        [
-            Param("gai", "Gain", 0x20, 0x40),
-            Param("bas", "Tone Bass", 0x21, 0x80),
-            Param("mid", "Tone Mid", 0x22, 0x80),
-            Param("tre", "Tone Treble", 0x23, 0x80),
-            Param("lvl", "Level", 0x24, 0xA0),
-        ],
-        bypass_addr=0x27,
-    ),
-    EffectSlot(
-        "fln",
-        "Flanger",
-        Port.FLN,
-        [
-            Param("man", "Manual", 0x28, 0x80),
-            Param("wid", "Width", 0x29, 0xC0),
-            Param("spd", "Speed", 0x2A, 0x30),
-            Param("reg", "Regen", 0x2B, 0xA0),
-        ],
-        bypass_addr=0x2F,
-    ),
+    EffectSlot("trm",
+               "Tremolo",
+               Port.TRM, [
+                   Param("rat", "Rate", 0x00, 0x3C),
+                   Param("dep", "Depth", 0x01, 0xB4),
+                   Param("shp", "Shape", 0x02, 0x00),
+               ],
+               bypass_addr=0x07),
+    EffectSlot("pha",
+               "Phaser",
+               Port.PHA, [
+                   Param("spd", "Speed", 0x08, 0x50),
+                   Param("fbn", "Feedback En", 0x09, 0x00),
+               ],
+               bypass_addr=0x0F),
+    EffectSlot("cho",
+               "Chorus",
+               Port.CHO, [
+                   Param("rat", "Rate", 0x10, 0x50),
+                   Param("dep", "Depth", 0x11, 0x64),
+                   Param("efx", "Effect", 0x12, 0x80),
+                   Param("eqh", "EQ High", 0x13, 0xC8),
+                   Param("eql", "EQ Low", 0x14, 0x80),
+               ],
+               bypass_addr=0x17),
+    EffectSlot("dly",
+               "Delay (DD3)",
+               Port.DLY, [
+                   Param("ton", "Tone", 0x18, 0xFF),
+                   Param("lvl", "Level", 0x19, 0x80),
+                   Param("fdb", "Feedback", 0x1A, 0x64),
+                   Param16("tim", "Time", 0x1B, 0x3000),
+               ],
+               bypass_addr=0x1F),
+    EffectSlot("tub",
+               "Tube Distortion",
+               Port.TUB, [
+                   Param("gai", "Gain", 0x20, 0x40),
+                   Param("bas", "Tone Bass", 0x21, 0x80),
+                   Param("mid", "Tone Mid", 0x22, 0x80),
+                   Param("tre", "Tone Treble", 0x23, 0x80),
+                   Param("lvl", "Level", 0x24, 0xA0),
+               ],
+               bypass_addr=0x27),
+    EffectSlot("fln",
+               "Flanger",
+               Port.FLN, [
+                   Param("man", "Manual", 0x28, 0x80),
+                   Param("wid", "Width", 0x29, 0xC0),
+                   Param("spd", "Speed", 0x2A, 0x30),
+                   Param("reg", "Regen", 0x2B, 0xA0),
+               ],
+               bypass_addr=0x2F),
 ]
 
 
@@ -552,7 +529,6 @@ def sync_from_hardware(link: SerialLink, slot_dict: dict[str, EffectSlot],
 
 class Color(IntEnum):
     """Curses color-pair IDs."""
-
     NORMAL = 1
     HEADER = 2
     ACTIVE = 3
@@ -630,8 +606,8 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
         hdr = _cp(Color.ACTIVE, bold=True)
 
     byp_text = " ON" if not slot.bypassed else "OFF"
-    byp_attr = _cp(Color.ACTIVE, bold=True) if not slot.bypassed else _cp(
-        Color.WARN)
+    byp_attr = _cp(Color.ACTIVE, bold=True) if not slot.bypassed \
+               else _cp(Color.WARN)
 
     # Header row:  + NAME               ON +
     name_w = w - 2 - 4  # 4 chars for bypass tag + space
@@ -659,8 +635,8 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
         _safe(win, y, x, "|", border_attr)
         _safe(win, y, x + 1, body, attr)
         bar_x = x + 1 + len(body)
-        bar_cp = (Color.SELECTED if is_sel else
-                  (Color.BAR if not slot.bypassed else Color.BYPASSED))
+        bar_cp = Color.SELECTED if is_sel else \
+                 (Color.BAR if not slot.bypassed else Color.BYPASSED)
         draw_bar(win, y, bar_x, p.value, p.hi, _BAR_W, bar_cp)
         _safe(win, y, x + w - 1, "|", border_attr)
         y += 1
@@ -699,8 +675,8 @@ def draw_connection_editor(scr, con_sink: int, con_src: int,
     _safe(scr, 1, 1, "ROUTE EDIT ", _cp(Color.WARN, bold=True))
     cx = 13
     for si, snk in enumerate(SINK_NODES):
-        attr = _cp(Color.SELECTED, bold=True) if si == con_sink else _cp(
-            Color.NORMAL)
+        attr = _cp(Color.SELECTED, bold=True) if si == con_sink \
+               else _cp(Color.NORMAL)
         _safe(scr, 1, cx, f" {snk.upper()} ", attr)
         cx += 5
 
@@ -723,30 +699,27 @@ def draw_connection_editor(scr, con_sink: int, con_src: int,
 
 def compute_two_col_layout(
         slots: list[EffectSlot]) -> list[tuple[int, int, int]]:
-    """Compute (col, x, y) for each slot in a 2-column left-to-right wrap.
+    """Compute (col, x, y) for each slot in a 2-column layout.
 
-    Slots fill left column top-to-bottom, then right column, like reading
-    order.  Returns a list parallel to *slots*.
+    Fills left column top-to-bottom first, then right column,
+    so signal chain reads top-to-bottom, left then right.
     """
     col_x = [1, 1 + SLOT_WIDTH + COL_GAP]
-    col_y = [0, 0]  # current y within each column (relative to viewport)
 
+    # Split: first half → left column, second half → right column
+    mid = (len(slots) + 1) // 2  # left gets the extra slot if odd
     layout: list[tuple[int, int, int]] = []
-    for s in slots:
-        # Pick column with the least used height (left wins ties → fill left first)
-        col = 0 if col_y[0] <= col_y[1] else 1
+    col_y = [0, 0]
+    for i, s in enumerate(slots):
+        col = 0 if i < mid else 1
         layout.append((col, col_x[col], col_y[col]))
         col_y[col] += s.height
     return layout
 
 
-def compute_scroll_2col(
-    layout: list[tuple[int, int, int]],
-    slots: list[EffectSlot],
-    active_idx: int,
-    viewport_h: int,
-    scroll_y: int,
-) -> int:
+def compute_scroll_2col(layout: list[tuple[int, int, int]],
+                        slots: list[EffectSlot], active_idx: int,
+                        viewport_h: int, scroll_y: int) -> int:
     """Adjust scroll_y so the active slot is fully visible."""
     if active_idx >= len(layout):
         return 0
@@ -775,19 +748,14 @@ def draw_scroll_indicators(scr, max_x: int, total_h: int, viewport_h: int,
         return
     ind_x = min(1 + SLOT_WIDTH * NUM_COLS + COL_GAP + 1, max_x - 1)
     _safe(scr, FIXED_TOP, ind_x, "^" if scroll_y > 0 else " ", _cp(Color.HELP))
-    _safe(
-        scr,
-        FIXED_TOP + viewport_h - 1,
-        ind_x,
-        "v" if scroll_y + viewport_h < total_h else " ",
-        _cp(Color.HELP),
-    )
+    _safe(scr, FIXED_TOP + viewport_h - 1, ind_x,
+          "v" if scroll_y + viewport_h < total_h else " ", _cp(Color.HELP))
 
 
 def draw_status(scr, y: int, max_x: int, msg: str, msg_time: float,
                 rx_log: list[str]) -> None:
     if msg and (time.time() - msg_time < 4.0):
-        _safe(scr, y, 1, f" {msg[: max_x - 3]} ", _cp(Color.HELP))
+        _safe(scr, y, 1, f" {msg[:max_x - 3]} ", _cp(Color.HELP))
     elif rx_log:
         _safe(scr, y, 1, rx_log[-1][:max_x - 3], _cp(Color.LOG))
 
@@ -822,7 +790,6 @@ class InputMode(IntEnum):
 @dataclass
 class AppState:
     """All mutable application state in one place."""
-
     slot_dict: dict[str, EffectSlot]
     route: list[int]
     link: SerialLink
@@ -898,11 +865,11 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
     slot = slots[ai]
     n = len(slots)
 
-    if ch in (ord("q"), ord("Q"), 27):
+    if ch in (ord('q'), ord('Q'), 27):
         st.running = False
 
     # ── slot navigation ──
-    elif ch == ord("\t"):
+    elif ch == ord('\t'):
         st.active_tag = slots[(ai + 1) % n].tag
     elif ch == curses.KEY_BTAB:
         st.active_tag = slots[(ai - 1) % n].tag
@@ -938,12 +905,12 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
         st.flash(f"set {slot.tag} {p.name} {p.format_cmd_value()}")
 
     # ── bypass ──
-    elif ch == ord(" ") or ch in ENTER_KEYS:
+    elif ch == ord(' ') or ch in ENTER_KEYS:
         slot.bypassed = not slot.bypassed
         st.link.set_bypass(slot, not slot.bypassed)
         st.flash(f"{slot.full_name}: {'ON' if not slot.bypassed else 'OFF'}")
 
-    elif ch in (ord("o"), ord("O")):
+    elif ch in (ord('o'), ord('O')):
         if slot.bypassed:
             slot.bypassed = False
             st.link.set_bypass(slot, True)
@@ -951,7 +918,7 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
         else:
             st.flash(f"{slot.full_name}: already ON")
 
-    elif ch in (ord("f"), ord("F")):
+    elif ch in (ord('f'), ord('F')):
         if not slot.bypassed:
             slot.bypassed = True
             st.link.set_bypass(slot, False)
@@ -960,16 +927,16 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
             st.flash(f"{slot.full_name}: already OFF")
 
     # ── mode switches ──
-    elif ch in (ord("c"), ord("C")):
+    elif ch in (ord('c'), ord('C')):
         st.enter_connection_mode()
-    elif ch in (ord("w"), ord("W")):
+    elif ch in (ord('w'), ord('W')):
         st.enter_raw_write_mode()
-    elif ch in (ord("s"), ord("S")):
+    elif ch in (ord('s'), ord('S')):
         if sync_from_hardware(st.link, st.slot_dict, st.route):
             st.flash("Synced from hardware")
         else:
             st.flash("Status sync failed")
-    elif ch in (ord("r"), ord("R")):
+    elif ch in (ord('r'), ord('R')):
         st.flash("Refreshed")
 
 
@@ -1147,22 +1114,18 @@ def main(stdscr, args: argparse.Namespace) -> None:
 def run() -> None:
     parser = argparse.ArgumentParser(
         description="ncurses GUI for FPGA effects processor (cmd_proc_v2)")
-    parser.add_argument(
-        "--port",
-        "-p",
-        default="/dev/ttyUSB1",
-        help="Serial port  (default: /dev/ttyUSB1)",
-    )
+    parser.add_argument("--port",
+                        "-p",
+                        default="/dev/ttyUSB0",
+                        help="Serial port  (default: /dev/ttyUSB0)")
     parser.add_argument("--baud",
                         "-b",
                         type=int,
                         default=115200,
                         help="Baud rate  (default: 115200)")
-    parser.add_argument(
-        "--offline",
-        action="store_true",
-        help="Run without serial (demo / preview mode)",
-    )
+    parser.add_argument("--offline",
+                        action="store_true",
+                        help="Run without serial (demo / preview mode)")
     args = parser.parse_args()
 
     if not HAS_SERIAL and not args.offline:

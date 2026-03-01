@@ -19,8 +19,8 @@
 //    6    Slot 5 (flanger)         Slot 5 input
 //
 // Default linear chain:
-//   route[6]=0 FLN←ADC  route[5]=6 TUB←FLN  route[1]=5 TRM←TUB
-//   route[2]=1 PHA←TRM  route[3]=2 CHO←PHA  route[4]=3 DLY←CHO
+//   route[5]=0 TUB←ADC  route[2]=5 PHA←TUB  route[6]=2 FLN←PHA
+//   route[3]=6 CHO←FLN  route[1]=3 TRM←CHO  route[4]=1 DLY←TRM
 //   route[0]=4 DAC←DLY
 //
 // Bypass is software-controlled via "set <efx> on/off" CLI commands.
@@ -177,10 +177,7 @@ module top #(
   // ---- sample_en: lrclk rising-edge detect (same as original top.sv) ----
   logic lrclk_prev, sample_en;
   always_ff @(posedge clk_audio) begin
-    if (!resetn)
-      lrclk_prev <= 1'b0;
-    else
-      lrclk_prev <= i2s2_tx_lrclk;
+    lrclk_prev <= i2s2_tx_lrclk;
   end
   assign sample_en = i2s2_tx_lrclk & ~lrclk_prev;
 
@@ -222,7 +219,7 @@ module top #(
   end
 
   // =========================================================================
-  // Crossbar (7 symmetric ports: ADC/DAC + 6 effect slots)
+  // Crossbar (5 symmetric ports)
   // =========================================================================
   logic [47:0] xbar_m_tdata [N_XBAR];
   logic        xbar_m_tvalid[N_XBAR];

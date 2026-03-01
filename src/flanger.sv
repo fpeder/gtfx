@@ -15,22 +15,36 @@
 //
 // Signal path (models the original MXR M117R):
 //
-//                     ┌──────── feedback (regen) ────────┐
-//                     │                                  │
-//   audio_in ──►(+)──► delay_line ──► interp ──► LPF ──►├──► (+) ──► audio_out
-//                                                wet     │    dry+wet / 2
-//                                                        │
-//                                              biquad_tdf2 (BBD recon filter)
+//                     +-------- feedback (regen) --------+
+//                     |                                  |
+//   audio_in -->(+)--> delay_line --> interp --> LPF -->--+--> (+) --> audio_out
+//                                               wet           dry+wet / 2
 //
-// The biquad models the SAD1024 BBD's reconstruction low-pass (~6 kHz at
-// 48 kHz Fs).  This gives the swept signal its characteristic dark, thick
-// tone — a defining quality of analog bucket-brigade flangers.
-//
-// All saturation uses the shared `saturate` module (no inline functions).
+// The biquad_tdf2 models the SAD1024 BBD's reconstruction low-pass (~6 kHz
+// at 48 kHz Fs).  All saturation uses the shared `saturate` module.
 //
 // Delay range: ~0.25 ms - ~5 ms at 48 kHz (12-240 samples)
 // LFO: triangle wave, ~0.05-11 Hz
 // Feedback: signed (negative = through-zero flanging)
+//
+// Latency: 1 cycle (sample_en -> audio_out registered)
+//   axis_effect_slot uses effect_valid = sample_en_d1, same as tremolo etc.
+//
+// Pipeline (all happens in a SINGLE sample_en cycle):
+//   sample_en edge:
+//     - LFO advances (registered)
+//     - delay_mem[wr_ptr] written with (audio_in + feedback) (feedback from
+//       previous sample's wet_filtered -- one-sample loop delay, same as analog)
+//     - tap_a, tap_b read COMBINATIONALLY (same cycle)
+//     - wet_interp computed combinationally from taps
+//     - biquad_tdf2 clocked: latches wet_interp, outputs wet_filtered (from
+//       PREVIOUS sample's computation -- inherent 1-sample biquad delay)
+//     - mix = (audio_in + wet_filtered) / 2, saturated, registered to audio_out
+//
+// This means feedback and the LPF both operate with a 1-sample delay in the
+// loop, which is correct -- the analog circuit has a similar propagation delay
+// through the BBD + reconstruction filter, and at audio rates (48 kHz) one
+// sample of loop delay is inaudible.
 // ============================================================================
 
 module flanger #(
@@ -70,23 +84,22 @@ module flanger #(
   // =========================================================================
   // BBD reconstruction low-pass filter coefficients
   // =========================================================================
-  // 2nd-order Butterworth LPF, Fc ~ 6 kHz, Fs = 48 kHz
-  // Analog prototype:  wc = 2*pi*6000
-  // Bilinear transform with pre-warp -> digital coefficients:
+  // 2nd-order Butterworth LPF, Fc = 6 kHz, Fs = 48 kHz
   //
-  //   b0 =  0.06745527  b1 =  0.13491055  b2 =  0.06745527
-  //   a1 = -1.14298050  a2 =  0.41280159
+  //   b0 =  0.09763107  b1 =  0.19526215  b2 =  0.09763107
+  //   a1 = -0.94280904  a2 =  0.33333333
   //
-  // Quantised to Q1.23 (COEFF_W = 24, FRAC = 23):
+  // Quantised to Q2.22 (COEFF_W = 24, FRAC = 22):
+  //   Range ±2.0, sufficient for all coefficients (|a1| < 1.0).
+  //   Previous Q1.23 overflowed on a1_neg (~0.94 × 2^23 > 8388607).
   localparam int COEFF_W = 24;
-  localparam int FRAC = 23;
+  localparam int FRAC = 22;
 
-  localparam logic signed [COEFF_W-1:0] LPF_B0 = 24'sd565870;  //  0.06745527 * 2^23
-  localparam logic signed [COEFF_W-1:0] LPF_B1 = 24'sd1131740;  //  0.13491055 * 2^23
-  localparam logic signed [COEFF_W-1:0] LPF_B2 = 24'sd565870;  //  0.06745527 * 2^23
-  // Pre-negated for biquad_tdf2 (pass -a1, -a2)
-  localparam logic signed [COEFF_W-1:0] LPF_A1_NEG = 24'sd9584882;  // +1.14298050 * 2^23 (= -a1)
-  localparam logic signed [COEFF_W-1:0] LPF_A2_NEG = -24'sd3462816;  // -0.41280159 * 2^23 (= -a2)
+  localparam logic signed [COEFF_W-1:0] LPF_B0     =  24'sd409494;   //  0.09763107 * 2^22
+  localparam logic signed [COEFF_W-1:0] LPF_B1     =  24'sd818989;   //  0.19526215 * 2^22
+  localparam logic signed [COEFF_W-1:0] LPF_B2     =  24'sd409494;   //  0.09763107 * 2^22
+  localparam logic signed [COEFF_W-1:0] LPF_A1_NEG =  24'sd3954428;  //  0.94280904 * 2^22
+  localparam logic signed [COEFF_W-1:0] LPF_A2_NEG = -24'sd1398101;  // -0.33333333 * 2^22
 
   // =========================================================================
   // LFO - Triangle wave via phase accumulator
@@ -95,7 +108,6 @@ module flanger #(
   logic [LFO_ACC_W-1:0] lfo_inc;
   logic [          7:0] lfo_tri;  // unsigned 8-bit triangle output
 
-  // Scale speed_val (0-255) to phase increment (0-LFO_INC_MAX)
   assign lfo_inc = LFO_ACC_W'((int'(speed_val) * LFO_INC_MAX) >> 8);
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -114,9 +126,6 @@ module flanger #(
   // =========================================================================
   // Delay time calculation
   // =========================================================================
-  // total_delay = MIN_DELAY + manual*RANGE/256 +/- width*lfo*RANGE/(256*256)
-  // Fixed-point result: [integer . FRAC_W fractional] samples
-
   logic [ADDR_W+FRAC_W-1:0] base_delay_frac;
   logic [ADDR_W+FRAC_W-1:0] lfo_mod_frac;
   logic [ADDR_W+FRAC_W:0] total_delay_raw;
@@ -126,26 +135,24 @@ module flanger #(
   logic [FRAC_W-1:0] delay_frac;
 
   always_comb begin
-    // Base delay from MANUAL knob
     base_delay_frac = (ADDR_W+FRAC_W)'(
             (MIN_DELAY << FRAC_W) +
             ((int'(manual_val) * DELAY_RANGE) << FRAC_W) / 256
         );
 
-    // LFO modulation scaled by WIDTH
+    // Use longint (64-bit) to avoid overflow:
+    // worst case: 255 * 255 * 228 * 1024 = ~15 billion, exceeds 32-bit int
     lfo_mod_frac = (ADDR_W+FRAC_W)'(
-            (int'(width_val) * int'(lfo_tri) * DELAY_RANGE * (1 << FRAC_W)) / (256 * 256)
+            (longint'(width_val) * longint'(lfo_tri) * longint'(DELAY_RANGE) * longint'(1 << FRAC_W)) / (256 * 256)
         );
 
-    // Combine (centred: LFO swings +/-half around base)
     total_delay_raw = (ADDR_W+FRAC_W+1)'(signed'({1'b0, base_delay_frac}) +
                            signed'({1'b0, lfo_mod_frac}) -
                            signed'({1'b0, (ADDR_W+FRAC_W)'(
-                               (int'(width_val) * DELAY_RANGE * (1 << FRAC_W)) / (256 * 2)
+                               (longint'(width_val) * longint'(DELAY_RANGE) * longint'(1 << FRAC_W)) / (256 * 2)
                            )}));
 
-    // Clamp to valid range
-    if (total_delay_raw[ADDR_W+FRAC_W])  // negative
+    if (total_delay_raw[ADDR_W+FRAC_W])
       total_delay_clamped = (ADDR_W + FRAC_W)'(MIN_DELAY << FRAC_W);
     else if (total_delay_raw > (ADDR_W + FRAC_W + 1)'(MAX_DELAY << FRAC_W))
       total_delay_clamped = (ADDR_W + FRAC_W)'(MAX_DELAY << FRAC_W);
@@ -162,54 +169,39 @@ module flanger #(
   logic signed [8:0] regen_signed;
   assign regen_signed = signed'({1'b0, regen_val}) - 9'sd128;
 
-  logic signed [ INT_W-1:0] feedback_scaled;
-  logic signed [ INT_W-1:0] delay_input_wide;
-
   // =========================================================================
-  // Delay line (circular buffer)
+  // Delay line (circular buffer) - COMBINATIONAL reads
   // =========================================================================
-  logic signed [ WIDTH-1:0] delay_mem        [0:MAX_DELAY-1];
+  // Key difference from previous version: tap reads are combinational
+  // (not registered) so wet_interp is available in the same cycle as
+  // sample_en.  This keeps the flanger at 1-cycle latency like tremolo
+  // and phaser, matching the slot wrapper's expectation.
+  // =========================================================================
+  logic signed [ WIDTH-1:0] delay_mem[0:MAX_DELAY-1];
   logic        [ADDR_W-1:0] wr_ptr;
 
   logic [ADDR_W-1:0] rd_addr_a, rd_addr_b;
   logic signed [WIDTH-1:0] tap_a, tap_b;
   logic signed [WIDTH-1:0] wet_interp;
 
-  // Read address computation
+  // Read addresses (circular subtraction modulo MAX_DELAY)
+  // MAX_DELAY (240) is not power-of-two, so binary subtraction wraps at
+  // 256 - addresses 240-255 are stale/invalid.  Must wrap explicitly.
   always_comb begin
-    rd_addr_a = wr_ptr - delay_int;
-    rd_addr_b = wr_ptr - delay_int - ADDR_W'(1);
+    if (wr_ptr >= delay_int)
+      rd_addr_a = wr_ptr - delay_int;
+    else
+      rd_addr_a = wr_ptr + ADDR_W'(MAX_DELAY) - delay_int;
+
+    if (wr_ptr >= delay_int + ADDR_W'(1))
+      rd_addr_b = wr_ptr - delay_int - ADDR_W'(1);
+    else
+      rd_addr_b = wr_ptr + ADDR_W'(MAX_DELAY) - delay_int - ADDR_W'(1);
   end
 
-  // --- Saturate delay-line input (shared saturate module) ---
-  logic signed [WIDTH-1:0] delay_input_sat;
-
-  saturate #(
-      .IN_W (INT_W),
-      .OUT_W(WIDTH)
-  ) u_sat_delay_in (
-      .din (delay_input_wide),
-      .dout(delay_input_sat)
-  );
-
-  // Write: input + feedback into delay line
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      wr_ptr <= '0;
-      for (int i = 0; i < MAX_DELAY; i++) delay_mem[i] <= '0;
-    end else if (sample_en) begin
-      delay_mem[wr_ptr] <= delay_input_sat;
-      wr_ptr <= (wr_ptr == ADDR_W'(MAX_DELAY - 1)) ? '0 : wr_ptr + ADDR_W'(1);
-    end
-  end
-
-  // Read taps (registered for timing)
-  always_ff @(posedge clk) begin
-    if (sample_en) begin
-      tap_a <= delay_mem[rd_addr_a];
-      tap_b <= delay_mem[rd_addr_b];
-    end
-  end
+  // Combinational tap reads
+  assign tap_a = delay_mem[rd_addr_a];
+  assign tap_b = delay_mem[rd_addr_b];
 
   // =========================================================================
   // Linear interpolation:  wet = tap_a + frac * (tap_b - tap_a)
@@ -226,21 +218,16 @@ module flanger #(
   // =========================================================================
   // BBD reconstruction low-pass filter (biquad_tdf2)
   // =========================================================================
-  // Models the SAD1024's clock-reconstruction / anti-imaging filter.
-  // The original M117R has a ~6 kHz rolloff on the delayed path which
-  // gives the swept signal its characteristic warm, dark character and
-  // prevents harsh aliasing artefacts from the BBD clock.
+  // Enabled on sample_en.  On the rising edge:
+  //   - x_in  = wet_interp (combinationally valid this cycle)
+  //   - y_out = wet_filtered (result from PREVIOUS sample -- 1-sample delay)
   //
-  // sample_en_d1 is used as the enable because wet_interp is valid
-  // one cycle after sample_en (tap_a/tap_b are registered reads).
-
-  logic                    sample_en_d1;
+  // This is correct: the biquad's inherent 1-sample latency models the
+  // analog reconstruction filter's propagation delay.  wet_filtered used
+  // in the feedback path and output mix is the previous sample's filtered
+  // output, which is stable and valid when sample_en fires.
+  // =========================================================================
   logic signed [WIDTH-1:0] wet_filtered;
-
-  always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) sample_en_d1 <= 1'b0;
-    else sample_en_d1 <= sample_en;
-  end
 
   biquad_tdf2 #(
       .DATA_W (WIDTH),
@@ -249,7 +236,7 @@ module flanger #(
   ) u_bbd_lpf (
       .clk   (clk),
       .rst_n (rst_n),
-      .en    (sample_en_d1),
+      .en    (sample_en),
       .x_in  (wet_interp),
       .y_out (wet_filtered),
       .b0    (LPF_B0),
@@ -260,17 +247,84 @@ module flanger #(
   );
 
   // =========================================================================
-  // Feedback path  (taken from the filtered wet signal)
+  // Feedback path
   // =========================================================================
+  // feedback uses wet_filtered which is the PREVIOUS sample's biquad output
+  // (stable before sample_en edge).  This 1-sample feedback delay is
+  // identical to the analog circuit's propagation through BBD + filter.
+  //
   // feedback = wet_filtered * regen_signed / 128
+  //   → max gain ≈ ±0.99 at regen extremes (127/128)
+
+  logic signed [INT_W-1:0] feedback_scaled;
+  logic signed [INT_W-1:0] delay_input_wide;
+
   always_comb begin
     feedback_scaled  = INT_W'((longint'(wet_filtered) * longint'(regen_signed)) >>> 7);
     delay_input_wide = INT_W'(signed'(audio_in)) + feedback_scaled;
   end
 
+  // --- Piecewise-linear soft-clip on delay input (models BBD/opamp saturation) ---
+  //
+  // The analog MXR M117R soft-clips at the BBD input summing node, NOT on
+  // feedback alone.  We apply soft-clip to (audio_in + feedback) before the
+  // delay write.  This prevents the hard-edge clicks that a pure saturator
+  // produces at high regen settings.
+  //
+  // Transfer function (signed, symmetric):
+  //   |x| ≤ T     :  y = x                         (gain = 1.0, linear)
+  //   T < |x|     :  y = sign(x) · (T + (|x|-T)/2) (gain = 0.5, compressed)
+  //   final clamp :  |y| ≤ PEAK                      (safety net)
+  //
+  // T = 0.5 · full-scale = 2^(WIDTH-2).  The 50% knee is conservative but
+  // eliminates audible hard-clip artefacts.  The 2:1 compression above the
+  // knee keeps the signal musically usable at high regen.
+  // Implementation: one compare, one subtract, one shift, one add.
+
+  localparam signed [WIDTH-1:0] CLIP_KNEE = (1 << (WIDTH - 2));  // 0.5 * full-scale
+  localparam signed [WIDTH-1:0] CLIP_PEAK = {1'b0, {(WIDTH-1){1'b1}}};  // +max
+
+  logic signed [WIDTH-1:0] delay_input_sat;
+
+  always_comb begin
+    logic signed [INT_W-1:0] x;
+    logic        [INT_W-2:0] x_abs;
+    logic        [INT_W-2:0] y_abs;
+
+    x     = delay_input_wide;
+    x_abs = x[INT_W-1] ? INT_W'(-x) : x;
+
+    if (x_abs <= INT_W'(CLIP_KNEE)) begin
+      // Linear region
+      delay_input_sat = x[WIDTH-1:0];
+    end else begin
+      // Compressed region: knee + (excess >> 1)
+      y_abs = (INT_W-1)'(CLIP_KNEE) + ((x_abs - (INT_W-1)'(CLIP_KNEE)) >> 1);
+      // Hard clamp as safety net
+      if (y_abs > (INT_W-1)'(CLIP_PEAK))
+        y_abs = (INT_W-1)'(CLIP_PEAK);
+      delay_input_sat = x[INT_W-1] ? -WIDTH'(y_abs) : WIDTH'(y_abs);
+    end
+  end
+
+  // Write delay line and advance pointer
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      wr_ptr <= '0;
+      for (int i = 0; i < MAX_DELAY; i++) delay_mem[i] <= '0;
+    end else if (sample_en) begin
+      delay_mem[wr_ptr] <= delay_input_sat;
+      wr_ptr <= (wr_ptr == ADDR_W'(MAX_DELAY - 1)) ? '0 : wr_ptr + ADDR_W'(1);
+    end
+  end
+
   // =========================================================================
   // Output mix:  (dry + wet_filtered) / 2
   // =========================================================================
+  // Uses wet_filtered (previous sample's biquad output, stable) and
+  // audio_in (current sample, combinationally valid).
+  // Both are valid at sample_en time.
+
   logic signed [INT_W-1:0] mix;
   logic signed [WIDTH-1:0] mix_sat;
 
@@ -278,7 +332,6 @@ module flanger #(
     mix = (INT_W'(signed'(audio_in)) + INT_W'(signed'(wet_filtered))) >>> 1;
   end
 
-  // --- Saturate output mix (shared saturate module) ---
   saturate #(
       .IN_W (INT_W),
       .OUT_W(WIDTH)
@@ -288,25 +341,16 @@ module flanger #(
   );
 
   // =========================================================================
-  // Registered output
+  // Registered output  (1-cycle latency, same as tremolo / phaser)
   // =========================================================================
-  // Pipeline:  sample_en  -> (tap read registered)
-  //            sample_en_d1 -> (biquad processes wet_interp)
-  //            sample_en_d2 -> output register captures mix_sat
-  //
-  // Total latency: 2 cycles from sample_en to audio_out valid.
-  // axis_effect_slot gen_flanger uses sample_en_d2 as effect_valid.
-
-  logic sample_en_d2;
+  // audio_out is registered on sample_en.  The slot wrapper reads it on
+  // effect_valid = sample_en_d1 (one cycle later), at which point it is
+  // stable.  This matches the exact timing contract of all other 1-cycle
+  // effect cores.
 
   always_ff @(posedge clk or negedge rst_n) begin
-    if (!rst_n) begin
-      audio_out    <= '0;
-      sample_en_d2 <= 1'b0;
-    end else begin
-      sample_en_d2 <= sample_en_d1;
-      if (sample_en_d2) audio_out <= mix_sat;
-    end
+    if (!rst_n) audio_out <= '0;
+    else if (sample_en) audio_out <= mix_sat;
   end
 
 endmodule
