@@ -6,7 +6,7 @@
 // pack/unpack wires and a sample_en edge detect, matching the proven
 // original design's I2S interface exactly.
 //
-// Symmetric 6-port crossbar (N_XBAR = N_SLOTS + 1 = 6):
+// Symmetric 7-port crossbar (N_XBAR = N_SLOTS + 1 = 7):
 //
 //   Port  Master (source)          Slave (sink)
 //   ----  ----------------------   ----------------------
@@ -16,17 +16,19 @@
 //    3    Slot 2 (chorus)          Slot 2 input
 //    4    Slot 3 (dd3 delay)       Slot 3 input
 //    5    Slot 4 (tube_distortion) Slot 4 input
+//    6    Slot 5 (flanger)         Slot 5 input
 //
 // Default linear chain:
-//   route[5]=0 TUB←ADC  route[1]=5 TRM←TUB  route[2]=1 PHA←TRM
-//   route[3]=2 CHO←PHA  route[4]=3 DLY←CHO  route[0]=4 DAC←DLY
+//   route[6]=0 FLN←ADC  route[5]=6 TUB←FLN  route[1]=5 TRM←TUB
+//   route[2]=1 PHA←TRM  route[3]=2 CHO←PHA  route[4]=3 DLY←CHO
+//   route[0]=4 DAC←DLY
 //
 // Bypass is software-controlled via "set <efx> on/off" CLI commands.
 // Each slot reads its own bypass bit from cfg_slice[7][0] (no sw_effect port).
 // ============================================================================
 
 module top #(
-    parameter int N_SLOTS  = 5,
+    parameter int N_SLOTS  = 6,
     parameter int REGS_PER = 8,
     parameter int REG_W    = 8
 ) (
@@ -175,7 +177,10 @@ module top #(
   // ---- sample_en: lrclk rising-edge detect (same as original top.sv) ----
   logic lrclk_prev, sample_en;
   always_ff @(posedge clk_audio) begin
-    lrclk_prev <= i2s2_tx_lrclk;
+    if (!resetn)
+      lrclk_prev <= 1'b0;
+    else
+      lrclk_prev <= i2s2_tx_lrclk;
   end
   assign sample_en = i2s2_tx_lrclk & ~lrclk_prev;
 
@@ -217,7 +222,7 @@ module top #(
   end
 
   // =========================================================================
-  // Crossbar (5 symmetric ports)
+  // Crossbar (7 symmetric ports: ADC/DAC + 6 effect slots)
   // =========================================================================
   logic [47:0] xbar_m_tdata [N_XBAR];
   logic        xbar_m_tvalid[N_XBAR];
@@ -252,7 +257,7 @@ module top #(
   // =========================================================================
   // Effect Slots
   // =========================================================================
-  localparam int EFFECT_TYPES[N_SLOTS] = '{0, 1, 2, 3, 4};
+  localparam int EFFECT_TYPES[N_SLOTS] = '{0, 1, 2, 3, 4, 5};
   localparam int TUBE_LUT_ADDR = 12;  // 4096-entry 12AX7 LUT
   localparam int TUBE_FRAC_W = 12;  // interpolation fraction bits
 
@@ -288,4 +293,3 @@ module top #(
   assign led = {2'b00, locked, btns[0]};
 
 endmodule
-

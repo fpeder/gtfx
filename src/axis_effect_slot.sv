@@ -16,6 +16,7 @@
 //   2 = chorus         (mono in, stereo out, 1-cycle latency)
 //   3 = dd3            (mono in, wet+dry mix,1-cycle latency)
 //   4 = tube_distortion(mono in, mono out,   valid_out-driven, 9-cycle latency)
+//   5 = flanger       (mono in, mono out,   1-cycle latency)
 //
 // Register map (per slot, 8 bytes, indexed from cfg_mem[SLOT_ID*CTRL_DEPTH]):
 //   tremolo:         [0]=rate  [1]=depth  [2]=shape(bit0)           [7]=bypass(bit0)
@@ -23,6 +24,7 @@
 //   chorus:          [0]=rate  [1]=depth  [2]=effect_lvl [3..4]=eq  [7]=bypass(bit0)
 //   dd3:             [0]=tone  [1]=level  [2]=feedback [3..4]=time  [7]=bypass(bit0)
 //   tube_distortion: [0]=gain  [1]=bass   [2]=mid [3]=treble [4]=lvl [7]=bypass(bit0)
+//   flanger:         [0]=manual [1]=width [2]=speed [3]=regen       [7]=bypass(bit0)
 //
 // bypass is read directly from cfg_slice[7][0].  The separate bypass input port
 // has been removed; ctrl_bus writes the bypass bit into cfg_mem[slot*CTRL_DEPTH+7].
@@ -42,7 +44,7 @@
 
 module axis_effect_slot #(
     parameter int SLOT_ID          = 0,
-    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=dd3, 4=tube
+    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=dd3, 4=tube, 5=flanger
     parameter int DATA_W           = 48,
     parameter int CTRL_DEPTH       = 8,
     parameter int CTRL_W           = 8,
@@ -253,6 +255,37 @@ module axis_effect_slot #(
       assign effect_out_r = core_out;
       assign effect_valid = core_valid;
 
+      // ---- FLANGER (type 5): mono in → mono out ----
+    end else if (EFFECT_TYPE == 5) begin : gen_flanger
+      logic signed [AUDIO_W-1:0] core_out;
+
+      flanger #(
+          .WIDTH    (AUDIO_W),
+          .MAX_DELAY(240),
+          .MIN_DELAY(12)
+      ) core (
+          .clk       (clk),
+          .rst_n     (rst_n),
+          .sample_en (sample_en_reg),
+          .audio_in  (audio_in_reg),
+          .audio_out (core_out),
+          .manual_val(cfg_slice[0]),
+          .width_val (cfg_slice[1]),
+          .speed_val (cfg_slice[2]),
+          .regen_val (cfg_slice[3])
+      );
+
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
+
+      // flanger has 2-cycle latency (sample_en → sample_d1 → output)
+      logic sample_en_d1, sample_en_d2;
+      always_ff @(posedge clk) begin
+        sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+        sample_en_d2 <= (!rst_n) ? 1'b0 : sample_en_d1;
+      end
+      assign effect_valid = sample_en_d2;
+
       // ---- DEFAULT: passthrough ----
     end else begin : gen_passthrough
       assign effect_out_l = dry_l_hold;
@@ -313,4 +346,3 @@ module axis_effect_slot #(
   assign m_axis_tvalid = bypass ? byp_valid : efx_valid;
 
 endmodule
-

@@ -54,7 +54,6 @@ try:
 except ImportError:
     HAS_SERIAL = False
 
-
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  Routing model — mirrors cmd_proc_v2 shadow_route[0..6]                 ║
 # ║                                                                         ║
@@ -276,14 +275,12 @@ def build_slot_dict() -> dict[str, EffectSlot]:
     return {s.tag: s for s in EFFECT_DEFS}
 
 
-def ordered_slots(
-    slot_dict: dict[str, EffectSlot], route: list[int]
-) -> list[EffectSlot]:
+def ordered_slots(slot_dict: dict[str, EffectSlot],
+                  route: list[int]) -> list[EffectSlot]:
     """Return slots ordered by signal chain (ADC-side first)."""
     chain_ports = trace_chain(route)
     ordered = [
-        slot_dict[PORT_TAG[p]]
-        for p in chain_ports
+        slot_dict[PORT_TAG[p]] for p in chain_ports
         if PORT_TAG.get(p, "adc") in slot_dict
     ]
     # Append orphaned slots (disconnected from DAC chain)
@@ -311,7 +308,8 @@ class SerialLink:
         self.port_name = port
         self.baud = baud
         self.timeout = timeout
-        self._ser: Optional[pyserial.Serial] = None  # type: ignore[name-defined]
+        self._ser: Optional[
+            pyserial.Serial] = None  # type: ignore[name-defined]
         self._lock = threading.Lock()
         self.rx_log: list[str] = []
         self.connected = False
@@ -323,8 +321,9 @@ class SerialLink:
             return False
         try:
             self._ser = pyserial.Serial(  # type: ignore[attr-defined]
-                self.port_name, self.baud, timeout=self.timeout
-            )
+                self.port_name,
+                self.baud,
+                timeout=self.timeout)
             self.connected = True
             time.sleep(0.1)
             self._ser.reset_input_buffer()
@@ -346,19 +345,36 @@ class SerialLink:
             self.rx_log[:] = self.rx_log[-LOG_TRIM:]
 
     def _send(self, cmd: str) -> str:
-        """Send *cmd* + CR, return any immediate response."""
+        """Send *cmd* + CR, waiting for echo of each character.
+
+        The FPGA cmd_proc echoes every character through its TX state
+        machine before returning to S_IDLE to accept the next one.
+        If we blast the whole string at once, characters arriving while
+        the FPGA is still echoing get overwritten in rx_latch and lost.
+        Sending one byte at a time and waiting for its echo avoids this.
+        """
         with self._lock:
             if not self.connected:
                 self._log(f"[offline] {cmd}")
                 return ""
             assert self._ser is not None
-            self._ser.write((cmd + "\r").encode("ascii"))
-            time.sleep(0.05)
+
+            # Drain any stale RX data
+            if self._ser.in_waiting:
+                self._ser.read(self._ser.in_waiting)
+
+            full = cmd + "\r"
+            for ch in full:
+                self._ser.write(ch.encode("ascii"))
+                # Wait for echo (the FPGA echoes every char, CR→CRLF)
+                time.sleep(0.002)  # 2ms >> 87µs per byte at 115200
+
+            # Read back any remaining response (echo + prompt)
+            time.sleep(0.02)
             resp = ""
             try:
-                resp = self._ser.read(self._ser.in_waiting or 1).decode(
-                    "ascii", errors="replace"
-                )
+                resp = self._ser.read(self._ser.in_waiting
+                                      or 1).decode("ascii", errors="replace")
             except Exception:
                 pass
             if resp:
@@ -373,7 +389,8 @@ class SerialLink:
     #  ;                       (status dump)
 
     def set_param(self, slot: EffectSlot, param: Param) -> str:
-        return self._send(f"set {slot.tag} {param.name} {param.format_cmd_value()}")
+        return self._send(
+            f"set {slot.tag} {param.name} {param.format_cmd_value()}")
 
     def set_bypass(self, slot: EffectSlot, active: bool) -> str:
         return self._send(f"set {slot.tag} {'on' if active else 'off'}")
@@ -392,12 +409,14 @@ class SerialLink:
                 return ""
             assert self._ser is not None
             self._ser.write(b";")
-            time.sleep(0.15)
+            time.sleep(0.3)
             resp = ""
             try:
-                resp = self._ser.read(self._ser.in_waiting or 1).decode(
-                    "ascii", errors="replace"
-                )
+                # Read all available bytes (status can be long)
+                while self._ser.in_waiting:
+                    resp += self._ser.read(self._ser.in_waiting).decode(
+                        "ascii", errors="replace")
+                    time.sleep(0.05)
             except Exception:
                 pass
             for line in resp.splitlines():
@@ -405,6 +424,125 @@ class SerialLink:
                 if stripped:
                     self._log(stripped)
             return resp
+
+
+# ╔═══════════════════════════════════════════════════════════════════════════╗
+# ║  Status parser — decode the `;` status dump from cmd_proc_v2            ║
+# ║                                                                         ║
+# ║  Status format (example):                                               ║
+# ║    DAC<DLY TRM<TUB PHA<TRM CHO<PHA DLY<CHO TUB<FLN FLN<ADC            ║
+# ║    TRM rat:3C dep:B4 shp:00                                             ║
+# ║    PHA spd:50 fbn:00                                                    ║
+# ║    CHO rat:50 dep:64 efx:80 eqh:C8 eql:80                              ║
+# ║    DLY ton:FF lvl:80 fdb:64 tim:3000                                    ║
+# ║    TUB gai:40 bas:80 mid:80 tre:80 lvl:A0                              ║
+# ║    FLN man:80 wid:C0 spd:30 reg:A0                                     ║
+# ║  Effects that are bypassed are omitted from the dump.                   ║
+# ╚═══════════════════════════════════════════════════════════════════════════╝
+
+# Maps 3-char route name → port index (for parsing the route line)
+_ROUTE_NAME_PORT: dict[str, int] = {
+    "ADC": Port.ADC,
+    "TRM": Port.TRM,
+    "PHA": Port.PHA,
+    "CHO": Port.CHO,
+    "DLY": Port.DLY,
+    "TUB": Port.TUB,
+    "FLN": Port.FLN,
+    "DAC": 0,
+}
+
+
+def parse_status(raw: str, slot_dict: dict[str, EffectSlot],
+                 route: list[int]) -> bool:
+    """Parse a status dump and update *slot_dict* and *route* in-place.
+
+    Returns True if at least the route line was successfully parsed.
+    """
+    lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+    if not lines:
+        return False
+
+    # ── Parse route line ──
+    # Format: "DAC<DLY TRM<TUB PHA<TRM CHO<PHA DLY<CHO TUB<FLN FLN<ADC"
+    route_parsed = False
+    for line in lines:
+        if "<" in line and not any(c == ":" for c in line):
+            pairs = line.split()
+            for pair in pairs:
+                if "<" not in pair:
+                    continue
+                snk_name, src_name = pair.split("<", 1)
+                snk_name = snk_name.strip().upper()
+                src_name = src_name.strip().upper()
+                if snk_name in _ROUTE_NAME_PORT and src_name in _ROUTE_NAME_PORT:
+                    snk_idx = SINK_ROUTE_IDX.get(snk_name.lower())
+                    if snk_idx is not None and snk_idx < len(route):
+                        route[snk_idx] = _ROUTE_NAME_PORT[src_name]
+                        route_parsed = True
+            break  # route line is always first
+
+    # ── Determine which effects appeared (= active / not bypassed) ──
+    seen_tags: set[str] = set()
+
+    for line in lines:
+        if "<" in line and ":" not in line:
+            continue  # skip route line
+        if ":" not in line:
+            continue
+
+        # Line format: "TRM rat:3C dep:B4 shp:00"
+        parts = line.split()
+        if not parts:
+            continue
+
+        tag = parts[0].strip().lower()
+        if tag not in slot_dict:
+            continue
+
+        seen_tags.add(tag)
+        slot = slot_dict[tag]
+
+        # Build param lookup for this slot
+        param_by_name: dict[str, Param] = {p.name: p for p in slot.params}
+
+        for token in parts[1:]:
+            if ":" not in token:
+                continue
+            pname, hexval = token.split(":", 1)
+            pname = pname.strip().lower()
+            hexval = hexval.strip().upper()
+            if pname not in param_by_name:
+                continue
+            try:
+                param_by_name[pname].value = int(hexval, 16)
+            except ValueError:
+                pass
+
+    # ── Update bypass state ──
+    for tag, slot in slot_dict.items():
+        slot.bypassed = tag not in seen_tags
+
+    return route_parsed
+
+
+def sync_from_hardware(link: SerialLink, slot_dict: dict[str, EffectSlot],
+                       route: list[int]) -> bool:
+    """Request status from hardware and sync local state.
+
+    Returns True on successful sync.
+    """
+    if not link.connected:
+        return False
+    raw = link.request_status()
+    if not raw:
+        return False
+    ok = parse_status(raw, slot_dict, route)
+    if ok:
+        link._log("Synced from hardware")
+    else:
+        link._log("Status parse failed — using defaults")
+    return ok
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -427,7 +565,9 @@ class Color(IntEnum):
     WARN = 10
 
 
-SLOT_WIDTH = 45
+SLOT_WIDTH = 40
+NUM_COLS = 2
+COL_GAP = 1  # horizontal gap between columns
 
 
 def _init_colors() -> None:
@@ -463,7 +603,8 @@ def _safe(win, *args, **kwargs) -> None:
 # ── bar ──────────────────────────────────────────────────────────────────
 
 
-def draw_bar(win, y: int, x: int, value: int, hi: int, width: int, cp: Color) -> None:
+def draw_bar(win, y: int, x: int, value: int, hi: int, width: int,
+             cp: Color) -> None:
     filled = max(0, min(int(value / max(hi, 1) * width), width))
     _safe(win, y, x, "#" * filled, _cp(cp, bold=True))
     _safe(win, "." * (width - filled), _cp(Color.NORMAL))
@@ -476,8 +617,8 @@ _VAL_W = 4
 _BAR_W = SLOT_WIDTH - 2 - 1 - _LABEL_W - 1 - _VAL_W - 1 - 1  # = 16
 
 
-def draw_slot(pad, slot: EffectSlot, y: int, is_active: bool) -> int:
-    """Draw one slot onto *pad* at row *y*.  Returns the next free row."""
+def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
+    """Draw one slot onto *win* at row *y*, column *x*.  Returns next free row."""
     w = SLOT_WIDTH
 
     # Determine header style
@@ -489,13 +630,14 @@ def draw_slot(pad, slot: EffectSlot, y: int, is_active: bool) -> int:
         hdr = _cp(Color.ACTIVE, bold=True)
 
     byp_text = " ON" if not slot.bypassed else "OFF"
-    byp_attr = _cp(Color.ACTIVE, bold=True) if not slot.bypassed else _cp(Color.WARN)
+    byp_attr = _cp(Color.ACTIVE, bold=True) if not slot.bypassed else _cp(
+        Color.WARN)
 
     # Header row:  + NAME               ON +
     name_w = w - 2 - 4  # 4 chars for bypass tag + space
-    _safe(pad, y, 0, "+" + "-" * (w - 2) + "+", hdr)
-    _safe(pad, y, 1, f" {slot.full_name.upper():<{name_w}}", hdr)
-    _safe(pad, y, 1 + name_w, f"{byp_text} ", byp_attr)
+    _safe(win, y, x, "+" + "-" * (w - 2) + "+", hdr)
+    _safe(win, y, x + 1, f" {slot.full_name.upper():<{name_w}}", hdr)
+    _safe(win, y, x + 1 + name_w, f"{byp_text} ", byp_attr)
     y += 1
 
     # Parameter rows
@@ -514,20 +656,17 @@ def draw_slot(pad, slot: EffectSlot, y: int, is_active: bool) -> int:
         body = f"{marker}{p.label:<{_LABEL_W}} {p.format_value()} "
         border_attr = attr if is_sel else hdr
 
-        _safe(pad, y, 0, "|", border_attr)
-        _safe(pad, y, 1, body, attr)
-        bar_x = 1 + len(body)
-        bar_cp = (
-            Color.SELECTED
-            if is_sel
-            else (Color.BAR if not slot.bypassed else Color.BYPASSED)
-        )
-        draw_bar(pad, y, bar_x, p.value, p.hi, _BAR_W, bar_cp)
-        _safe(pad, y, w - 1, "|", border_attr)
+        _safe(win, y, x, "|", border_attr)
+        _safe(win, y, x + 1, body, attr)
+        bar_x = x + 1 + len(body)
+        bar_cp = (Color.SELECTED if is_sel else
+                  (Color.BAR if not slot.bypassed else Color.BYPASSED))
+        draw_bar(win, y, bar_x, p.value, p.hi, _BAR_W, bar_cp)
+        _safe(win, y, x + w - 1, "|", border_attr)
         y += 1
 
     # Footer
-    _safe(pad, y, 0, "+" + "-" * (w - 2) + "+", hdr)
+    _safe(win, y, x, "+" + "-" * (w - 2) + "+", hdr)
     return y + 1
 
 
@@ -541,7 +680,7 @@ def draw_title(scr, max_x: int, port: str, baud: int, connected: bool) -> None:
     title = " EFX Control | cmd_proc_v2 "
     conn = f" {port}@{baud}" if connected else " OFFLINE"
     line = f"{title}{conn:>{max_x - len(title) - 1}}"
-    _safe(scr, 0, 0, line[: max_x - 1].ljust(max_x - 1), _cp(Color.TITLE))
+    _safe(scr, 0, 0, line[:max_x - 1].ljust(max_x - 1), _cp(Color.TITLE))
 
 
 def draw_chain(scr, slots: list[EffectSlot]) -> None:
@@ -554,12 +693,14 @@ def draw_chain(scr, slots: list[EffectSlot]) -> None:
     _safe(scr, chain, _cp(Color.ACTIVE, bold=True))
 
 
-def draw_connection_editor(scr, con_sink: int, con_src: int, route: list[int]) -> None:
+def draw_connection_editor(scr, con_sink: int, con_src: int,
+                           route: list[int]) -> None:
     # Row 1 — sink selector
     _safe(scr, 1, 1, "ROUTE EDIT ", _cp(Color.WARN, bold=True))
     cx = 13
     for si, snk in enumerate(SINK_NODES):
-        attr = _cp(Color.SELECTED, bold=True) if si == con_sink else _cp(Color.NORMAL)
+        attr = _cp(Color.SELECTED, bold=True) if si == con_sink else _cp(
+            Color.NORMAL)
         _safe(scr, 1, cx, f" {snk.upper()} ", attr)
         cx += 5
 
@@ -580,31 +721,79 @@ def draw_connection_editor(scr, con_sink: int, con_src: int, route: list[int]) -
         sx += 5
 
 
-def draw_scroll_indicators(scr, total_h: int, viewport_h: int, scroll_y: int) -> None:
+def compute_two_col_layout(
+        slots: list[EffectSlot]) -> list[tuple[int, int, int]]:
+    """Compute (col, x, y) for each slot in a 2-column left-to-right wrap.
+
+    Slots fill left column top-to-bottom, then right column, like reading
+    order.  Returns a list parallel to *slots*.
+    """
+    col_x = [1, 1 + SLOT_WIDTH + COL_GAP]
+    col_y = [0, 0]  # current y within each column (relative to viewport)
+
+    layout: list[tuple[int, int, int]] = []
+    for s in slots:
+        # Pick column with the least used height (left wins ties → fill left first)
+        col = 0 if col_y[0] <= col_y[1] else 1
+        layout.append((col, col_x[col], col_y[col]))
+        col_y[col] += s.height
+    return layout
+
+
+def compute_scroll_2col(
+    layout: list[tuple[int, int, int]],
+    slots: list[EffectSlot],
+    active_idx: int,
+    viewport_h: int,
+    scroll_y: int,
+) -> int:
+    """Adjust scroll_y so the active slot is fully visible."""
+    if active_idx >= len(layout):
+        return 0
+    _, _, y = layout[active_idx]
+    h = slots[active_idx].height
+    top, bot = y, y + h
+    if top < scroll_y:
+        scroll_y = top
+    if bot > scroll_y + viewport_h:
+        scroll_y = bot - viewport_h
+    return max(0, scroll_y)
+
+
+def total_height_2col(layout: list[tuple[int, int, int]],
+                      slots: list[EffectSlot]) -> int:
+    """Maximum height across both columns."""
+    max_h = 0
+    for (col, _, y), s in zip(layout, slots):
+        max_h = max(max_h, y + s.height)
+    return max_h
+
+
+def draw_scroll_indicators(scr, max_x: int, total_h: int, viewport_h: int,
+                           scroll_y: int) -> None:
     if total_h <= viewport_h:
         return
-    _safe(scr, FIXED_TOP, SLOT_WIDTH + 3, "^" if scroll_y > 0 else " ", _cp(Color.HELP))
+    ind_x = min(1 + SLOT_WIDTH * NUM_COLS + COL_GAP + 1, max_x - 1)
+    _safe(scr, FIXED_TOP, ind_x, "^" if scroll_y > 0 else " ", _cp(Color.HELP))
     _safe(
         scr,
         FIXED_TOP + viewport_h - 1,
-        SLOT_WIDTH + 3,
+        ind_x,
         "v" if scroll_y + viewport_h < total_h else " ",
         _cp(Color.HELP),
     )
 
 
-def draw_status(
-    scr, y: int, max_x: int, msg: str, msg_time: float, rx_log: list[str]
-) -> None:
+def draw_status(scr, y: int, max_x: int, msg: str, msg_time: float,
+                rx_log: list[str]) -> None:
     if msg and (time.time() - msg_time < 4.0):
         _safe(scr, y, 1, f" {msg[: max_x - 3]} ", _cp(Color.HELP))
     elif rx_log:
-        _safe(scr, y, 1, rx_log[-1][: max_x - 3], _cp(Color.LOG))
+        _safe(scr, y, 1, rx_log[-1][:max_x - 3], _cp(Color.LOG))
 
 
-def draw_help_bar(
-    scr, max_y: int, max_x: int, mode: "InputMode", raw_buf: str, raw_field: int
-) -> None:
+def draw_help_bar(scr, max_y: int, max_x: int, mode: "InputMode", raw_buf: str,
+                  raw_field: int) -> None:
     if mode == InputMode.CONNECTION:
         text = " CON | </>:sink  ^/v:source  Enter:apply  ESC:cancel "
     elif mode == InputMode.RAW_WRITE:
@@ -613,11 +802,10 @@ def draw_help_bar(
         else:
             text = f" RAW | {raw_buf[:2]}:{raw_buf[2:]}_ | 2 hex, Enter=send "
     else:
-        text = (
-            " TAB:slot ^v:prm <>:+-1 PgU/D:+-16"
-            "  SPC:byp o:ON f:OFF c:con s:stat w:raw q:quit "
-        )
-    _safe(scr, max_y - 1, 0, text[: max_x - 1].ljust(max_x - 1), _cp(Color.TITLE))
+        text = (" TAB:slot ^v:prm <>:+-1 PgU/D:+-16"
+                "  SPC:byp o:ON f:OFF c:con s:stat w:raw q:quit ")
+    _safe(scr, max_y - 1, 0, text[:max_x - 1].ljust(max_x - 1),
+          _cp(Color.TITLE))
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -704,7 +892,8 @@ ENTER_KEYS = {curses.KEY_ENTER, 10, 13}
 BACKSPACE_KEYS = {curses.KEY_BACKSPACE, 127, 8}
 
 
-def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot], ai: int) -> None:
+def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
+                   ai: int) -> None:
     """Process a keypress in NORMAL mode."""
     slot = slots[ai]
     n = len(slots)
@@ -736,7 +925,8 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot], ai: int) -> N
             slot.selected_param += 1
 
     # ── value adjust ──
-    elif ch in (curses.KEY_RIGHT, curses.KEY_LEFT, curses.KEY_PPAGE, curses.KEY_NPAGE):
+    elif ch in (curses.KEY_RIGHT, curses.KEY_LEFT, curses.KEY_PPAGE,
+                curses.KEY_NPAGE):
         p = slot.params[slot.selected_param]
         if ch in (curses.KEY_RIGHT, curses.KEY_PPAGE):
             step = p.step_coarse if ch == curses.KEY_PPAGE else p.step_fine
@@ -775,8 +965,10 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot], ai: int) -> N
     elif ch in (ord("w"), ord("W")):
         st.enter_raw_write_mode()
     elif ch in (ord("s"), ord("S")):
-        st.link.request_status()
-        st.flash("Status requested (;)")
+        if sync_from_hardware(st.link, st.slot_dict, st.route):
+            st.flash("Synced from hardware")
+        else:
+            st.flash("Status sync failed")
     elif ch in (ord("r"), ord("R")):
         st.flash("Refreshed")
 
@@ -879,6 +1071,13 @@ def main(stdscr, args: argparse.Namespace) -> None:
         link=link,
     )
 
+    # ── sync local state from hardware shadow registers ──
+    if link.connected:
+        if sync_from_hardware(link, st.slot_dict, st.route):
+            st.flash("Synced from hardware")
+        else:
+            st.flash("Sync failed — using defaults")
+
     # ── loop ──
     while st.running:
         slots = st.get_ordered_slots()
@@ -900,31 +1099,29 @@ def main(stdscr, args: argparse.Namespace) -> None:
         else:
             draw_chain(stdscr, slots)
 
-        # ── draw slots onto a pad ──
-        total_h = sum(s.height for s in slots)
-        pad_h = max(total_h + 2, viewport_h + 2)
-        pad = curses.newpad(pad_h, SLOT_WIDTH + 2)
+        # ── draw slots in 2 columns directly on stdscr ──
+        layout = compute_two_col_layout(slots)
+        total_h = total_height_2col(layout, slots)
+        st.scroll_y = compute_scroll_2col(layout, slots, ai, viewport_h,
+                                          st.scroll_y)
 
-        py = 0
         for idx, slot in enumerate(slots):
-            py = draw_slot(pad, slot, py, idx == ai)
+            col, cx, cy = layout[idx]
+            screen_y = FIXED_TOP + cy - st.scroll_y
+            # Skip slots entirely above or below the viewport
+            if screen_y + slot.height <= FIXED_TOP:
+                continue
+            if screen_y >= FIXED_TOP + viewport_h:
+                continue
+            draw_slot(stdscr, slot, screen_y, cx, idx == ai)
 
-        st.scroll_y = compute_scroll(slots, ai, viewport_h, st.scroll_y)
-        blit_bot = min(FIXED_TOP + viewport_h - 1, max_y - FIXED_BOT - 1)
-        blit_right = min(SLOT_WIDTH + 2, max_x - 1)
-
-        draw_scroll_indicators(stdscr, total_h, viewport_h, st.scroll_y)
-        draw_status(
-            stdscr, max_y - 2, max_x, st.status_msg, st.status_time, link.rx_log
-        )
+        draw_scroll_indicators(stdscr, max_x, total_h, viewport_h, st.scroll_y)
+        draw_status(stdscr, max_y - 2, max_x, st.status_msg, st.status_time,
+                    link.rx_log)
         draw_help_bar(stdscr, max_y, max_x, st.mode, st.raw_buf, st.raw_field)
 
-        # ── blit: stdscr first, pad overlay second ──
+        # ── refresh ──
         stdscr.noutrefresh()
-        try:
-            pad.noutrefresh(st.scroll_y, 0, FIXED_TOP, 1, blit_bot, blit_right)
-        except curses.error:
-            pass
         curses.doupdate()
 
         # ── input dispatch ──
@@ -942,23 +1139,6 @@ def main(stdscr, args: argparse.Namespace) -> None:
     link.close()
 
 
-def compute_scroll(
-    slots: list[EffectSlot], active_idx: int, viewport_h: int, scroll_y: int
-) -> int:
-    """Adjust *scroll_y* so the active slot is fully visible."""
-    y = 0
-    for idx, s in enumerate(slots):
-        if idx == active_idx:
-            top, bot = y, y + s.height
-            if top < scroll_y:
-                scroll_y = top
-            if bot > scroll_y + viewport_h:
-                scroll_y = bot - viewport_h
-            break
-        y += s.height
-    return max(0, scroll_y)
-
-
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  Entry point                                                            ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -966,17 +1146,18 @@ def compute_scroll(
 
 def run() -> None:
     parser = argparse.ArgumentParser(
-        description="ncurses GUI for FPGA effects processor (cmd_proc_v2)"
-    )
+        description="ncurses GUI for FPGA effects processor (cmd_proc_v2)")
     parser.add_argument(
         "--port",
         "-p",
-        default="/dev/ttyUSB0",
-        help="Serial port  (default: /dev/ttyUSB0)",
+        default="/dev/ttyUSB1",
+        help="Serial port  (default: /dev/ttyUSB1)",
     )
-    parser.add_argument(
-        "--baud", "-b", type=int, default=115200, help="Baud rate  (default: 115200)"
-    )
+    parser.add_argument("--baud",
+                        "-b",
+                        type=int,
+                        default=115200,
+                        help="Baud rate  (default: 115200)")
     parser.add_argument(
         "--offline",
         action="store_true",

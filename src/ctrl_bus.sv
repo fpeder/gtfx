@@ -17,10 +17,11 @@
 //   0x10..0x17 : Slot 2  - chorus    [0]=rate [1]=depth [2]=efx [3..4]=eq [7]=bypass
 //   0x18..0x1F : Slot 3  - dd3       [0]=tone [1]=lvl [2]=fdb [3..4]=time [7]=bypass
 //   0x20..0x27 : Slot 4  - tube_dist [0]=gain [1]=bas [2]=mid [3]=tre [4]=lvl [7]=bypass
-//   0x40..0x45 : route[0] .. route[N_XBAR-1]
+//   0x28..0x2F : Slot 5  - flanger   [0]=manual [1]=width [2]=speed [3]=regen [7]=bypass
+//   0x40..0x46 : route[0] .. route[N_XBAR-1]
 //
-// "set <efx> on"  writes 0x00 to addr 0x07/0x0F/0x17/0x1F/0x27 (bypass off = active)
-// "set <efx> off" writes 0x01 to those addrs                    (bypass on  = bypassed)
+// "set <efx> on"  writes 0x00 to addr 0x07/0x0F/0x17/0x1F/0x27/0x2F (bypass off = active)
+// "set <efx> off" writes 0x01 to those addrs                         (bypass on  = bypassed)
 // Both fall within the normal cfg_mem write path - no special logic needed.
 //
 // Removed vs previous version:
@@ -78,6 +79,13 @@ module ctrl_bus #(
             cfg_mem[31] <= 8'h01;   // dly bypass
             cfg_mem[39] <= 8'h01;   // tub bypass
 
+            // ---- Slot 5 (flanger): manual=80 width=C0 speed=30 regen=A0 ----
+            cfg_mem[40] <= 8'h80;   // manual (mid)
+            cfg_mem[41] <= 8'hC0;   // width  (wide sweep)
+            cfg_mem[42] <= 8'h30;   // speed  (moderate)
+            cfg_mem[43] <= 8'hA0;   // regen  (positive, moderate)
+            cfg_mem[47] <= 8'h01;   // fln bypass
+
             // ---- Slot 0 (tremolo): rate=0x3C depth=0xB4 ----
             cfg_mem[0] <= 8'h3C;
             cfg_mem[1] <= 8'hB4;
@@ -117,13 +125,14 @@ module ctrl_bus #(
     // =========================================================================
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            // Default chain: ADC → TUB → TRM → PHA → CHO → DLY → DAC
+            // Default chain: ADC → FLN → TUB → TRM → PHA → CHO → DLY → DAC
             route[0] <= SEL_W'(4);   // DAC ← DLY  (port 4)
             route[1] <= SEL_W'(5);   // TRM ← TUB  (port 5)
             route[2] <= SEL_W'(1);   // PHA ← TRM  (port 1)
             route[3] <= SEL_W'(2);   // CHO ← PHA  (port 2)
             route[4] <= SEL_W'(3);   // DLY ← CHO  (port 3)
-            route[5] <= SEL_W'(0);   // TUB ← ADC  (port 0)
+            route[5] <= SEL_W'(6);   // TUB ← FLN  (port 6)
+            route[6] <= SEL_W'(0);   // FLN ← ADC  (port 0)
         end else if (wr_en &&
                      wr_addr >= ADDR_W'(ROUTE_BASE) &&
                      wr_addr <  ADDR_W'(ROUTE_END)) begin

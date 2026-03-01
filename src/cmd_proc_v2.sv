@@ -9,7 +9,7 @@
 //  - `emit_port_src()` task eliminates the 5× duplicate case block in S_ST_ROUTE
 //  - `emit_param()` task eliminates character-by-character tx_buf packing that
 //    was copy-pasted across all status states
-//  - S_ST_ROUTE out-of-bounds fix: shadow_route is [0:5]; DAC uses index 0
+//  - S_ST_ROUTE out-of-bounds fix: shadow_route is [0:6]; DAC uses index 0
 //  - S_PARSE_LOOP: nibble extraction unified into one branch that covers 0-9/A-F/a-f
 //  - S_WRITE_TIME comment corrected (2-byte LE write, not 4-byte)
 //  - `default` branch added to the state case to prevent latch inference
@@ -20,8 +20,8 @@
 //  - Slot 4 (tube_distortion) added: gain / tone_bass / tone_mid / tone_treble / level
 //  - sw_effect input removed; bypass state is entirely software-controlled
 //  - "set <efx> on/off" commands write bypass[slot]=0/1 directly (no rerouting)
-//  - Routing is permanently fixed: ADC→TUB→TRM→PHA→CHO→DLY→DAC
-//  - Status display always shows all slots unconditionally
+//  - Routing modifiable at runtime via "con <src> <dst>" command
+//  - Status display shows full routing table from shadow_route
 // =============================================================================
 
 module cmd_proc_v2 (
@@ -49,16 +49,16 @@ module cmd_proc_v2 (
   //    0x10..0x17 : Slot 2 (chorus)         [0]=rate  [1]=depth  [2]=efx  [3]=eqhi  [4]=eqlo
   //    0x18..0x1F : Slot 3 (dd3)            [0]=tone  [1]=level  [2]=feedback  [3..4]=time(LE)
   //    0x20..0x27 : Slot 4 (tube_distortion)[0]=gain  [1]=tone_bass [2]=tone_mid [3]=tone_treble [4]=level
+  //    0x28..0x2F : Slot 5 (flanger)       [0]=manual [1]=width [2]=speed [3]=regen
   //
-  //  Infrastructure (symmetric 6-port: 0=ADC, 1=TRM, 2=PHA, 3=CHO, 4=DLY, 5=TUB):
-  //    0x40..0x45 : route[0..5]
-  //    0x48..0x4C : bypass[0..4]
+  //  Infrastructure (symmetric 7-port: 0=ADC, 1=TRM, 2=PHA, 3=CHO, 4=DLY, 5=TUB, 6=FLN):
+  //    0x40..0x46 : route[0..6]
   //
   // CLI format: set <efx> <prm> <hex>     (all qualifiers 3 chars)
   //
-  //   set trm rat <hex>       → 0x00     con <src> to <snk>
-  //   set trm dep <hex>       → 0x01       src/snk ∈ {adc,trm,pha,cho,dly,tub,dac}
-  //   set trm shp <hex>       → 0x02
+  //   set trm rat <hex>       → 0x00     con <src> <dst>
+  //   set trm dep <hex>       → 0x01       src/dst ∈ {adc,trm,pha,cho,dly,tub,fln,dac}
+  //   set trm shp <hex>       → 0x02       e.g. "con adc trm" sets route[1]=0
   //   set pha spd <hex>       → 0x08
   //   set pha fbn <hex>       → 0x09     set byp trm <hex>   → 0x48
   //   set cho rat <hex>       → 0x10     set byp pha <hex>   → 0x49
@@ -75,6 +75,10 @@ module cmd_proc_v2 (
   //   set tub mid <hex>       → 0x22
   //   set tub tre <hex>       → 0x23
   //   set tub lvl <hex>       → 0x24
+  //   set fln man <hex>       → 0x28     flanger manual (base delay)
+  //   set fln wid <hex>       → 0x29     flanger width  (LFO depth)
+  //   set fln spd <hex>       → 0x2A     flanger speed  (LFO rate)
+  //   set fln reg <hex>       → 0x2B     flanger regen  (feedback, 0x80=center)
   //
   //  Successful writes return directly to prompt (no OK response).
   //  Status is triggered by a single ';' character (no Enter needed).
@@ -113,6 +117,10 @@ module cmd_proc_v2 (
   localparam logic [7:0] ADDR_TUB_MID = 8'h22;   // tube tone_mid
   localparam logic [7:0] ADDR_TUB_TRE = 8'h23;   // tube tone_treble
   localparam logic [7:0] ADDR_TUB_LVL = 8'h24;   // tube output level
+  localparam logic [7:0] ADDR_FLN_MAN = 8'h28;   // flanger manual (base delay)
+  localparam logic [7:0] ADDR_FLN_WID = 8'h29;   // flanger width  (LFO depth)
+  localparam logic [7:0] ADDR_FLN_SPD = 8'h2A;   // flanger speed  (LFO rate)
+  localparam logic [7:0] ADDR_FLN_REG = 8'h2B;   // flanger regen  (feedback)
   localparam logic [7:0] ADDR_RTE_BASE = 8'h40;
   // Bypass is at cfg_mem[slot*8+7] - one address per slot
   localparam logic [7:0] ADDR_BYP_TRM = 8'h07;   // tremolo  bypass bit
@@ -120,6 +128,7 @@ module cmd_proc_v2 (
   localparam logic [7:0] ADDR_BYP_CHO = 8'h17;   // chorus   bypass bit
   localparam logic [7:0] ADDR_BYP_DLY = 8'h1F;   // dd3      bypass bit
   localparam logic [7:0] ADDR_BYP_TUB = 8'h27;   // tube     bypass bit
+  localparam logic [7:0] ADDR_BYP_FLN = 8'h2F;   // flanger  bypass bit
   localparam logic [7:0] ADDR_RAW_SENTINEL = 8'hFF;
 
   // CDC gap between multi-byte writes
@@ -153,6 +162,7 @@ module cmd_proc_v2 (
     S_ST_CHO,         // status: chorus slot
     S_ST_DLY,         // status: delay slot
     S_ST_TUB,         // status: tube distortion slot
+    S_ST_FLN,         // status: flanger slot
     S_TX_START,       // start transmitting next byte from tx_buf
     S_TX_WAIT,        // wait for tx_done
     S_LOAD_PROMPT,    // copy MSG_PROMPT into tx_buf then send
@@ -204,16 +214,16 @@ module cmd_proc_v2 (
 
   // ---------------------------------------------------------------------------
   // Shadow registers
-  //   shadow[0x00..0x27] : slot registers (5 slots × 8 regs = 40 entries)
+  //   shadow[0x00..0x2F] : slot registers (6 slots × 8 regs = 48 entries)
   //                        shadow[slot*8+7][0] = bypass bit for that slot
-  //   shadow_route[0..5] : route[0..5]
+  //   shadow_route[0..6] : route[0..6]
   // ---------------------------------------------------------------------------
-  logic [7:0] shadow       [0:39];
-  logic [7:0] shadow_route [0:5];
+  logic [7:0] shadow       [0:47];
+  logic [7:0] shadow_route [0:6];
 
   // Boot-time write sequencer
-  // Total writes: 40 slot regs (includes bypass at [7]) + 6 route = 46
-  // Total half-steps: 92 (0..91), done when init_idx == 92
+  // Total writes: 48 slot regs (includes bypass at [7]) + 7 route = 55
+  // Total half-steps: 110 (0..109), done when init_idx == 110
   logic [6:0] init_idx;
 
   // ---------------------------------------------------------------------------
@@ -302,6 +312,7 @@ module cmd_proc_v2 (
       3'd3: begin tx_buf[p] <= "C"; p++; tx_buf[p] <= "H"; p++; tx_buf[p] <= "O"; p++; end
       3'd4: begin tx_buf[p] <= "D"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "Y"; p++; end
       3'd5: begin tx_buf[p] <= "T"; p++; tx_buf[p] <= "U"; p++; tx_buf[p] <= "B"; p++; end
+      3'd6: begin tx_buf[p] <= "F"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "N"; p++; end
       default: begin tx_buf[p] <= "?"; p++; tx_buf[p] <= "?"; p++; tx_buf[p] <= "?"; p++; end
     endcase
   endtask
@@ -310,11 +321,11 @@ module cmd_proc_v2 (
   // Shadow update helper
   // ===========================================================================
   task automatic update_shadow(input logic [7:0] addr, input logic [7:0] data);
-    if (addr < 8'h28)                                             // 5 slots × 8 = 0x28
+    if (addr < 8'h30)                                             // 6 slots × 8 = 0x30
       shadow[addr[5:0]] <= data;
-    else if (addr >= ADDR_RTE_BASE && addr < ADDR_RTE_BASE + 8'd6)
+    else if (addr >= ADDR_RTE_BASE && addr < ADDR_RTE_BASE + 8'd7)
       shadow_route[addr[2:0]] <= data;
-    // bypass addrs (0x07,0x0F,0x17,0x1F,0x27) fall within the slot range above
+    // bypass addrs (0x07,0x0F,0x17,0x1F,0x27,0x2F) fall within the slot range above
   endtask
 
   task automatic send_msg(
@@ -352,7 +363,7 @@ module cmd_proc_v2 (
       rx_pending   <= '0;
       wr_en_reg    <= '0;
 
-      for (int i = 0; i < 40; i++) shadow[i] <= '0;
+      for (int i = 0; i < 48; i++) shadow[i] <= '0;
 
       // Slot 0 (tremolo)
       shadow[0]  <= 8'h3C;
@@ -375,26 +386,36 @@ module cmd_proc_v2 (
       shadow[34] <= 8'h80;   // tone_mid
       shadow[35] <= 8'h80;   // tone_treble
       shadow[36] <= 8'hA0;   // level
-      // shadow[7/15/23/31/39] = bypass bits; default 0x01 (all bypassed)
+
+      // Slot 5 (flanger): manual=80 width=C0 speed=30 regen=A0
+      shadow[40] <= 8'h80;   // manual
+      shadow[41] <= 8'hC0;   // width
+      shadow[42] <= 8'h30;   // speed
+      shadow[43] <= 8'hA0;   // regen
+
+      // shadow[7/15/23/31/39/47] = bypass bits; default 0x01 (all bypassed)
       shadow[7]  <= 8'h01;
       shadow[15] <= 8'h01;
       shadow[23] <= 8'h01;
       shadow[31] <= 8'h01;
       shadow[39] <= 8'h01;
+      shadow[47] <= 8'h01;
 
-      // Default route: ADC→TUB→TRM→PHA→CHO→DLY→DAC
+      // Default route: ADC→FLN→TUB→TRM→PHA→CHO→DLY→DAC
       //   route[0] = DAC source  ← DLY (4)
       //   route[1] = TRM source  ← TUB (5)
       //   route[2] = PHA source  ← TRM (1)
       //   route[3] = CHO source  ← PHA (2)
       //   route[4] = DLY source  ← CHO (3)
-      //   route[5] = TUB source  ← ADC (0)
+      //   route[5] = TUB source  ← FLN (6)
+      //   route[6] = FLN source  ← ADC (0)
       shadow_route[0] <= 8'd4;
       shadow_route[1] <= 8'd5;
       shadow_route[2] <= 8'd1;
       shadow_route[3] <= 8'd2;
       shadow_route[4] <= 8'd3;
-      shadow_route[5] <= 8'd0;
+      shadow_route[5] <= 8'd6;
+      shadow_route[6] <= 8'd0;
 
       init_idx   <= 7'd0;
 
@@ -426,25 +447,25 @@ module cmd_proc_v2 (
         // ------------------------------------------------------------
         // S_INIT_WRITES
         //
-        // Writes: 40 slot regs (bypass at [7] included) + 6 route = 46
-        // Half-steps: 92 (0..91); done when init_idx == 92
-        //   write_num = init_idx[6:1]  (0..45)
-        //   0..39  → shadow[write_num]           addr = write_num
-        //   40..45 → shadow_route[write_num-40]  addr = ADDR_RTE_BASE + (write_num-40)
+        // Writes: 48 slot regs (bypass at [7] included) + 7 route = 55
+        // Half-steps: 110 (0..109); done when init_idx == 110
+        //   write_num = init_idx[6:1]  (0..54)
+        //   0..47  → shadow[write_num]           addr = write_num
+        //   48..54 → shadow_route[write_num-48]  addr = ADDR_RTE_BASE + (write_num-48)
         // ------------------------------------------------------------
         S_INIT_WRITES: begin
-          if (init_idx >= 7'd92) begin
+          if (init_idx >= 7'd110) begin
             wr_en_reg <= 1'b0;
             state     <= S_LOAD_PROMPT;
           end else begin
             if (init_idx[0] == 1'b0) begin
               wr_en_reg <= 1'b0;
-              if (init_idx[6:1] <= 7'd39) begin
+              if (init_idx[6:1] <= 7'd47) begin
                 wr_addr_reg <= 8'(init_idx[6:1]);
                 wr_data_reg <= shadow[init_idx[6:1]];
               end else begin
-                wr_addr_reg <= ADDR_RTE_BASE + 8'(init_idx[6:1] - 7'd40);
-                wr_data_reg <= shadow_route[3'(init_idx[6:1] - 7'd40)];
+                wr_addr_reg <= ADDR_RTE_BASE + 8'(init_idx[6:1] - 7'd48);
+                wr_data_reg <= shadow_route[3'(init_idx[6:1] - 7'd48)];
               end
             end else begin
               wr_en_reg <= 1'b1;
@@ -538,10 +559,12 @@ module cmd_proc_v2 (
             state       <= S_PARSE_INIT;
 
           end else if (m3(0, "c","o","n") && cmd_buf[3] == CHAR_SPC) begin
+            // con <src> <dst>   - connect source master to destination slave
+            //   e.g. "con adc trm" sets route[1]=0  (TRM input ← ADC output)
             begin
-              logic [7:0] snk_addr;
+              logic [7:0] dst_addr;
               logic [7:0] src_val;
-              logic       snk_ok, src_ok;
+              logic       dst_ok, src_ok;
 
               src_ok = 1;
               if      (m3(4,"a","d","c")) src_val = 8'd0;
@@ -550,27 +573,28 @@ module cmd_proc_v2 (
               else if (m3(4,"c","h","o")) src_val = 8'd3;
               else if (m3(4,"d","l","y")) src_val = 8'd4;
               else if (m3(4,"t","u","b")) src_val = 8'd5;
-              else if (m3(4,"d","a","c")) src_val = 8'd6;
+              else if (m3(4,"f","l","n")) src_val = 8'd6;
               else begin src_val = '0; src_ok = 0; end
 
-              if (cmd_buf[7] != CHAR_SPC || cmd_buf[8] != "t" || cmd_buf[9] != "o" || cmd_buf[10] != CHAR_SPC)
-                snk_ok = 0;
+              if (cmd_buf[7] != CHAR_SPC)
+                dst_ok = 0;
               else begin
-                snk_ok = 1;
-                if      (m3(11,"d","a","c")) snk_addr = ADDR_RTE_BASE + 8'd0;
-                else if (m3(11,"t","r","m")) snk_addr = ADDR_RTE_BASE + 8'd1;
-                else if (m3(11,"p","h","a")) snk_addr = ADDR_RTE_BASE + 8'd2;
-                else if (m3(11,"c","h","o")) snk_addr = ADDR_RTE_BASE + 8'd3;
-                else if (m3(11,"d","l","y")) snk_addr = ADDR_RTE_BASE + 8'd4;
-                else if (m3(11,"t","u","b")) snk_addr = ADDR_RTE_BASE + 8'd5;
-                else begin snk_addr = '0; snk_ok = 0; end
+                dst_ok = 1;
+                if      (m3(8,"d","a","c")) dst_addr = ADDR_RTE_BASE + 8'd0;
+                else if (m3(8,"t","r","m")) dst_addr = ADDR_RTE_BASE + 8'd1;
+                else if (m3(8,"p","h","a")) dst_addr = ADDR_RTE_BASE + 8'd2;
+                else if (m3(8,"c","h","o")) dst_addr = ADDR_RTE_BASE + 8'd3;
+                else if (m3(8,"d","l","y")) dst_addr = ADDR_RTE_BASE + 8'd4;
+                else if (m3(8,"t","u","b")) dst_addr = ADDR_RTE_BASE + 8'd5;
+                else if (m3(8,"f","l","n")) dst_addr = ADDR_RTE_BASE + 8'd6;
+                else begin dst_addr = '0; dst_ok = 0; end
               end
 
-              if (src_ok && snk_ok) begin
-                wr_addr_reg <= snk_addr;
+              if (src_ok && dst_ok) begin
+                wr_addr_reg <= dst_addr;
                 wr_data_reg <= src_val;
                 wr_en_reg   <= 1'b1;
-                update_shadow(snk_addr, src_val);
+                update_shadow(dst_addr, src_val);
                 send_prompt();
               end else begin
                 send_err();
@@ -659,6 +683,22 @@ module cmd_proc_v2 (
               end
               else                             send_err();
 
+            end else if (m3(4, "f","l","n") && cmd_buf[7] == CHAR_SPC) begin
+              // -- flanger --
+              if      (m3(8,"m","a","n")) begin target_addr <= ADDR_FLN_MAN; parse_ptr <= 12; state <= S_PARSE_INIT; end
+              else if (m3(8,"w","i","d")) begin target_addr <= ADDR_FLN_WID; parse_ptr <= 12; state <= S_PARSE_INIT; end
+              else if (m3(8,"s","p","d")) begin target_addr <= ADDR_FLN_SPD; parse_ptr <= 12; state <= S_PARSE_INIT; end
+              else if (m3(8,"r","e","g")) begin target_addr <= ADDR_FLN_REG; parse_ptr <= 12; state <= S_PARSE_INIT; end
+              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
+                wr_addr_reg <= ADDR_BYP_FLN; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
+                update_shadow(ADDR_BYP_FLN, 8'h00); send_prompt();
+              end
+              else if (m3(8,"o","f","f")) begin
+                wr_addr_reg <= ADDR_BYP_FLN; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
+                update_shadow(ADDR_BYP_FLN, 8'h01); send_prompt();
+              end
+              else                             send_err();
+
             end else begin
               send_err();
             end
@@ -669,30 +709,37 @@ module cmd_proc_v2 (
         end
 
         // ============================================================
-        // Status display  (chain: ROUTE → TRM → PHA → CHO → DLY → TUB → PROMPT)
+        // Status display  (chain: ROUTE → TRM → PHA → CHO → DLY → TUB → FLN → PROMPT)
         // ============================================================
 
-        // -- Routes & bypass --
-        // Format: ADC>tub>trm>pha>cho>dly>DAC  (only active effects shown)
-        // DAC is always shown. ADC is always the left anchor.
+        // -- Routes --
+        // Shows actual routing table: each port's source
+        // Format: DAC<TRM TRM<ADC PHA<TRM CHO<PHA DLY<CHO TUB<FLN FLN<ADC
         S_ST_ROUTE: begin
           automatic int p = 0;
+          automatic int j;
 
-          // ADC always starts the chain
-          tx_buf[p]<="A";p++;tx_buf[p]<="D";p++;tx_buf[p]<="C";p++;
-
-          // Each active effect appended with ">" separator; bypassed slots skipped
-          if (!shadow[39][0]) begin tx_buf[p]<=">";p++;tx_buf[p]<="t";p++;tx_buf[p]<="u";p++;tx_buf[p]<="b";p++; end
-          if (!shadow[7][0])  begin tx_buf[p]<=">";p++;tx_buf[p]<="t";p++;tx_buf[p]<="r";p++;tx_buf[p]<="m";p++; end
-          if (!shadow[15][0]) begin tx_buf[p]<=">";p++;tx_buf[p]<="p";p++;tx_buf[p]<="h";p++;tx_buf[p]<="a";p++; end
-          if (!shadow[23][0]) begin tx_buf[p]<=">";p++;tx_buf[p]<="c";p++;tx_buf[p]<="h";p++;tx_buf[p]<="o";p++; end
-          if (!shadow[31][0]) begin tx_buf[p]<=">";p++;tx_buf[p]<="d";p++;tx_buf[p]<="l";p++;tx_buf[p]<="y";p++; end
-
-          // DAC always terminates
-          tx_buf[p]<=">";p++;tx_buf[p]<="D";p++;tx_buf[p]<="A";p++;tx_buf[p]<="C";p++;
+          // Port names: 0=DAC/ADC, 1=TRM, 2=PHA, 3=CHO, 4=DLY, 5=TUB, 6=FLN
+          for (j = 0; j < 7; j++) begin
+            // Destination (sink) name
+            case (j)
+              0: begin tx_buf[p]<="D";p++;tx_buf[p]<="A";p++;tx_buf[p]<="C";p++; end
+              1: begin tx_buf[p]<="T";p++;tx_buf[p]<="R";p++;tx_buf[p]<="M";p++; end
+              2: begin tx_buf[p]<="P";p++;tx_buf[p]<="H";p++;tx_buf[p]<="A";p++; end
+              3: begin tx_buf[p]<="C";p++;tx_buf[p]<="H";p++;tx_buf[p]<="O";p++; end
+              4: begin tx_buf[p]<="D";p++;tx_buf[p]<="L";p++;tx_buf[p]<="Y";p++; end
+              5: begin tx_buf[p]<="T";p++;tx_buf[p]<="U";p++;tx_buf[p]<="B";p++; end
+              6: begin tx_buf[p]<="F";p++;tx_buf[p]<="L";p++;tx_buf[p]<="N";p++; end
+              default: ;
+            endcase
+            tx_buf[p] <= "<"; p++;
+            // Source (master) name from shadow_route
+            emit_port_src(shadow_route[j][2:0], p);
+            if (j < 6) begin
+              tx_buf[p] <= " "; p++;
+            end
+          end
           st_nl(p);
-
-
 
           tx_len       <= 6'(p);
           tx_idx       <= '0;
@@ -795,6 +842,26 @@ module cmd_proc_v2 (
             emit_param("m","i","d", shadow[8'h22], p);
             emit_param("t","r","e", shadow[8'h23], p);
             emit_param("l","v","l", shadow[8'h24], p);
+            st_nl(p);
+            tx_len       <= 6'(p);
+            tx_idx       <= '0;
+            return_state <= S_ST_FLN;
+            state        <= S_TX_START;
+          end else begin
+            state <= S_ST_FLN;
+          end
+        end
+
+        // -- Flanger (slot 5) --
+        S_ST_FLN: begin
+          if (!shadow[47][0]) begin
+            automatic int p = 0;
+            tx_buf[p] <= "F"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "N"; p++;
+            tx_buf[p] <= " "; p++;
+            emit_param("m","a","n", shadow[8'h28], p);
+            emit_param("w","i","d", shadow[8'h29], p);
+            emit_param("s","p","d", shadow[8'h2A], p);
+            emit_param("r","e","g", shadow[8'h2B], p);
             st_nl(p);
             tx_len       <= 6'(p);
             tx_idx       <= '0;
