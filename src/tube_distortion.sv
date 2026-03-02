@@ -3,7 +3,7 @@
 // 12AX7 Tube Distortion  -  Top-level
 //
 // Pipeline (9 clock-cycle latency):
-//   Stage 0  pre-gain multiply (NOT shift - avoids huge overdrives)
+//   Stage 0  pre-gain multiply (1× to 256×)
 //   Stage 1  saturation clamp
 //   Stage 2  address + fraction split
 //   Stage 3  dual LUT read (y0, y1)  [BRAM registered output]
@@ -13,14 +13,12 @@
 //   Stage 7  3-band Baxandall tone biquads (Bass / Mid / Treble)
 //   Stage 8  tone mix + output level scale
 //
-// FIX LOG:
-//   - Pre-gain changed from arithmetic shift to multiply. The original
-//     gain_shift of 1..64 bits on a 24-bit signal meant gain[7:2]>=7
-//     shifted all signal bits out, leaving only the saturated rail
-//     (±full-scale square wave = noise).  Now uses a 1×..64× multiply
-//     which gives a smooth, usable gain range.
-//   - Output level scaling unchanged (was correct in logic, just masked
-//     by the destroyed signal from stage 0).
+// Dependencies (compile order):
+//   saturate.sv
+//   tube_lut_rom.sv
+//   linear_interp.sv
+//   biquad_tdf2.sv
+//   tube_distortion.sv   ← this file
 // =============================================================================
 
 `timescale 1ns / 1ps
@@ -41,7 +39,7 @@ module tube_distortion #(
     output logic                     valid_out,
 
     // Controls - unsigned, 0=min 255=max
-    input logic [7:0] gain,         // pre-gain: 0≈1×  255≈64×
+    input logic [7:0] gain,         // pre-gain: 0=1×  255≈64×
     input logic [7:0] tone_bass,    // bass shelf:   128=flat
     input logic [7:0] tone_mid,     // mid peak:     128=flat
     input logic [7:0] tone_treble,  // treble shelf: 128=flat
@@ -57,24 +55,17 @@ module tube_distortion #(
     else vld <= {vld[PIPE-2:0], sample_en};
 
   // =========================================================================
-  // STAGE 0 : Pre-gain via MULTIPLY  (not shift!)
-  //
-  //   gain_mult = gain[7:2] + 1  →  range 1 .. 64
-  //   gained    = audio_in * gain_mult
-  //
-  // A multiply by 1..64 is the correct analogue of a preamp gain of
-  // 0 dB .. ~36 dB, plenty for tube distortion.  The original shift-based
-  // approach produced unusable results because <<< 7 on a 24-bit value
-  // already puts the signal at ±2^30, saturating instantly → square wave.
+  // STAGE 0 : Pre-gain multiply
+  // gain 0→1×, 255→256×  (linear, much gentler than the old shift method)
   // =========================================================================
-  localparam int GAIN_W = DATA_W + 7;  // 31-bit headroom for product
+  localparam int GAIN_W = DATA_W + 9;  // headroom for 24 × 9-bit multiply
 
   logic signed [GAIN_W-1:0] gained;
-  wire  [6:0] gain_mult = {1'b0, gain[7:2]} + 7'd1;  // 1 .. 64
+  wire signed [8:0] gain_mul = {1'b0, gain} + 9'sd1;   // 1..256 unsigned
 
   always_ff @(posedge clk or negedge rst_n)
     if (!rst_n) gained <= '0;
-    else if (sample_en) gained <= audio_in * $signed({1'b0, gain_mult});
+    else if (sample_en) gained <= audio_in * gain_mul;
 
   // =========================================================================
   // STAGE 1 : Saturation clamp to DATA_W bits
@@ -97,13 +88,12 @@ module tube_distortion #(
 
   // =========================================================================
   // STAGE 2 : Split LUT address and interpolation fraction
-  //   gained_sat[23:12]  →  offset-binary LUT index  (0..4095)
-  //   gained_sat[11:0]   →  interpolation fraction    (0..4095)
+  //   audio_in[23:12]  →  offset-binary LUT index  (0..4095)
+  //   audio_in[11:0]   →  interpolation fraction    (0..4095)
   // =========================================================================
   logic [LUT_ADDR-1:0] addr_a, addr_b;
   logic [  FRAC_W-1:0] lut_frac;
 
-  // Flip MSB to convert signed → offset-binary for the LUT
   wire  [LUT_ADDR-1:0] idx_comb = gained_sat[DATA_W-1:FRAC_W] ^ {1'b1, {(LUT_ADDR - 1) {1'b0}}};
 
   always_ff @(posedge clk or negedge rst_n) begin
@@ -113,8 +103,7 @@ module tube_distortion #(
       lut_frac <= '0;
     end else begin
       addr_a   <= idx_comb;
-      // Clamp addr_b at max to avoid LUT wrap-around at full-scale
-      addr_b   <= (idx_comb == {LUT_ADDR{1'b1}}) ? idx_comb : idx_comb + 1'b1;
+      addr_b   <= idx_comb + 1'b1;
       lut_frac <= gained_sat[FRAC_W-1:0];
     end
   end
@@ -196,7 +185,6 @@ module tube_distortion #(
   localparam signed [23:0] TREB_A1N = 24'sh64B4A1;
   localparam signed [23:0] TREB_A2N = -24'sh1BB8AA;
 
-  // Tone band gains: 128=0 dB, 0=-12 dB, 255=+12 dB  (Q1.7 signed offset)
   wire signed [8:0] bg = {1'b0, tone_bass}   - 9'sh80;
   wire signed [8:0] mg = {1'b0, tone_mid}    - 9'sh80;
   wire signed [8:0] tg = {1'b0, tone_treble} - 9'sh80;
@@ -259,17 +247,30 @@ module tube_distortion #(
   // =========================================================================
   // STAGE 8 : Tone mix  +  output level scale  +  saturation
   //
-  // mix = dry + bg*bass + mg*mid + tg*treble   (Q1.7 gains → shift 7)
-  // out = mix * level / 256                    (Q0.8 scale  → shift 8)
+  // Each band: (biquad_out * tone_offset) >>> 7
+  // Computed in full precision then explicitly truncated to MIX_W before sum.
   // =========================================================================
-  localparam int MIX_W = DATA_W + 9;  // 33 bits - overflow guard
-  localparam int LVL_W = DATA_W + 8;  // 32 bits
+  localparam int PROD_W = DATA_W + 9 + 9;  // 42 bits: 33-bit sign-ext × 9-bit gain
+  localparam int MIX_W  = DATA_W + 4;      // 28 bits is plenty: 24-bit dry + 3 × ~24-bit terms
+  localparam int LVL_W  = DATA_W + 8;      // 32 bits
+
+  // Full-precision products, shifted
+  wire signed [PROD_W-1:0] bass_prod = ($signed({{9{bass_y[DATA_W-1]}}, bass_y}) * bg) >>> 7;
+  wire signed [PROD_W-1:0] mid_prod  = ($signed({{9{mid_y[DATA_W-1]}},  mid_y})  * mg) >>> 7;
+  wire signed [PROD_W-1:0] treb_prod = ($signed({{9{treb_y[DATA_W-1]}}, treb_y}) * tg) >>> 7;
+
+  // Saturate each band term to MIX_W before summing
+  wire signed [MIX_W-1:0] bass_term, mid_term, treb_term;
+
+  saturate #(.IN_W(PROD_W), .OUT_W(MIX_W)) u_sat_bass (.din(bass_prod), .dout(bass_term));
+  saturate #(.IN_W(PROD_W), .OUT_W(MIX_W)) u_sat_mid  (.din(mid_prod),  .dout(mid_term));
+  saturate #(.IN_W(PROD_W), .OUT_W(MIX_W)) u_sat_treb (.din(treb_prod), .dout(treb_term));
 
   wire signed [MIX_W-1:0] mix_raw =
-          {{9{interp_out[DATA_W-1]}}, interp_out}
-        + (({{9{bass_y[DATA_W-1]}}, bass_y} * bg) >>> 7)
-        + (({{9{mid_y[DATA_W-1]}},  mid_y}  * mg) >>> 7)
-        + (({{9{treb_y[DATA_W-1]}}, treb_y} * tg) >>> 7);
+          {{(MIX_W-DATA_W){interp_out[DATA_W-1]}}, interp_out}
+        + bass_term
+        + mid_term
+        + treb_term;
 
   wire signed [DATA_W-1:0] mix_sat_comb;
 

@@ -17,6 +17,7 @@
 //   3 = dd3            (mono in, wet+dry mix,1-cycle latency)
 //   4 = tube_distortion(mono in, mono out,   valid_out-driven, 9-cycle latency)
 //   5 = flanger       (mono in, mono out,   1-cycle latency)
+//   6 = big_muff      (mono in, mono out,   1-cycle latency)
 //
 // Register map (per slot, 8 bytes, indexed from cfg_mem[SLOT_ID*CTRL_DEPTH]):
 //   tremolo:         [0]=rate  [1]=depth  [2]=shape(bit0)           [7]=bypass(bit0)
@@ -25,6 +26,7 @@
 //   dd3:             [0]=tone  [1]=level  [2]=feedback [3..4]=time  [7]=bypass(bit0)
 //   tube_distortion: [0]=gain  [1]=bass   [2]=mid [3]=treble [4]=lvl [7]=bypass(bit0)
 //   flanger:         [0]=manual [1]=width [2]=speed [3]=regen       [7]=bypass(bit0)
+//   big_muff:        [0]=sustain [1]=tone [2]=volume                [7]=bypass(bit0)
 //
 // bypass is read directly from cfg_slice[7][0].  The separate bypass input port
 // has been removed; ctrl_bus writes the bypass bit into cfg_mem[slot*CTRL_DEPTH+7].
@@ -44,7 +46,7 @@
 
 module axis_effect_slot #(
     parameter int SLOT_ID          = 0,
-    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=dd3, 4=tube, 5=flanger
+    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=dd3, 4=tube, 5=flanger, 6=big_muff
     parameter int DATA_W           = 48,
     parameter int CTRL_DEPTH       = 8,
     parameter int CTRL_W           = 8,
@@ -283,6 +285,30 @@ module axis_effect_slot #(
       always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
 
+      // ---- BIG MUFF (type 6): mono in → mono out ----
+    end else if (EFFECT_TYPE == 6) begin : gen_big_muff
+      logic signed [AUDIO_W-1:0] core_out;
+
+      big_muff #(
+          .WIDTH(AUDIO_W)
+      ) core (
+          .clk        (clk),
+          .rst_n      (rst_n),
+          .sample_en  (sample_en_reg),
+          .audio_in   (audio_in_reg),
+          .audio_out  (core_out),
+          .sustain_val(cfg_slice[0]),
+          .tone_val   (cfg_slice[1]),
+          .volume_val (cfg_slice[2])
+      );
+
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
+
+      logic sample_en_d1;
+      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_valid = sample_en_d1;
+
       // ---- DEFAULT: passthrough ----
     end else begin : gen_passthrough
       assign effect_out_l = dry_l_hold;
@@ -318,10 +344,13 @@ module axis_effect_slot #(
     end
   end
 
-  // ---- Bypass mux ----
+  // ---- Bypass mux with crossfade ----
   // bypass=1 → forward input directly (registered, 1-cycle latency)
   // bypass=0 → use effect output
   // Effect still runs in bypass to keep LFO phase / delay tails alive.
+  //
+  // To prevent audible clicks when bypass toggles, a short linear crossfade
+  // ramps between dry and wet paths over FADE_LEN samples (~1.3 ms at 48 kHz).
 
   logic [DATA_W-1:0] byp_data;
   logic              byp_valid;
@@ -339,7 +368,69 @@ module axis_effect_slot #(
     end
   end
 
-  assign m_axis_tdata  = bypass ? byp_data : efx_data;
-  assign m_axis_tvalid = bypass ? byp_valid : efx_valid;
+  // Crossfade counter
+  localparam int FADE_LEN = 64;            // samples to crossfade
+  localparam int FADE_W   = $clog2(FADE_LEN+1); // bits for counter 0..FADE_LEN
+
+  logic [FADE_W-1:0] fade_pos;             // 0 = full bypass, FADE_LEN = full effect
+  logic               bypass_prev;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      fade_pos    <= '0;
+      bypass_prev <= 1'b1;
+    end else begin
+      bypass_prev <= bypass;
+
+      // When bypass changes, the fade ramps toward the new target.
+      // Only step on sample boundaries (effect_valid or byp_valid) to keep
+      // the crossfade in sync with the audio rate.
+      if (effect_valid || byp_valid) begin
+        if (bypass && fade_pos != '0)
+          fade_pos <= fade_pos - 1;
+        else if (!bypass && fade_pos != FADE_W'(FADE_LEN))
+          fade_pos <= fade_pos + 1;
+      end
+
+      // Snap to target if bypass hasn't changed for a full ramp
+      // (handles startup: bypass=1 → fade_pos stays 0)
+    end
+  end
+
+  // Crossfade mix: out = (byp * (FADE_LEN - fade_pos) + efx * fade_pos) / FADE_LEN
+  // Applied per-channel to the packed stereo data.
+
+  logic signed [AUDIO_W-1:0] byp_l, byp_r, efx_l, efx_r;
+  logic signed [AUDIO_W-1:0] mix_l, mix_r;
+
+  always_comb begin
+    byp_l = unpack_left(byp_data);
+    byp_r = unpack_right(byp_data);
+    efx_l = unpack_left(efx_data);
+    efx_r = unpack_right(efx_data);
+
+    // When fully bypassed (fade_pos==0) or fully active (fade_pos==FADE_LEN),
+    // the multiply reduces to identity - no rounding error in steady state.
+    mix_l = AUDIO_W'(
+      (longint'(byp_l) * longint'(FADE_LEN - int'(fade_pos)) +
+       longint'(efx_l) * longint'(fade_pos)) / longint'(FADE_LEN));
+    mix_r = AUDIO_W'(
+      (longint'(byp_r) * longint'(FADE_LEN - int'(fade_pos)) +
+       longint'(efx_r) * longint'(fade_pos)) / longint'(FADE_LEN));
+  end
+
+  // Output uses whichever valid strobe fires (both paths run in parallel)
+  logic              out_valid;
+  logic [DATA_W-1:0] out_data;
+
+  assign out_data  = pack_stereo(mix_l, mix_r);
+  // During crossfade both paths are blended, so either valid is sufficient.
+  // In steady state only one path matters but both are always running.
+  assign out_valid = (fade_pos == '0)              ? byp_valid :
+                     (fade_pos == FADE_W'(FADE_LEN)) ? efx_valid :
+                     (efx_valid | byp_valid);
+
+  assign m_axis_tdata  = out_data;
+  assign m_axis_tvalid = out_valid;
 
 endmodule

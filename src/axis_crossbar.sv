@@ -30,7 +30,7 @@ module axis_crossbar #(
     // ---- Slave-side muxing (unchanged) ----
     always_comb begin
         for (int k = 0; k < N_PORTS; k++) begin
-            if (route[k] < SEL_W'(N_PORTS)) begin
+            if ({1'b0, route[k]} < (SEL_W+1)'(N_PORTS)) begin
                 s_tdata[k]  = m_tdata[route[k]];
                 s_tvalid[k] = m_tvalid[route[k]];
             end else begin

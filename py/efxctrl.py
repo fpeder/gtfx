@@ -71,26 +71,28 @@ class Port(IntEnum):
     DLY = 4
     TUB = 5
     FLN = 6
+    BMF = 7
 
 
 PORT_TAG: dict[int, str] = {p.value: p.name.lower() for p in Port}
 TAG_PORT: dict[str, int] = {v: k for k, v in PORT_TAG.items()}
-TAG_PORT["dac"] = 7  # virtual display-only node
+TAG_PORT["dac"] = 99  # virtual display-only node (not a real port)
 
 # Nodes available as source / sink in the connection editor
 SOURCE_NODES = [p.name.lower() for p in Port]  # adc … fln
 SINK_NODES = ["dac"] + [p.name.lower() for p in Port if p != Port.ADC]
 SINK_ROUTE_IDX = {tag: i for i, tag in enumerate(SINK_NODES)}
 
-# Default route: ADC→TUB→PHA→FLN→CHO→TRM→DLY→DAC
+# Default route: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→DAC
 DEFAULT_ROUTE: list[int] = [
     Port.DLY,  # route[0]  DAC ← DLY
     Port.CHO,  # route[1]  TRM ← CHO
     Port.TUB,  # route[2]  PHA ← TUB
     Port.FLN,  # route[3]  CHO ← FLN
     Port.TRM,  # route[4]  DLY ← TRM
-    Port.ADC,  # route[5]  TUB ← ADC
+    Port.BMF,  # route[5]  TUB ← BMF
     Port.PHA,  # route[6]  FLN ← PHA
+    Port.ADC,  # route[7]  BMF ← ADC
 ]
 
 ROUTE_ADDR_BASE = 0x40  # ctrl_bus base address for route registers
@@ -244,6 +246,14 @@ EFFECT_DEFS: list[EffectSlot] = [
                    Param("reg", "Regen", 0x2B, 0xA0),
                ],
                bypass_addr=0x2F),
+    EffectSlot("bmf",
+               "Big Muff",
+               Port.BMF, [
+                   Param("sus", "Sustain", 0x30, 0x80),
+                   Param("ton", "Tone", 0x31, 0x80),
+                   Param("vol", "Volume", 0x32, 0xA0),
+               ],
+               bypass_addr=0x37),
 ]
 
 
@@ -380,25 +390,38 @@ class SerialLink:
         return self._send(f"wr {addr:02X}{data:02X}")
 
     def request_status(self) -> str:
+        """Send ';' and read the full status dump until the '>' prompt.
+
+        The FPGA sends the status line-by-line through its TX state
+        machine.  We keep reading until we see the '>' prompt or
+        hit a timeout, to ensure we capture all lines including the
+        route table and every active effect's parameters.
+        """
         with self._lock:
             if not self.connected:
                 self._log("[offline] status request")
                 return ""
             assert self._ser is not None
+
+            # Drain stale RX
+            if self._ser.in_waiting:
+                self._ser.read(self._ser.in_waiting)
+
             self._ser.write(b";")
-            time.sleep(0.3)
             resp = ""
-            try:
-                # Read all available bytes (status can be long)
-                while self._ser.in_waiting:
-                    resp += self._ser.read(self._ser.in_waiting).decode(
-                        "ascii", errors="replace")
-                    time.sleep(0.05)
-            except Exception:
-                pass
+            deadline = time.time() + 2.0  # 2s overall timeout
+            while time.time() < deadline:
+                time.sleep(0.05)
+                n = self._ser.in_waiting
+                if n:
+                    chunk = self._ser.read(n).decode("ascii", errors="replace")
+                    resp += chunk
+                    # Status dump ends with the prompt '> '
+                    if ">" in chunk:
+                        break
             for line in resp.splitlines():
                 stripped = line.strip()
-                if stripped:
+                if stripped and stripped != ">":
                     self._log(stripped)
             return resp
 
@@ -407,14 +430,18 @@ class SerialLink:
 # ║  Status parser — decode the `;` status dump from cmd_proc_v2            ║
 # ║                                                                         ║
 # ║  Status format (example):                                               ║
-# ║    DAC<DLY TRM<TUB PHA<TRM CHO<PHA DLY<CHO TUB<FLN FLN<ADC            ║
-# ║    TRM rat:3C dep:B4 shp:00                                             ║
-# ║    PHA spd:50 fbn:00                                                    ║
-# ║    CHO rat:50 dep:64 efx:80 eqh:C8 eql:80                              ║
-# ║    DLY ton:FF lvl:80 fdb:64 tim:3000                                    ║
+# ║    DAC<DLY TRM<CHO PHA<TUB CHO<FLN DLY<TRM TUB<BMF FLN<PHA BMF<ADC    ║
+# ║    BMF sus:80 ton:80 vol:A0                                             ║
 # ║    TUB gai:40 bas:80 mid:80 tre:80 lvl:A0                              ║
+# ║    PHA spd:50 fbn:00                                                    ║
 # ║    FLN man:80 wid:C0 spd:30 reg:A0                                     ║
-# ║  Effects that are bypassed are omitted from the dump.                   ║
+# ║    CHO rat:50 dep:64 efx:80 eqh:C8 eql:80                              ║
+# ║    TRM rat:3C dep:B4 shp:00                                             ║
+# ║    DLY ton:FF lvl:80 fdb:64 tim:3000                                    ║
+# ║                                                                         ║
+# ║  The route line is always present.  Effect lines are only printed       ║
+# ║  for effects that are NOT bypassed — omitted effects are bypassed.      ║
+# ║  Params of bypassed effects keep their last known (or default) values.  ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
 
 # Maps 3-char route name → port index (for parsing the route line)
@@ -426,6 +453,7 @@ _ROUTE_NAME_PORT: dict[str, int] = {
     "DLY": Port.DLY,
     "TUB": Port.TUB,
     "FLN": Port.FLN,
+    "BMF": Port.BMF,
     "DAC": 0,
 }
 
@@ -847,7 +875,7 @@ class AppState:
         self.flash("Raw write mode...")
 
     def update_route(self, route_idx: int, src_port: int) -> None:
-        """Update local route table (called after con or raw write to 0x40-0x46)."""
+        """Update local route table (called after con or raw write to 0x40-0x47)."""
         if 0 <= route_idx < len(self.route):
             self.route[route_idx] = src_port
 
@@ -988,7 +1016,7 @@ def _handle_raw_write(ch: int, st: AppState) -> None:
                 return
             st.link.raw_write(addr, data)
             # Keep local route table in sync
-            if ROUTE_ADDR_BASE <= addr <= ROUTE_ADDR_BASE + 6:
+            if ROUTE_ADDR_BASE <= addr <= ROUTE_ADDR_BASE + 7:
                 st.update_route(addr - ROUTE_ADDR_BASE, data)
                 st.flash(f"wr {addr:02X}{data:02X} (route updated)")
             else:
