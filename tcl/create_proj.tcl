@@ -26,7 +26,18 @@ puts "--- Clock Wizard Generated ---"
 
 # ... (rest of script adding design sources)
 # 3. Add Design Sources (SystemVerilog)
-add_files -fileset sources_1 [glob ./src -recursive -- *sv]
+proc find_sv {dir} {
+    set result {}
+    foreach f [glob -nocomplain -directory $dir *.sv] {
+        lappend result $f
+    }
+    foreach subdir [glob -nocomplain -directory $dir -type d *] {
+        set result [concat $result [find_sv $subdir]]
+    }
+    return $result
+}
+
+add_files -fileset sources_1 [find_sv ./src]
 
 # 4. Add Simulation Sources (Testbenches)
 add_files -fileset sim_1 [glob ./sim/*.sv]
