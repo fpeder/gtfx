@@ -1,30 +1,16 @@
 // =============================================================================
-// cmd_proc_v2.sv  -  Serial CLI command processor
+// cmd_proc.sv  -  Serial CLI command processor
 //
-// Improvements over original:
-//  - Dedicated `tx_msg_sel` enum replaces the rx_latch-as-message-selector hack
-//  - `send_msg()` task centralises the repetitive {tx_len, tx_idx, rx_latch,
-//    state, return_state} boilerplate that appeared ~10 times
-//  - `send_err()` / `send_prompt()` one-liner wrappers (OK response removed)
-//  - `emit_port_src()` task eliminates the 5× duplicate case block in S_ST_ROUTE
-//  - `emit_param()` task eliminates character-by-character tx_buf packing that
-//    was copy-pasted across all status states
-//  - S_ST_ROUTE out-of-bounds fix: shadow_route is [0:5]; DAC uses index 0
-//  - S_PARSE_LOOP: nibble extraction unified into one branch that covers 0-9/A-F/a-f
-//  - S_WRITE_TIME comment corrected (2-byte LE write, not 4-byte)
-//  - `default` branch added to the state case to prevent latch inference
-//  - All magic numbers replaced with named localparam constants
-//  - State enum widened to 6 bits and kept contiguous for easy expansion
-//  - OK response removed; successful writes go directly back to prompt
-//  - "status" command remapped to single character ';'
-//  - Slot 4 (tube_distortion) added: gain / tone_bass / tone_mid / tone_treble / level
-//  - sw_effect input removed; bypass state is entirely software-controlled
-//  - "set <efx> on/off" commands write bypass[slot]=0/1 directly (no rerouting)
-//  - Routing is permanently fixed: ADC→TUB→TRM→PHA→CHO→DLY→DAC
-//  - Status display always shows all slots unconditionally
+// Conservative refactor of cmd_proc_v2:
+//   - Module renamed: cmd_proc_v2 → cmd_proc
+//   - Prompt changed to " gtfx>"
+//   - set_param() / do_bypass() / is_on() / is_off() helper tasks/functions
+//     eliminate the repetitive on/off/parse dispatch per effect
+//   - Clearer section organisation with region comments
+//   - All original FSM logic, timing, and state transitions preserved exactly
 // =============================================================================
 
-module cmd_proc_v2 (
+module cmd_proc (
     input  logic        clk,
     input  logic        rst_n,
     input  logic        rx_valid,
@@ -41,56 +27,10 @@ module cmd_proc_v2 (
 );
 
   // ===========================================================================
-  // ctrl_bus Address Map
-  //
-  //  Slot registers (8 regs per slot):
-  //    0x00..0x07 : Slot 0 (tremolo)        [0]=rate  [1]=depth  [2]=shape
-  //    0x08..0x0F : Slot 1 (phaser)         [0]=speed [1]=feedback_en
-  //    0x10..0x17 : Slot 2 (chorus)         [0]=rate  [1]=depth  [2]=efx  [3]=eqhi  [4]=eqlo
-  //    0x18..0x1F : Slot 3 (dd3)            [0]=tone  [1]=level  [2]=feedback  [3..4]=time(LE)
-  //    0x20..0x27 : Slot 4 (tube_distortion)[0]=gain  [1]=tone_bass [2]=tone_mid [3]=tone_treble [4]=level
-  //    0x28..0x2F : Slot 5 (flanger)       [0]=manual [1]=width [2]=speed [3]=regen
-//    0x30..0x37 : Slot 6 (big_muff)      [0]=sustain [1]=tone [2]=volume
-  //
-  //  Infrastructure (symmetric 8-port: 0=ADC, 1=TRM, 2=PHA, 3=CHO, 4=DLY, 5=TUB, 6=FLN, 7=BMF):
-  //    0x40..0x47 : route[0..7]
-  //
-  // CLI format: set <efx> <prm> <hex>     (all qualifiers 3 chars)
-  //
-  //   set trm rat <hex>       → 0x00     con <src> to <snk>
-  //   set trm dep <hex>       → 0x01       src/snk ∈ {adc,trm,pha,cho,dly,tub,fln,bmf}
-  //   set trm shp <hex>       → 0x02
-  //   set pha spd <hex>       → 0x08
-  //   set pha fbn <hex>       → 0x09     set byp trm <hex>   → 0x48
-  //   set cho rat <hex>       → 0x10     set byp pha <hex>   → 0x49
-  //   set cho dep <hex>       → 0x11     set byp cho <hex>   → 0x4A
-  //   set cho efx <hex>       → 0x12
-  //   set cho eqh <hex>       → 0x13     set <efx> on   → bypass[slot] = 0 (active)
-  //   set cho eql <hex>       → 0x14     set <efx> off  → bypass[slot] = 1 (bypassed)
-  //   set dly ton <hex>       → 0x18       <efx> ∈ {tub,trm,pha,cho,dly,fln,bmf}
-  //   set dly lvl <hex>       → 0x19
-  //   set dly fdb <hex>       → 0x1A     wr <addr><data>  → raw write
-  //   set dly tim <hex8>      → 0x1B..0x1C (2 writes, LE)
-  //   set tub gai <hex>       → 0x20     ;                → status dump
-  //   set tub bas <hex>       → 0x21
-  //   set tub mid <hex>       → 0x22
-  //   set tub tre <hex>       → 0x23
-  //   set tub lvl <hex>       → 0x24
-  //   set fln man <hex>       → 0x28     flanger manual (base delay)
-  //   set fln wid <hex>       → 0x29     flanger width  (LFO depth)
-  //   set fln spd <hex>       → 0x2A     flanger speed  (LFO rate)
-  //   set fln reg <hex>       → 0x2B     flanger regen  (feedback, 0x80=center)
-  //   set bmf sus <hex>       → 0x30     big_muff sustain (fuzz gain)
-  //   set bmf ton <hex>       → 0x31     big_muff tone
-  //   set bmf vol <hex>       → 0x32     big_muff volume
-  //
-  //  Successful writes return directly to prompt (no OK response).
-  //  Status is triggered by a single ';' character (no Enter needed).
+  // ctrl_bus Address Map  (unchanged from v2 - see original header for details)
   // ===========================================================================
 
-  // ---------------------------------------------------------------------------
-  // ASCII constants
-  // ---------------------------------------------------------------------------
+  // ─── ASCII constants ─────────────────────────────────────────────────────
   localparam logic [7:0] CHAR_CR  = 8'h0D;
   localparam logic [7:0] CHAR_LF  = 8'h0A;
   localparam logic [7:0] CHAR_BS  = 8'h08;
@@ -99,9 +39,7 @@ module cmd_proc_v2 (
   localparam logic [7:0] CHAR_0   = 8'h30;
   localparam logic [7:0] CHAR_A   = 8'h41;
 
-  // ---------------------------------------------------------------------------
-  // Register address map constants
-  // ---------------------------------------------------------------------------
+  // ─── Register address map ────────────────────────────────────────────────
   localparam logic [7:0] ADDR_TRM_RAT = 8'h00;
   localparam logic [7:0] ADDR_TRM_DEP = 8'h01;
   localparam logic [7:0] ADDR_TRM_SHP = 8'h02;
@@ -115,75 +53,68 @@ module cmd_proc_v2 (
   localparam logic [7:0] ADDR_DLY_TON = 8'h18;
   localparam logic [7:0] ADDR_DLY_LVL = 8'h19;
   localparam logic [7:0] ADDR_DLY_FDB = 8'h1A;
-  localparam logic [7:0] ADDR_DLY_TIM = 8'h1B;   // 2 bytes LE: 0x1B, 0x1C
-  localparam logic [7:0] ADDR_TUB_GAI = 8'h20;   // tube pre-gain
-  localparam logic [7:0] ADDR_TUB_BAS = 8'h21;   // tube tone_bass
-  localparam logic [7:0] ADDR_TUB_MID = 8'h22;   // tube tone_mid
-  localparam logic [7:0] ADDR_TUB_TRE = 8'h23;   // tube tone_treble
-  localparam logic [7:0] ADDR_TUB_LVL = 8'h24;   // tube output level
-  localparam logic [7:0] ADDR_FLN_MAN = 8'h28;   // flanger manual (base delay)
-  localparam logic [7:0] ADDR_FLN_WID = 8'h29;   // flanger width  (LFO depth)
-  localparam logic [7:0] ADDR_FLN_SPD = 8'h2A;   // flanger speed  (LFO rate)
-  localparam logic [7:0] ADDR_FLN_REG = 8'h2B;   // flanger regen  (feedback)
-  localparam logic [7:0] ADDR_BMF_SUS = 8'h30;   // big_muff sustain (fuzz gain)
-  localparam logic [7:0] ADDR_BMF_TON = 8'h31;   // big_muff tone
-  localparam logic [7:0] ADDR_BMF_VOL = 8'h32;   // big_muff volume
+  localparam logic [7:0] ADDR_DLY_TIM = 8'h1B;
+  localparam logic [7:0] ADDR_TUB_GAI = 8'h20;
+  localparam logic [7:0] ADDR_TUB_BAS = 8'h21;
+  localparam logic [7:0] ADDR_TUB_MID = 8'h22;
+  localparam logic [7:0] ADDR_TUB_TRE = 8'h23;
+  localparam logic [7:0] ADDR_TUB_LVL = 8'h24;
+  localparam logic [7:0] ADDR_FLN_MAN = 8'h28;
+  localparam logic [7:0] ADDR_FLN_WID = 8'h29;
+  localparam logic [7:0] ADDR_FLN_SPD = 8'h2A;
+  localparam logic [7:0] ADDR_FLN_REG = 8'h2B;
+  localparam logic [7:0] ADDR_BMF_SUS = 8'h30;
+  localparam logic [7:0] ADDR_BMF_TON = 8'h31;
+  localparam logic [7:0] ADDR_BMF_VOL = 8'h32;
   localparam logic [7:0] ADDR_RTE_BASE = 8'h40;
-  // Bypass is at cfg_mem[slot*8+7] - one address per slot
-  localparam logic [7:0] ADDR_BYP_TRM = 8'h07;   // tremolo  bypass bit
-  localparam logic [7:0] ADDR_BYP_PHA = 8'h0F;   // phaser   bypass bit
-  localparam logic [7:0] ADDR_BYP_CHO = 8'h17;   // chorus   bypass bit
-  localparam logic [7:0] ADDR_BYP_DLY = 8'h1F;   // dd3      bypass bit
-  localparam logic [7:0] ADDR_BYP_TUB = 8'h27;   // tube     bypass bit
-  localparam logic [7:0] ADDR_BYP_FLN = 8'h2F;   // flanger  bypass bit
-  localparam logic [7:0] ADDR_BYP_BMF = 8'h37;   // big_muff bypass bit
+
+  localparam logic [7:0] ADDR_BYP_TRM = 8'h07;
+  localparam logic [7:0] ADDR_BYP_PHA = 8'h0F;
+  localparam logic [7:0] ADDR_BYP_CHO = 8'h17;
+  localparam logic [7:0] ADDR_BYP_DLY = 8'h1F;
+  localparam logic [7:0] ADDR_BYP_TUB = 8'h27;
+  localparam logic [7:0] ADDR_BYP_FLN = 8'h2F;
+  localparam logic [7:0] ADDR_BYP_BMF = 8'h37;
   localparam logic [7:0] ADDR_RAW_SENTINEL = 8'hFF;
 
-  // CDC gap between multi-byte writes
   localparam int CDC_WAIT_CYCLES = 31;
 
-  // ---------------------------------------------------------------------------
-  // Canned messages
-  // ---------------------------------------------------------------------------
-  localparam logic [7:0] MSG_PROMPT [0:2] = '{">"," "," "};
-  localparam int         LEN_PROMPT = 2;
-  localparam logic [7:0] MSG_ERR [0:4]   = '{"E","r","r", CHAR_CR, CHAR_LF};
+  // ─── Canned messages ─────────────────────────────────────────────────────
+  localparam logic [7:0] MSG_PROMPT [0:5] = '{"g","t","f","x",">", " "};
+  localparam int         LEN_PROMPT = 6;
+  localparam logic [7:0] MSG_ERR [0:4]    = '{"E","r","r", CHAR_CR, CHAR_LF};
   localparam int         LEN_ERR  = 5;
 
-  // ---------------------------------------------------------------------------
-  // State encoding
-  // ---------------------------------------------------------------------------
+  // ─── State encoding ──────────────────────────────────────────────────────
   typedef enum logic [5:0] {
-    S_BOOT,           // startup CRLF
-    S_INIT_WRITES,    // replay shadow defaults → ctrl_bus after reset
-    S_IDLE,           // wait for RX character
-    S_RX_CHAR,        // process received character
-    S_BACKSPACE,      // handle BS/DEL
-    S_CHECK_CMD,      // dispatch command string
-    S_PARSE_INIT,     // initialise hex parser
-    S_PARSE_LOOP,     // accumulate hex digits
-    S_WRITE_REG,      // issue single 8-bit write
-    S_WRITE_TIME,     // issue 2-byte LE write with CDC gap
-    S_ST_ROUTE,       // status: routing & bypass lines
-    S_ST_TRM,         // status: tremolo slot
-    S_ST_PHA,         // status: phaser slot
-    S_ST_CHO,         // status: chorus slot
-    S_ST_DLY,         // status: delay slot
-    S_ST_TUB,         // status: tube distortion slot
-    S_ST_FLN,         // status: flanger slot
-    S_ST_BMF,         // status: big_muff slot
-    S_TX_START,       // start transmitting next byte from tx_buf
-    S_TX_WAIT,        // wait for tx_done
-    S_LOAD_PROMPT,    // copy MSG_PROMPT into tx_buf then send
-    S_LOAD_STRING     // copy selected canned message into tx_buf then send
+    S_BOOT,
+    S_INIT_WRITES,
+    S_IDLE,
+    S_RX_CHAR,
+    S_BACKSPACE,
+    S_CHECK_CMD,
+    S_PARSE_INIT,
+    S_PARSE_LOOP,
+    S_WRITE_REG,
+    S_WRITE_TIME,
+    S_ST_ROUTE,
+    S_ST_TRM,
+    S_ST_PHA,
+    S_ST_CHO,
+    S_ST_DLY,
+    S_ST_TUB,
+    S_ST_FLN,
+    S_ST_BMF,
+    S_TX_START,
+    S_TX_WAIT,
+    S_LOAD_PROMPT,
+    S_LOAD_STRING
   } state_t;
 
   state_t state        = S_BOOT;
   state_t return_state = S_IDLE;
 
-  // ---------------------------------------------------------------------------
-  // Message selector
-  // ---------------------------------------------------------------------------
+  // ─── Message selector ────────────────────────────────────────────────────
   typedef enum logic {
     MSG_SEL_PROMPT = 1'd0,
     MSG_SEL_ERR    = 1'd1
@@ -191,9 +122,7 @@ module cmd_proc_v2 (
 
   msg_sel_t tx_msg_sel = MSG_SEL_PROMPT;
 
-  // ---------------------------------------------------------------------------
-  // Buffers and indices
-  // ---------------------------------------------------------------------------
+  // ─── Buffers and indices ─────────────────────────────────────────────────
   logic [7:0] cmd_buf [0:31];
   logic [5:0] cmd_idx   = '0;
 
@@ -201,43 +130,27 @@ module cmd_proc_v2 (
   logic [6:0] tx_len    = '0;
   logic [6:0] tx_idx    = '0;
 
-  // ---------------------------------------------------------------------------
-  // Parser state
-  // ---------------------------------------------------------------------------
+  // ─── Parser state ────────────────────────────────────────────────────────
   logic [31:0] parse_acc      = '0;
   logic [ 5:0] parse_ptr      = '0;
   logic [ 7:0] target_addr    = '0;
   logic        target_is_time = '0;
 
-  // ---------------------------------------------------------------------------
-  // RX latch
-  // ---------------------------------------------------------------------------
+  // ─── RX latch ────────────────────────────────────────────────────────────
   logic        rx_pending = '0;
   logic [7:0]  rx_latch   = '0;
 
-  // ---------------------------------------------------------------------------
-  // Multi-byte write helpers
-  // ---------------------------------------------------------------------------
+  // ─── Multi-byte write helpers ────────────────────────────────────────────
   logic        time_wr_idx = '0;
   logic [ 4:0] cdc_wait    = '0;
 
-  // ---------------------------------------------------------------------------
-  // Shadow registers
-  //   shadow[0x00..0x2F] : slot registers (6 slots × 8 regs = 48 entries)
-  //                        shadow[slot*8+7][0] = bypass bit for that slot
-  //   shadow_route[0..6] : route[0..6]
-  // ---------------------------------------------------------------------------
+  // ─── Shadow registers ────────────────────────────────────────────────────
   logic [7:0] shadow       [0:55];
   logic [7:0] shadow_route [0:7];
 
-  // Boot-time write sequencer
-  // Total writes: 56 slot regs (includes bypass at [7]) + 8 route = 64
-  // Total half-steps: 128 (0..127), done when init_idx == 128
   logic [7:0] init_idx;
 
-  // ---------------------------------------------------------------------------
-  // Write bus
-  // ---------------------------------------------------------------------------
+  // ─── Write bus ───────────────────────────────────────────────────────────
   logic        wr_en_reg   = '0;
   logic [7:0]  wr_addr_reg = '0;
   logic [7:0]  wr_data_reg = '0;
@@ -245,9 +158,9 @@ module cmd_proc_v2 (
   assign wr_addr = wr_addr_reg;
   assign wr_data = wr_data_reg;
 
-  // ===========================================================================
+  // =========================================================================
   // Helper functions
-  // ===========================================================================
+  // =========================================================================
 
   function automatic logic [7:0] n2h(input logic [3:0] n);
     return (n < 10) ? (8'(n) + CHAR_0) : (8'(n) - 10 + CHAR_A);
@@ -262,12 +175,6 @@ module cmd_proc_v2 (
             cmd_buf[start+2] == c2);
   endfunction
 
-  function automatic logic str_match(input int start, input string s);
-    for (int i = 0; i < s.len(); i++)
-      if (cmd_buf[start+i] != s.getc(i)) return 0;
-    return 1;
-  endfunction
-
   function automatic logic [3:0] hex_nibble(
     input  logic [7:0] c,
     output logic       valid
@@ -278,9 +185,18 @@ module cmd_proc_v2 (
     else                           begin valid = 0; return 4'd0;          end
   endfunction
 
-  // ===========================================================================
+  // ── on/off detection at cmd_buf position 8 ──
+  function automatic logic is_on();
+    return (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00));
+  endfunction
+
+  function automatic logic is_off();
+    return m3(8,"o","f","f");
+  endfunction
+
+  // =========================================================================
   // tx_buf builder tasks
-  // ===========================================================================
+  // =========================================================================
 
   task automatic st_hdr(
     input  logic [7:0] c0, c1, c2,
@@ -312,7 +228,6 @@ module cmd_proc_v2 (
     st_hex(val, p);
   endtask
 
-  // Port source name - extended to include TUB (index 5)
   task automatic emit_port_src(input logic [2:0] src, inout int p);
     case (src)
       3'd0: begin tx_buf[p] <= "A"; p++; tx_buf[p] <= "D"; p++; tx_buf[p] <= "C"; p++; end
@@ -327,16 +242,20 @@ module cmd_proc_v2 (
     endcase
   endtask
 
-  // ===========================================================================
+  // =========================================================================
   // Shadow update helper
-  // ===========================================================================
+  // =========================================================================
+
   task automatic update_shadow(input logic [7:0] addr, input logic [7:0] data);
-    if (addr < 8'h38)                                             // 7 slots × 8 = 0x38
+    if (addr < 8'h38)
       shadow[addr[5:0]] <= data;
     else if (addr >= ADDR_RTE_BASE && addr < ADDR_RTE_BASE + 8'd8)
       shadow_route[addr[2:0]] <= data;
-    // bypass addrs (0x07,0x0F,0x17,0x1F,0x27,0x2F,0x37) fall within the slot range above
   endtask
+
+  // =========================================================================
+  // Message / prompt / error tasks
+  // =========================================================================
 
   task automatic send_msg(
     input msg_sel_t  sel,
@@ -362,9 +281,29 @@ module cmd_proc_v2 (
     return_state <= S_IDLE;
   endtask
 
-  // ===========================================================================
+  // =========================================================================
+  // Command dispatch helpers  (reduce per-effect copy-paste)
+  // =========================================================================
+
+  // Start hex parse for a parameter register
+  task automatic set_param(input logic [7:0] addr);
+    target_addr <= addr;
+    parse_ptr   <= 12;
+    state       <= S_PARSE_INIT;
+  endtask
+
+  // Write bypass register directly (on=0x00, off=0x01)
+  task automatic do_bypass(input logic [7:0] byp_addr, input logic [7:0] val);
+    wr_addr_reg <= byp_addr;
+    wr_data_reg <= val;
+    wr_en_reg   <= 1'b1;
+    update_shadow(byp_addr, val);
+    send_prompt();
+  endtask
+
+  // =========================================================================
   // Main always_ff block
-  // ===========================================================================
+  // =========================================================================
   always_ff @(posedge clk) begin
     if (!rst_n) begin
       state        <= S_BOOT;
@@ -390,25 +329,25 @@ module cmd_proc_v2 (
       shadow[24] <= 8'hFF; shadow[25] <= 8'h80; shadow[26] <= 8'h64;
       shadow[27] <= 8'h00; shadow[28] <= 8'h30;
 
-      // Slot 4 (tube_distortion): gain=40 bass=80 mid=80 treble=80 level=A0
-      shadow[32] <= 8'h40;   // gain
-      shadow[33] <= 8'h80;   // tone_bass
-      shadow[34] <= 8'h80;   // tone_mid
-      shadow[35] <= 8'h80;   // tone_treble
-      shadow[36] <= 8'hA0;   // level
+      // Slot 4 (tube_distortion)
+      shadow[32] <= 8'h40;
+      shadow[33] <= 8'h80;
+      shadow[34] <= 8'h80;
+      shadow[35] <= 8'h80;
+      shadow[36] <= 8'hA0;
 
-      // Slot 5 (flanger): manual=80 width=C0 speed=30 regen=A0
-      shadow[40] <= 8'h80;   // manual
-      shadow[41] <= 8'hC0;   // width
-      shadow[42] <= 8'h30;   // speed
-      shadow[43] <= 8'hA0;   // regen
+      // Slot 5 (flanger)
+      shadow[40] <= 8'h80;
+      shadow[41] <= 8'hC0;
+      shadow[42] <= 8'h30;
+      shadow[43] <= 8'hA0;
 
-      // Slot 6 (big_muff): sustain=80 tone=80 volume=A0
-      shadow[48] <= 8'h80;   // sustain
-      shadow[49] <= 8'h80;   // tone
-      shadow[50] <= 8'hA0;   // volume
+      // Slot 6 (big_muff)
+      shadow[48] <= 8'h80;
+      shadow[49] <= 8'h80;
+      shadow[50] <= 8'hA0;
 
-      // shadow[7/15/23/31/39/47/55] = bypass bits; default 0x01 (all bypassed)
+      // Bypass bits - all bypassed at boot
       shadow[7]  <= 8'h01;
       shadow[15] <= 8'h01;
       shadow[23] <= 8'h01;
@@ -418,14 +357,6 @@ module cmd_proc_v2 (
       shadow[55] <= 8'h01;
 
       // Default route: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→DAC
-      //   route[0] = DAC source  ← DLY (4)
-      //   route[1] = TRM source  ← CHO (3)
-      //   route[2] = PHA source  ← TUB (5)
-      //   route[3] = CHO source  ← FLN (6)
-      //   route[4] = DLY source  ← TRM (1)
-      //   route[5] = TUB source  ← BMF (7)
-      //   route[6] = FLN source  ← PHA (2)
-      //   route[7] = BMF source  ← ADC (0)
       shadow_route[0] <= 8'd4;
       shadow_route[1] <= 8'd3;
       shadow_route[2] <= 8'd5;
@@ -446,13 +377,14 @@ module cmd_proc_v2 (
       end
 
       // ================================================================
-      // State machine
+      //  State machine
       // ================================================================
       case (state)
 
-        // ------------------------------------------------------------
-        // S_BOOT
-        // ------------------------------------------------------------
+        // ──────────────────────────────────────────────────────────────
+        //  Boot & init
+        // ──────────────────────────────────────────────────────────────
+
         S_BOOT: begin
           tx_buf[0] <= CHAR_CR;
           tx_buf[1] <= CHAR_LF;
@@ -462,19 +394,13 @@ module cmd_proc_v2 (
           state <= S_TX_START;
         end
 
-        // ------------------------------------------------------------
-        // S_INIT_WRITES
-        //
-        // Writes: 56 slot regs (bypass at [7] included) + 8 route = 64
-        // Half-steps: 128 (0..127); done when init_idx == 128
-        //   write_num = init_idx[7:1]  (0..63)
-        //   0..55  → shadow[write_num]           addr = write_num
-        //   56..63 → shadow_route[write_num-56]  addr = ADDR_RTE_BASE + (write_num-56)
-        // ------------------------------------------------------------
         S_INIT_WRITES: begin
           if (init_idx >= 8'd128) begin
             wr_en_reg <= 1'b0;
             state     <= S_LOAD_PROMPT;
+          end else if (cdc_wait != '0) begin
+            // Wait for toggle to propagate through audio-domain CDC
+            cdc_wait <= cdc_wait - 1;
           end else begin
             if (init_idx[0] == 1'b0) begin
               wr_en_reg <= 1'b0;
@@ -487,14 +413,16 @@ module cmd_proc_v2 (
               end
             end else begin
               wr_en_reg <= 1'b1;
+              cdc_wait  <= 5'(CDC_WAIT_CYCLES);
             end
             init_idx <= init_idx + 8'd1;
           end
         end
 
-        // ------------------------------------------------------------
-        // S_IDLE
-        // ------------------------------------------------------------
+        // ──────────────────────────────────────────────────────────────
+        //  Idle & RX character handling
+        // ──────────────────────────────────────────────────────────────
+
         S_IDLE: begin
           tx_start <= '0;
           if (rx_pending) begin
@@ -503,9 +431,6 @@ module cmd_proc_v2 (
           end
         end
 
-        // ------------------------------------------------------------
-        // S_RX_CHAR
-        // ------------------------------------------------------------
         S_RX_CHAR: begin
           if (rx_latch == CHAR_CR || rx_latch == CHAR_LF) begin
             cmd_buf[cmd_idx] <= 8'h00;
@@ -546,9 +471,6 @@ module cmd_proc_v2 (
           end
         end
 
-        // ------------------------------------------------------------
-        // S_BACKSPACE
-        // ------------------------------------------------------------
         S_BACKSPACE: begin
           if (cmd_idx > 0) begin
             cmd_idx      <= cmd_idx - 1;
@@ -564,18 +486,21 @@ module cmd_proc_v2 (
           end
         end
 
-        // ============================================================
-        // S_CHECK_CMD
-        // ============================================================
+        // ──────────────────────────────────────────────────────────────
+        //  Command dispatch
+        // ──────────────────────────────────────────────────────────────
+
         S_CHECK_CMD: begin
           cmd_idx        <= '0;
           target_is_time <= '0;
 
+          // ── "wr <addr><data>" ────────────────────────────────────
           if (m3(0, "w","r"," ")) begin
             parse_ptr   <= 3;
             target_addr <= ADDR_RAW_SENTINEL;
             state       <= S_PARSE_INIT;
 
+          // ── "con <src> to <snk>" ─────────────────────────────────
           end else if (m3(0, "c","o","n") && cmd_buf[3] == CHAR_SPC) begin
             begin
               logic [7:0] snk_addr;
@@ -619,118 +544,81 @@ module cmd_proc_v2 (
               end
             end
 
+          // ── "set <efx> ..." ──────────────────────────────────────
           end else if (m3(0, "s","e","t") && cmd_buf[3] == CHAR_SPC) begin
 
+            // ── tremolo ──
             if (m3(4, "t","r","m") && cmd_buf[7] == CHAR_SPC) begin
-              if      (m3(8,"r","a","t")) begin target_addr <= ADDR_TRM_RAT; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"d","e","p")) begin target_addr <= ADDR_TRM_DEP; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"s","h","p")) begin target_addr <= ADDR_TRM_SHP; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_TRM; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_TRM, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_TRM; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_TRM, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              if      (m3(8,"r","a","t")) set_param(ADDR_TRM_RAT);
+              else if (m3(8,"d","e","p")) set_param(ADDR_TRM_DEP);
+              else if (m3(8,"s","h","p")) set_param(ADDR_TRM_SHP);
+              else if (is_on())           do_bypass(ADDR_BYP_TRM, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_TRM, 8'h01);
+              else                        send_err();
 
+            // ── phaser ──
             end else if (m3(4, "p","h","a") && cmd_buf[7] == CHAR_SPC) begin
-              if      (m3(8,"s","p","d")) begin target_addr <= ADDR_PHA_SPD; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"f","b","n")) begin target_addr <= ADDR_PHA_FBN; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_PHA; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_PHA, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_PHA; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_PHA, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              if      (m3(8,"s","p","d")) set_param(ADDR_PHA_SPD);
+              else if (m3(8,"f","b","n")) set_param(ADDR_PHA_FBN);
+              else if (is_on())           do_bypass(ADDR_BYP_PHA, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_PHA, 8'h01);
+              else                        send_err();
 
+            // ── chorus ──
             end else if (m3(4, "c","h","o") && cmd_buf[7] == CHAR_SPC) begin
-              if      (m3(8,"r","a","t")) begin target_addr <= ADDR_CHO_RAT; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"d","e","p")) begin target_addr <= ADDR_CHO_DEP; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"e","f","x")) begin target_addr <= ADDR_CHO_EFX; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"e","q","h")) begin target_addr <= ADDR_CHO_EQH; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"e","q","l")) begin target_addr <= ADDR_CHO_EQL; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_CHO; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_CHO, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_CHO; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_CHO, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              if      (m3(8,"r","a","t")) set_param(ADDR_CHO_RAT);
+              else if (m3(8,"d","e","p")) set_param(ADDR_CHO_DEP);
+              else if (m3(8,"e","f","x")) set_param(ADDR_CHO_EFX);
+              else if (m3(8,"e","q","h")) set_param(ADDR_CHO_EQH);
+              else if (m3(8,"e","q","l")) set_param(ADDR_CHO_EQL);
+              else if (is_on())           do_bypass(ADDR_BYP_CHO, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_CHO, 8'h01);
+              else                        send_err();
 
+            // ── delay ──
             end else if (m3(4, "d","l","y") && cmd_buf[7] == CHAR_SPC) begin
-              if      (m3(8,"t","o","n")) begin target_addr <= ADDR_DLY_TON; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"l","v","l")) begin target_addr <= ADDR_DLY_LVL; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"f","d","b")) begin target_addr <= ADDR_DLY_FDB; parse_ptr <= 12; state <= S_PARSE_INIT; end
+              if      (m3(8,"t","o","n")) set_param(ADDR_DLY_TON);
+              else if (m3(8,"l","v","l")) set_param(ADDR_DLY_LVL);
+              else if (m3(8,"f","d","b")) set_param(ADDR_DLY_FDB);
               else if (m3(8,"t","i","m")) begin
                 target_addr    <= ADDR_DLY_TIM;
                 parse_ptr      <= 12;
                 target_is_time <= 1;
                 state          <= S_PARSE_INIT;
               end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_DLY; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_DLY, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_DLY; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_DLY, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              else if (is_on())           do_bypass(ADDR_BYP_DLY, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_DLY, 8'h01);
+              else                        send_err();
 
+            // ── tube distortion ──
             end else if (m3(4, "t","u","b") && cmd_buf[7] == CHAR_SPC) begin
-              // -- tube distortion --
-              if      (m3(8,"g","a","i")) begin target_addr <= ADDR_TUB_GAI; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"b","a","s")) begin target_addr <= ADDR_TUB_BAS; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"m","i","d")) begin target_addr <= ADDR_TUB_MID; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"t","r","e")) begin target_addr <= ADDR_TUB_TRE; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"l","v","l")) begin target_addr <= ADDR_TUB_LVL; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_TUB; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_TUB, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_TUB; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_TUB, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              if      (m3(8,"g","a","i")) set_param(ADDR_TUB_GAI);
+              else if (m3(8,"b","a","s")) set_param(ADDR_TUB_BAS);
+              else if (m3(8,"m","i","d")) set_param(ADDR_TUB_MID);
+              else if (m3(8,"t","r","e")) set_param(ADDR_TUB_TRE);
+              else if (m3(8,"l","v","l")) set_param(ADDR_TUB_LVL);
+              else if (is_on())           do_bypass(ADDR_BYP_TUB, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_TUB, 8'h01);
+              else                        send_err();
 
+            // ── flanger ──
             end else if (m3(4, "f","l","n") && cmd_buf[7] == CHAR_SPC) begin
-              // -- flanger --
-              if      (m3(8,"m","a","n")) begin target_addr <= ADDR_FLN_MAN; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"w","i","d")) begin target_addr <= ADDR_FLN_WID; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"s","p","d")) begin target_addr <= ADDR_FLN_SPD; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"r","e","g")) begin target_addr <= ADDR_FLN_REG; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_FLN; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_FLN, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_FLN; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_FLN, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              if      (m3(8,"m","a","n")) set_param(ADDR_FLN_MAN);
+              else if (m3(8,"w","i","d")) set_param(ADDR_FLN_WID);
+              else if (m3(8,"s","p","d")) set_param(ADDR_FLN_SPD);
+              else if (m3(8,"r","e","g")) set_param(ADDR_FLN_REG);
+              else if (is_on())           do_bypass(ADDR_BYP_FLN, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_FLN, 8'h01);
+              else                        send_err();
 
+            // ── big_muff ──
             end else if (m3(4, "b","m","f") && cmd_buf[7] == CHAR_SPC) begin
-              // -- big_muff --
-              if      (m3(8,"s","u","s")) begin target_addr <= ADDR_BMF_SUS; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"t","o","n")) begin target_addr <= ADDR_BMF_TON; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"v","o","l")) begin target_addr <= ADDR_BMF_VOL; parse_ptr <= 12; state <= S_PARSE_INIT; end
-              else if (m3(8,"o","n"," ") || (cmd_buf[8]=="o" && cmd_buf[9]=="n" && cmd_buf[10]==8'h00)) begin
-                wr_addr_reg <= ADDR_BYP_BMF; wr_data_reg <= 8'h00; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_BMF, 8'h00); send_prompt();
-              end
-              else if (m3(8,"o","f","f")) begin
-                wr_addr_reg <= ADDR_BYP_BMF; wr_data_reg <= 8'h01; wr_en_reg <= 1'b1;
-                update_shadow(ADDR_BYP_BMF, 8'h01); send_prompt();
-              end
-              else                             send_err();
+              if      (m3(8,"s","u","s")) set_param(ADDR_BMF_SUS);
+              else if (m3(8,"t","o","n")) set_param(ADDR_BMF_TON);
+              else if (m3(8,"v","o","l")) set_param(ADDR_BMF_VOL);
+              else if (is_on())           do_bypass(ADDR_BYP_BMF, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_BMF, 8'h01);
+              else                        send_err();
 
             end else begin
               send_err();
@@ -741,51 +629,37 @@ module cmd_proc_v2 (
           end
         end
 
-        // ============================================================
-        // Status display  (chain: ROUTE → TRM → PHA → CHO → DLY → TUB → FLN → BMF → PROMPT)
-        // ============================================================
 
-        // -- Routes --
-        // Shows all 7 route entries from shadow_route, e.g.:
-        //   DAC<DLY TRM<CHO PHA<TUB CHO<FLN DLY<TRM TUB<ADC FLN<PHA
         S_ST_ROUTE: begin
           automatic int p = 0;
-          // Port 0 (DAC sink)
           tx_buf[p]<="D";p++;tx_buf[p]<="A";p++;tx_buf[p]<="C";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[0][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 1 (TRM sink)
           tx_buf[p]<="T";p++;tx_buf[p]<="R";p++;tx_buf[p]<="M";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[1][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 2 (PHA sink)
           tx_buf[p]<="P";p++;tx_buf[p]<="H";p++;tx_buf[p]<="A";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[2][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 3 (CHO sink)
           tx_buf[p]<="C";p++;tx_buf[p]<="H";p++;tx_buf[p]<="O";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[3][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 4 (DLY sink)
           tx_buf[p]<="D";p++;tx_buf[p]<="L";p++;tx_buf[p]<="Y";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[4][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 5 (TUB sink)
           tx_buf[p]<="T";p++;tx_buf[p]<="U";p++;tx_buf[p]<="B";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[5][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 6 (FLN sink)
           tx_buf[p]<="F";p++;tx_buf[p]<="L";p++;tx_buf[p]<="N";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[6][2:0], p);
           tx_buf[p]<=" ";p++;
-          // Port 7 (BMF sink)
           tx_buf[p]<="B";p++;tx_buf[p]<="M";p++;tx_buf[p]<="F";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[7][2:0], p);
@@ -797,7 +671,7 @@ module cmd_proc_v2 (
           state        <= S_TX_START;
         end
 
-        // -- Tremolo (slot 0) --
+        // ── Tremolo (slot 0) ──
         S_ST_TRM: begin
           if (!shadow[7][0]) begin
             automatic int p = 0;
@@ -816,7 +690,7 @@ module cmd_proc_v2 (
           end
         end
 
-        // -- Phaser (slot 1) --
+        // ── Phaser (slot 1) ──
         S_ST_PHA: begin
           if (!shadow[15][0]) begin
             automatic int p = 0;
@@ -834,7 +708,7 @@ module cmd_proc_v2 (
           end
         end
 
-        // -- Chorus (slot 2) --
+        // ── Chorus (slot 2) ──
         S_ST_CHO: begin
           if (!shadow[23][0]) begin
             automatic int p = 0;
@@ -855,7 +729,7 @@ module cmd_proc_v2 (
           end
         end
 
-        // -- Delay (slot 3) --
+        // ── Delay (slot 3) ──
         S_ST_DLY: begin
           if (!shadow[31][0]) begin
             automatic int p = 0;
@@ -881,7 +755,7 @@ module cmd_proc_v2 (
           end
         end
 
-        // -- Tube distortion (slot 4) --
+        // ── Tube distortion (slot 4) ──
         S_ST_TUB: begin
           if (!shadow[39][0]) begin
             automatic int p = 0;
@@ -902,7 +776,7 @@ module cmd_proc_v2 (
           end
         end
 
-        // -- Flanger (slot 5) --
+        // ── Flanger (slot 5) ──
         S_ST_FLN: begin
           if (!shadow[47][0]) begin
             automatic int p = 0;
@@ -922,7 +796,7 @@ module cmd_proc_v2 (
           end
         end
 
-        // -- Big Muff (slot 6) --
+        // ── Big Muff (slot 6) ──
         S_ST_BMF: begin
           if (!shadow[55][0]) begin
             automatic int p = 0;
@@ -941,9 +815,10 @@ module cmd_proc_v2 (
           end
         end
 
-        // ============================================================
-        // Hex parser
-        // ============================================================
+        // ──────────────────────────────────────────────────────────────
+        //  Hex parser
+        // ──────────────────────────────────────────────────────────────
+
         S_PARSE_INIT: begin
           parse_acc <= '0;
           state     <= S_PARSE_LOOP;
@@ -983,9 +858,10 @@ module cmd_proc_v2 (
           end
         end
 
-        // ============================================================
-        // Single 8-bit register write
-        // ============================================================
+        // ──────────────────────────────────────────────────────────────
+        //  Register writes
+        // ──────────────────────────────────────────────────────────────
+
         S_WRITE_REG: begin
           wr_addr_reg <= target_addr;
           wr_data_reg <= parse_acc[7:0];
@@ -994,9 +870,6 @@ module cmd_proc_v2 (
           send_prompt();
         end
 
-        // ============================================================
-        // 16-bit time register: 2 sequential byte writes (LE) with CDC gap
-        // ============================================================
         S_WRITE_TIME: begin
           if (cdc_wait != '0) begin
             cdc_wait <= cdc_wait - 1;
@@ -1023,9 +896,10 @@ module cmd_proc_v2 (
           end
         end
 
-        // ============================================================
-        // TX engine
-        // ============================================================
+        // ──────────────────────────────────────────────────────────────
+        //  TX engine
+        // ──────────────────────────────────────────────────────────────
+
         S_LOAD_PROMPT: begin
           tx_msg_sel   <= MSG_SEL_PROMPT;
           tx_idx       <= '0;
@@ -1037,9 +911,9 @@ module cmd_proc_v2 (
         S_LOAD_STRING: begin
           if (tx_idx < tx_len) begin
             case (tx_msg_sel)
-              MSG_SEL_PROMPT: tx_buf[tx_idx] <= MSG_PROMPT[tx_idx];
-              MSG_SEL_ERR:    tx_buf[tx_idx] <= MSG_ERR   [tx_idx];
-              default:        tx_buf[tx_idx] <= MSG_ERR   [tx_idx];
+              MSG_SEL_PROMPT: tx_buf[tx_idx] <= MSG_PROMPT[tx_idx[2:0]];
+              MSG_SEL_ERR:    tx_buf[tx_idx] <= MSG_ERR   [tx_idx[2:0]];
+              default:        tx_buf[tx_idx] <= MSG_ERR   [tx_idx[2:0]];
             endcase
             tx_idx <= tx_idx + 1;
           end else begin

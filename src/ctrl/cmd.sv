@@ -90,7 +90,7 @@ module cmd #(
   logic [7:0] proc_wr_addr;
   logic [7:0] proc_wr_data;
 
-  cmd_proc_v2 proc (
+  cmd_proc proc (
       .clk(sys_clk), .rst_n(rst_n),
       .rx_valid(proc_rx_valid), .rx_byte(proc_rx_byte),
       .tx_start(proc_tx_start), .tx_byte(proc_tx_byte),

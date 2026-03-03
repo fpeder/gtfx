@@ -17,7 +17,9 @@
 //   0x10..0x17 : Slot 2  - chorus    [0]=rate [1]=depth [2]=efx [3..4]=eq [7]=bypass
 //   0x18..0x1F : Slot 3  - dd3       [0]=tone [1]=lvl [2]=fdb [3..4]=time [7]=bypass
 //   0x20..0x27 : Slot 4  - tube_dist [0]=gain [1]=bas [2]=mid [3]=tre [4]=lvl [7]=bypass
-//   0x40..0x45 : route[0] .. route[N_XBAR-1]
+//   0x28..0x2F : Slot 5  - flanger   [0]=man [1]=wid [2]=spd [3]=reg     [7]=bypass
+//   0x30..0x37 : Slot 6  - big_muff  [0]=sus [1]=ton [2]=vol             [7]=bypass
+//   0x40..0x47 : route[0] .. route[N_XBAR-1]
 //
 // "set <efx> on"  writes 0x00 to addr 0x07/0x0F/0x17/0x1F/0x27 (bypass off = active)
 // "set <efx> off" writes 0x01 to those addrs                    (bypass on  = bypassed)
@@ -29,13 +31,13 @@
 // ============================================================================
 
 module ctrl_bus #(
-    parameter int N_SLOTS    = 5,
+    parameter int N_SLOTS    = 7,
     parameter int REGS_PER   = 8,
     parameter int REG_W      = 8,
     parameter int N_XBAR     = N_SLOTS + 1,
     parameter int SEL_W      = $clog2(N_XBAR),
     parameter int ADDR_W     = 8,
-    parameter int CFG_DEPTH  = N_SLOTS * REGS_PER
+    parameter int CFG_DEPTH  = N_SLOTS * REGS_PER  // MUST equal N_SLOTS * REGS_PER
 )(
     input  logic              clk,
     input  logic              rst_n,
@@ -77,6 +79,8 @@ module ctrl_bus #(
             cfg_mem[23] <= 8'h01;   // cho bypass
             cfg_mem[31] <= 8'h01;   // dly bypass
             cfg_mem[39] <= 8'h01;   // tub bypass
+            cfg_mem[47] <= 8'h01;   // fln bypass
+            cfg_mem[55] <= 8'h01;   // bmf bypass
 
             // ---- Slot 0 (tremolo): rate=0x3C depth=0xB4 ----
             cfg_mem[0] <= 8'h3C;
@@ -107,6 +111,19 @@ module ctrl_bus #(
             cfg_mem[36] <= 8'h60;   // level  (tamed output)
             // cfg_mem[39] = 0x01 bypass on - set above
 
+            // ---- Slot 5 (flanger): manual/width/speed/regen ----
+            cfg_mem[40] <= 8'h80;   // manual (centre)
+            cfg_mem[41] <= 8'hC0;   // width
+            cfg_mem[42] <= 8'h30;   // speed
+            cfg_mem[43] <= 8'hA0;   // regen
+            // cfg_mem[47] = 0x01 bypass on - set above
+
+            // ---- Slot 6 (big_muff): sustain/tone/volume ----
+            cfg_mem[48] <= 8'h80;   // sustain
+            cfg_mem[49] <= 8'h80;   // tone
+            cfg_mem[50] <= 8'hA0;   // volume
+            // cfg_mem[55] = 0x01 bypass on - set above
+
         end else if (wr_en && wr_addr < ADDR_W'(SLOT_END)) begin
             cfg_mem[wr_addr] <= wr_data;
         end
@@ -117,13 +134,15 @@ module ctrl_bus #(
     // =========================================================================
     always_ff @(posedge clk) begin
         if (!rst_n) begin
-            // Default chain: ADC → TUB → TRM → PHA → CHO → DLY → DAC
+            // Default chain: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→DAC
             route[0] <= SEL_W'(4);   // DAC ← DLY  (port 4)
-            route[1] <= SEL_W'(5);   // TRM ← TUB  (port 5)
-            route[2] <= SEL_W'(1);   // PHA ← TRM  (port 1)
-            route[3] <= SEL_W'(2);   // CHO ← PHA  (port 2)
-            route[4] <= SEL_W'(3);   // DLY ← CHO  (port 3)
-            route[5] <= SEL_W'(0);   // TUB ← ADC  (port 0)
+            route[1] <= SEL_W'(3);   // TRM ← CHO  (port 3)
+            route[2] <= SEL_W'(5);   // PHA ← TUB  (port 5)
+            route[3] <= SEL_W'(6);   // CHO ← FLN  (port 6)
+            route[4] <= SEL_W'(1);   // DLY ← TRM  (port 1)
+            route[5] <= SEL_W'(7);   // TUB ← BMF  (port 7)
+            route[6] <= SEL_W'(2);   // FLN ← PHA  (port 2)
+            route[7] <= SEL_W'(0);   // BMF ← ADC  (port 0)
         end else if (wr_en &&
                      wr_addr >= ADDR_W'(ROUTE_BASE) &&
                      wr_addr <  ADDR_W'(ROUTE_END)) begin

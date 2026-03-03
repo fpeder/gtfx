@@ -53,7 +53,7 @@ module axis_effect_slot #(
     parameter int AUDIO_W          = 24,
     // Effect-specific parameters
     parameter int CHORUS_DELAY_MAX = 2048,
-    parameter int DD3_RAM_DEPTH    = 32768,
+    parameter int DD3_RAM_DEPTH    = 65536,
     parameter int TUBE_LUT_ADDR    = 12,     // tube: 4096-entry LUT
     parameter int TUBE_FRAC_W      = 12      // tube: interpolation fraction bits
 ) (
@@ -108,6 +108,15 @@ module axis_effect_slot #(
   end
 
   // =====================================================================
+  // Shared sample_en delay (1-cycle latency strobe)
+  //
+  // All effect types except tube_distortion (type 4) use this as effect_valid.
+  // Hoisted here to avoid duplicating the identical logic in every branch.
+  // =====================================================================
+  logic sample_en_d1;
+  always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+
+  // =====================================================================
   // Effect core (selected by EFFECT_TYPE parameter)
   // =====================================================================
   logic signed [AUDIO_W-1:0] effect_out_l;
@@ -120,7 +129,8 @@ module axis_effect_slot #(
       logic signed [AUDIO_W-1:0] core_out;
 
       tremolo #(
-          .WIDTH(AUDIO_W)
+          .WIDTH (AUDIO_W),
+          .CTRL_W(CTRL_W)
       ) core (
           .clk      (clk),
           .rst_n    (rst_n),
@@ -134,10 +144,6 @@ module axis_effect_slot #(
 
       assign effect_out_l = core_out;
       assign effect_out_r = core_out;
-
-      // 1-cycle latency cores use sample_en_reg delayed by 1
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
 
       // ---- PHASER (type 1): mono in → mono out ----
@@ -145,7 +151,8 @@ module axis_effect_slot #(
       logic signed [AUDIO_W-1:0] core_out;
 
       phaser #(
-          .WIDTH(AUDIO_W)
+          .WIDTH (AUDIO_W),
+          .CTRL_W(CTRL_W)
       ) core (
           .clk        (clk),
           .rst_n      (rst_n),
@@ -158,17 +165,14 @@ module axis_effect_slot #(
 
       assign effect_out_l = core_out;
       assign effect_out_r = core_out;
-
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
 
       // ---- CHORUS (type 2): mono in → stereo out ----
     end else if (EFFECT_TYPE == 2) begin : gen_chorus
       chorus #(
-          .SAMPLE_RATE(48_000),
-          .DATA_WIDTH (AUDIO_W),
-          .DELAY_MAX  (CHORUS_DELAY_MAX)
+          .DATA_WIDTH(AUDIO_W),
+          .DELAY_MAX (CHORUS_DELAY_MAX),
+          .CTRL_W    (CTRL_W)
       ) core (
           .clk        (clk),
           .rst_n      (rst_n),
@@ -183,21 +187,19 @@ module axis_effect_slot #(
           .e_q_lo     (cfg_slice[4])
       );
 
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
 
       // ---- DD3 DELAY (type 3): mono in → wet-only out + dry/wet mix ----
     end else if (EFFECT_TYPE == 3) begin : gen_dd3
-      logic signed [AUDIO_W-1:0] wet_out;
+      logic signed [AUDIO_W-1:0] core_out;
 
       // Reconstruct 16-bit time_val from two consecutive 8-bit registers (LE)
       logic [15:0] time_val_16;
       assign time_val_16 = {cfg_slice[4], cfg_slice[3]};
 
-      dd3 #(
-          .WIDTH    (AUDIO_W),
-          .RAM_DEPTH(DD3_RAM_DEPTH)
+      delay #(
+          .AUDIO_W     (AUDIO_W),
+          .RAM_DEPTH   (DD3_RAM_DEPTH)
       ) core (
           .clk         (clk),
           .rst_n       (rst_n),
@@ -207,22 +209,11 @@ module axis_effect_slot #(
           .feedback_val(cfg_slice[2]),
           .time_val    (time_val_16),
           .audio_in    (audio_in_reg),
-          .audio_out   (wet_out)
+          .audio_out   (core_out)
       );
 
-      // Dry + wet saturating mix
-      logic signed [AUDIO_W:0] sum_l, sum_r;
-      always_comb begin
-        sum_l = $signed({dry_l_hold[AUDIO_W-1], dry_l_hold}) +
-            $signed({wet_out[AUDIO_W-1], wet_out});
-        sum_r = $signed({dry_r_hold[AUDIO_W-1], dry_r_hold}) +
-            $signed({wet_out[AUDIO_W-1], wet_out});
-      end
-      assign effect_out_l = saturate(sum_l);
-      assign effect_out_r = saturate(sum_r);
-
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
       assign effect_valid = sample_en_d1;
 
       // ---- TUBE DISTORTION (type 4): mono in → mono out, valid_out-driven ----
@@ -263,8 +254,9 @@ module axis_effect_slot #(
 
       flanger #(
           .WIDTH    (AUDIO_W),
-          .MAX_DELAY(240),
-          .MIN_DELAY(12)
+          .CTRL_W   (CTRL_W),
+          .MAX_DELAY(256),
+          .MIN_DELAY(16)
       ) core (
           .clk       (clk),
           .rst_n     (rst_n),
@@ -279,10 +271,6 @@ module axis_effect_slot #(
 
       assign effect_out_l = core_out;
       assign effect_out_r = core_out;
-
-      // 1-cycle latency, same as tremolo / phaser / chorus
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
 
       // ---- BIG MUFF (type 6): mono in → mono out ----
@@ -304,17 +292,12 @@ module axis_effect_slot #(
 
       assign effect_out_l = core_out;
       assign effect_out_r = core_out;
-
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
 
       // ---- DEFAULT: passthrough ----
     end else begin : gen_passthrough
       assign effect_out_l = dry_l_hold;
       assign effect_out_r = dry_r_hold;
-      logic sample_en_d1;
-      always_ff @(posedge clk) sample_en_d1 <= (!rst_n) ? 1'b0 : sample_en_reg;
       assign effect_valid = sample_en_d1;
     end
   endgenerate

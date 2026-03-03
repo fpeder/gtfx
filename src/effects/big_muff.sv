@@ -114,33 +114,11 @@ module big_muff #(
   logic [GAIN_W-1:0] stage2_gain;
 
   always_comb begin
+    // 256 + sustain * 768/256 → gain 1.0x (sustain=0) to 4.0x (sustain=255)
     stage1_gain = GAIN_W'(16'd256 + ((16'(sustain_val) * 16'd768)  >> 8));
+    // 384 + sustain * 3712/256 → gain 1.5x (sustain=0) to 16.0x (sustain=255)
     stage2_gain = GAIN_W'(16'd384 + ((16'(sustain_val) * 16'd3712) >> 8));
   end
-
-  // =========================================================================
-  // Soft-clip function
-  // =========================================================================
-  function automatic logic signed [WIDTH-1:0] soft_clip(
-    input logic signed [INT_W-1:0] x
-  );
-    logic [INT_W-2:0] x_abs;
-    logic [INT_W-2:0] y_abs;
-    logic signed [WIDTH-1:0] result;
-
-    x_abs = x[INT_W-1] ? (INT_W-1)'(-x) : (INT_W-1)'(x);
-
-    if (x_abs <= (INT_W-1)'(CLIP_KNEE)) begin
-      result = x[WIDTH-1:0];
-    end else begin
-      y_abs = (INT_W-1)'(CLIP_KNEE) + ((x_abs - (INT_W-1)'(CLIP_KNEE)) >> 2);
-      if (y_abs > (INT_W-1)'(CLIP_PEAK))
-        y_abs = (INT_W-1)'(CLIP_PEAK);
-      result = x[INT_W-1] ? -WIDTH'(y_abs) : WIDTH'(y_abs);
-    end
-
-    return result;
-  endfunction
 
   // =========================================================================
   // Clipping stage 1 + post-clip smoothing
@@ -151,8 +129,18 @@ module big_muff #(
 
   always_comb begin
     stage1_gained  = INT_W'((longint'(audio_in) * longint'(signed'({1'b0, stage1_gain}))) >>> 8);
-    stage1_clipped = soft_clip(stage1_gained);
   end
+
+  soft_clip #(
+      .IN_W      (INT_W),
+      .OUT_W     (WIDTH),
+      .COMP_SHIFT(2),          // 4:1 compression
+      .KNEE      (CLIP_KNEE),
+      .PEAK      (CLIP_PEAK)
+  ) u_clip1 (
+      .din (stage1_gained),
+      .dout(stage1_clipped)
+  );
 
   biquad_tdf2 #(
       .DATA_W (WIDTH),
@@ -182,8 +170,18 @@ module big_muff #(
 
   always_comb begin
     stage2_gained  = INT_W'((longint'(stage1_smooth) * longint'(signed'({1'b0, stage2_gain}))) >>> 8);
-    stage2_clipped = soft_clip(stage2_gained);
   end
+
+  soft_clip #(
+      .IN_W      (INT_W),
+      .OUT_W     (WIDTH),
+      .COMP_SHIFT(2),          // 4:1 compression
+      .KNEE      (CLIP_KNEE),
+      .PEAK      (CLIP_PEAK)
+  ) u_clip2 (
+      .din (stage2_gained),
+      .dout(stage2_clipped)
+  );
 
   biquad_tdf2 #(
       .DATA_W (WIDTH),
@@ -263,14 +261,14 @@ module big_muff #(
   // =========================================================================
   logic signed [INT_W-1:0] tone_mixed;
   logic signed [WIDTH-1:0] tone_out;
+  logic [8:0] lp_weight;
+  logic [7:0] hp_weight;
 
   always_comb begin
-    logic [8:0] lp_weight;
-    logic [7:0] hp_weight;
-
     hp_weight = tone_val;
     lp_weight = 9'd256 - 9'(tone_val);
 
+    // Tone blend: Q1.AF × Q0.9 + Q1.AF × Q0.8, >>> 8 → Q1.AF
     tone_mixed = INT_W'(
         (longint'(tone_lp_out) * longint'(signed'({1'b0, lp_weight})) +
          longint'(tone_hp_out) * longint'(signed'({1'b0, hp_weight}))) >>> 8
@@ -292,6 +290,7 @@ module big_muff #(
   logic signed [WIDTH-1:0] vol_out;
 
   always_comb begin
+    // Volume: Q1.AF × Q0.8 → Q1.(AF+8), >>> 8 → Q1.AF
     vol_scaled = INT_W'((longint'(tone_out) * longint'({1'b0, volume_val})) >>> 8);
   end
 
@@ -306,7 +305,7 @@ module big_muff #(
   // =========================================================================
   // Registered output (1-cycle latency)
   // =========================================================================
-  always_ff @(posedge clk or negedge rst_n) begin
+  always_ff @(posedge clk) begin
     if (!rst_n) audio_out <= '0;
     else if (sample_en) audio_out <= vol_out;
   end

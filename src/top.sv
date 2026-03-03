@@ -134,11 +134,12 @@ module top #(
   logic [SEL_W-1:0] route   [N_XBAR];
 
   ctrl_bus #(
-      .N_SLOTS (N_SLOTS),
-      .REGS_PER(REGS_PER),
-      .REG_W   (REG_W),
-      .N_XBAR  (N_XBAR),
-      .SEL_W   (SEL_W)
+      .N_SLOTS  (N_SLOTS),
+      .REGS_PER (REGS_PER),
+      .REG_W    (REG_W),
+      .N_XBAR   (N_XBAR),
+      .SEL_W    (SEL_W),
+      .CFG_DEPTH(CFG_DEPTH)
   ) ctrl_inst (
       .clk    (clk_audio),
       .rst_n  (resetn),
@@ -268,7 +269,7 @@ module top #(
         .CTRL_W          (REG_W),
         .AUDIO_W         (24),
         .CHORUS_DELAY_MAX(2048),
-        .DD3_RAM_DEPTH   (32768),
+        .DD3_RAM_DEPTH   (65536),
         .TUBE_LUT_ADDR   (TUBE_LUT_ADDR),
         .TUBE_FRAC_W     (TUBE_FRAC_W)
     ) slot_inst (

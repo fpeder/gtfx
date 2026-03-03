@@ -39,6 +39,15 @@ module biquad_tdf2 #(
   wire signed [ACC_W-1:0] s1_next = xe * b1 + y_full * a1_neg + s2;
   wire signed [ACC_W-1:0] s2_next = xe * b2 + y_full * a2_neg;
 
+  // FIX #4: Saturate y_full before truncating to DATA_W bits.
+  //         Raw truncation (y_full[DATA_W-1:0]) wraps on overflow,
+  //         causing massive clicks when the IIR transiently overshoots.
+  wire signed [DATA_W-1:0] y_sat;
+  saturate #(.IN_W(ACC_W), .OUT_W(DATA_W)) u_y_sat (
+      .din  (y_full),
+      .dout (y_sat)
+  );
+
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n) begin
       s1    <= '0;
@@ -47,7 +56,7 @@ module biquad_tdf2 #(
     end else if (en) begin
       s1    <= s1_next;
       s2    <= s2_next;
-      y_out <= y_full[DATA_W-1:0];
+      y_out <= y_sat;
     end
   end
 
