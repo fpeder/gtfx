@@ -115,9 +115,9 @@ module big_muff #(
 
   always_comb begin
     // 256 + sustain * 768/256 → gain 1.0x (sustain=0) to 4.0x (sustain=255)
-    stage1_gain = GAIN_W'(16'd256 + ((16'(sustain_val) * 16'd768)  >> 8));
+    stage1_gain = GAIN_W'(16'd256 + ((32'(sustain_val) * 32'd768)  >> 8));
     // 384 + sustain * 3712/256 → gain 1.5x (sustain=0) to 16.0x (sustain=255)
-    stage2_gain = GAIN_W'(16'd384 + ((16'(sustain_val) * 16'd3712) >> 8));
+    stage2_gain = GAIN_W'(16'd384 + ((32'(sustain_val) * 32'd3712) >> 8));
   end
 
   // =========================================================================

@@ -48,7 +48,7 @@ module biquad_tdf2 #(
       .dout (y_sat)
   );
 
-  always_ff @(posedge clk or negedge rst_n) begin
+  always_ff @(posedge clk) begin
     if (!rst_n) begin
       s1    <= '0;
       s2    <= '0;

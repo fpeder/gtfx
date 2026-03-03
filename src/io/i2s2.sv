@@ -21,7 +21,7 @@ module i2s2 #(
 );
 
   logic [8:0] clk_cnt;
-  always_ff @(posedge clk or negedge resetn) begin
+  always_ff @(posedge clk) begin
     if (!resetn) clk_cnt <= 0;
     else clk_cnt <= clk_cnt + 1;
   end
@@ -42,7 +42,7 @@ module i2s2 #(
 
   assign load_tx = (clk_cnt[6:0] == 7'd3);
 
-  always_ff @(posedge clk or negedge resetn) begin
+  always_ff @(posedge clk) begin
     if (!resetn) begin
       shift_tx <= 0;
     end else if (load_tx && sclk_fall) begin
@@ -63,7 +63,7 @@ module i2s2 #(
 
   assign latch_rx = (clk_cnt[6:0] == 7'd99);
 
-  always_ff @(posedge clk or negedge resetn) begin
+  always_ff @(posedge clk) begin
     if (!resetn) begin
       shift_rx     <= 0;
       rx_latched_l <= 0;

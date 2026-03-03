@@ -254,7 +254,7 @@ module tube_distortion #(
   // =========================================================================
   localparam int PROD_W = DATA_W + 9 + 9;  // 42 bits: 33-bit sign-ext × 9-bit gain
   localparam int MIX_W  = DATA_W + 4;      // 28 bits is plenty: 24-bit dry + 3 × ~24-bit terms
-  localparam int LVL_W  = DATA_W + 8;      // 32 bits
+  localparam int LVL_W  = DATA_W + 11;     // 35 bits (wider for eff_level scaling)
 
   // Full-precision products, shifted
   wire signed [PROD_W-1:0] bass_prod = ($signed({{9{bass_y[DATA_W-1]}}, bass_y}) * bg) >>> 7;
@@ -284,9 +284,20 @@ module tube_distortion #(
       .dout(mix_sat_comb)
   );
 
-  // Level: Q1.AF × Q0.8 (unsigned level) → Q1.(AF+8), [LVL_W-1:8] extracts Q1.AF
-  wire signed [LVL_W-1:0] level_scaled = {{8{mix_sat_comb[DATA_W-1]}}, mix_sat_comb} * $signed(
-      {1'b0, level}
+  // Level: level=128 ≈ unity (dry-signal loudness at midpoint)
+  // eff_level = level × 2  (level=0 → mute, level=128 → 256 → unity @ >>>8, level=255 → ×1.99)
+  wire [9:0] eff_level = {1'b0, level, 1'b0};
+
+  wire signed [LVL_W-1:0] level_scaled =
+      $signed({{(LVL_W-DATA_W){mix_sat_comb[DATA_W-1]}}, mix_sat_comb})
+      * $signed({1'b0, eff_level});
+
+  wire signed [LVL_W-9:0] lvl_shifted = level_scaled[LVL_W-1:8];
+  wire signed [DATA_W-1:0] lvl_sat;
+
+  saturate #(.IN_W(LVL_W - 8), .OUT_W(DATA_W)) u_sat_lvl (
+      .din (lvl_shifted),
+      .dout(lvl_sat)
   );
 
   always_ff @(posedge clk) begin
@@ -294,7 +305,7 @@ module tube_distortion #(
       audio_out <= '0;
       valid_out <= 1'b0;
     end else begin
-      audio_out <= level_scaled[LVL_W-1:8];
+      audio_out <= lvl_sat;
       valid_out <= vld[PIPE-1];
     end
   end

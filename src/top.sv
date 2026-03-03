@@ -74,6 +74,31 @@ module top #(
   );
 
   // =========================================================================
+  // Reset synchronizers (one per clock domain, gated by PLL lock)
+  // =========================================================================
+  logic rst_sys_n;
+  logic [1:0] rst_sys_pipe;
+
+  always_ff @(posedge sys_clk) begin
+    if (!resetn)
+      rst_sys_pipe <= 2'b00;
+    else
+      rst_sys_pipe <= {rst_sys_pipe[0], 1'b1};
+  end
+  assign rst_sys_n = rst_sys_pipe[1];
+
+  logic rst_audio_n;
+  logic [1:0] rst_audio_pipe;
+
+  always_ff @(posedge clk_audio) begin
+    if (!resetn || !locked)
+      rst_audio_pipe <= 2'b00;
+    else
+      rst_audio_pipe <= {rst_audio_pipe[0], 1'b1};
+  end
+  assign rst_audio_n = rst_audio_pipe[1];
+
+  // =========================================================================
   // Command subsystem (sys_clk domain)
   // =========================================================================
   logic       cmd_wr_toggle;
@@ -85,7 +110,7 @@ module top #(
       .BAUD_RATE(115_200)
   ) cmd_inst (
       .sys_clk(sys_clk),
-      .rst_n  (resetn),
+      .rst_n  (rst_sys_n),
       .tx_din (uart_tx_din),
       .rx_dout(uart_rx_dout),
       .wr_en  (cmd_wr_toggle),
@@ -97,35 +122,41 @@ module top #(
   // CDC: sys_clk → clk_audio (toggle handshake)
   // =========================================================================
   logic tog_s1, tog_s2, tog_prev;
-  logic [7:0] addr_s1, addr_s2;
-  logic [7:0] data_s1, data_s2;
+  logic       tog_edge;
   logic       wr_en_audio;
   logic [7:0] wr_addr_audio;
   logic [7:0] wr_data_audio;
 
+  // 2-flop synchronizer for toggle only
   always_ff @(posedge clk_audio) begin
-    if (!resetn) begin
+    if (!rst_audio_n) begin
       tog_s1   <= 1'b0;
       tog_s2   <= 1'b0;
       tog_prev <= 1'b0;
-      addr_s1  <= 8'd0;
-      addr_s2  <= 8'd0;
-      data_s1  <= 8'd0;
-      data_s2  <= 8'd0;
     end else begin
       tog_s1   <= cmd_wr_toggle;
       tog_s2   <= tog_s1;
-      addr_s1  <= cmd_wr_addr;
-      addr_s2  <= addr_s1;
-      data_s1  <= cmd_wr_data;
-      data_s2  <= data_s1;
       tog_prev <= tog_s2;
     end
   end
 
-  assign wr_en_audio   = tog_s2 ^ tog_prev;
-  assign wr_addr_audio = addr_s2;
-  assign wr_data_audio = data_s2;
+  assign tog_edge = tog_s2 ^ tog_prev;
+
+  // On toggle edge, capture addr/data (guaranteed stable by source protocol).
+  // Delay wr_en by 1 cycle to align with the registered capture.
+  always_ff @(posedge clk_audio) begin
+    if (!rst_audio_n) begin
+      wr_en_audio   <= 1'b0;
+      wr_addr_audio <= 8'd0;
+      wr_data_audio <= 8'd0;
+    end else begin
+      wr_en_audio <= tog_edge;
+      if (tog_edge) begin
+        wr_addr_audio <= cmd_wr_addr;
+        wr_data_audio <= cmd_wr_data;
+      end
+    end
+  end
 
   // =========================================================================
   // Control Bus  (shared config RAM)
@@ -142,7 +173,7 @@ module top #(
       .CFG_DEPTH(CFG_DEPTH)
   ) ctrl_inst (
       .clk    (clk_audio),
-      .rst_n  (resetn),
+      .rst_n  (rst_audio_n),
       .wr_en  (wr_en_audio),
       .wr_addr(wr_addr_audio),
       .wr_data(wr_data_audio),
@@ -161,7 +192,7 @@ module top #(
       .AUDIO_W(24)
   ) audio_inst (
       .clk_audio(clk_audio),
-      .resetn   (resetn),
+      .resetn   (rst_audio_n),
       .tx_mclk  (i2s2_tx_mclk),
       .tx_lrclk (i2s2_tx_lrclk),
       .tx_sclk  (i2s2_tx_sclk),
@@ -192,7 +223,7 @@ module top #(
   logic        adc_tvalid;
 
   always_ff @(posedge clk_audio) begin
-    if (!resetn) begin
+    if (!rst_audio_n) begin
       adc_tdata  <= '0;
       adc_tvalid <= 1'b0;
     end else begin
@@ -211,7 +242,7 @@ module top #(
   logic        dac_tvalid;
 
   always_ff @(posedge clk_audio) begin
-    if (!resetn) begin
+    if (!rst_audio_n) begin
       din_l <= '0;
       din_r <= '0;
     end else if (dac_tvalid) begin
@@ -274,7 +305,7 @@ module top #(
         .TUBE_FRAC_W     (TUBE_FRAC_W)
     ) slot_inst (
         .clk          (clk_audio),
-        .rst_n        (resetn),
+        .rst_n        (rst_audio_n),
         .s_axis_tdata (xbar_s_tdata[i+1]),
         .s_axis_tvalid(xbar_s_tvalid[i+1]),
         .s_axis_tready(xbar_s_tready[i+1]),

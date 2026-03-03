@@ -328,26 +328,27 @@ module axis_effect_slot #(
   end
 
   // ---- Bypass mux with crossfade ----
-  // bypass=1 → forward input directly (registered, 1-cycle latency)
+  // bypass=1 → forward input directly
   // bypass=0 → use effect output
   // Effect still runs in bypass to keep LFO phase / delay tails alive.
   //
   // To prevent audible clicks when bypass toggles, a short linear crossfade
   // ramps between dry and wet paths over FADE_LEN samples (~1.3 ms at 48 kHz).
+  //
+  // Timing: efx_valid is the sole output strobe in all modes (bypass, active,
+  // crossfade). The effect always runs, so efx_valid fires once per sample
+  // regardless of bypass state. The bypass path just holds the dry data for
+  // the crossfade mix — no independent valid strobe. This prevents the
+  // double-valid-pulse that would occur if bypass and effect valid strobes
+  // fired at different times during crossfade.
 
   logic [DATA_W-1:0] byp_data;
-  logic              byp_valid;
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
-      byp_data  <= '0;
-      byp_valid <= 1'b0;
-    end else begin
-      if (byp_valid && m_axis_tready) byp_valid <= 1'b0;
-      if (beat_in) begin
-        byp_data  <= s_axis_tdata;
-        byp_valid <= 1'b1;
-      end
+      byp_data <= '0;
+    end else if (beat_in) begin
+      byp_data <= s_axis_tdata;
     end
   end
 
@@ -356,27 +357,17 @@ module axis_effect_slot #(
   localparam int FADE_W   = $clog2(FADE_LEN+1); // bits for counter 0..FADE_LEN
 
   logic [FADE_W-1:0] fade_pos;             // 0 = full bypass, FADE_LEN = full effect
-  logic               bypass_prev;
 
   always_ff @(posedge clk) begin
     if (!rst_n) begin
-      fade_pos    <= '0;
-      bypass_prev <= 1'b1;
-    end else begin
-      bypass_prev <= bypass;
-
-      // When bypass changes, the fade ramps toward the new target.
-      // Only step on sample boundaries (effect_valid or byp_valid) to keep
-      // the crossfade in sync with the audio rate.
-      if (effect_valid || byp_valid) begin
-        if (bypass && fade_pos != '0)
-          fade_pos <= fade_pos - 1;
-        else if (!bypass && fade_pos != FADE_W'(FADE_LEN))
-          fade_pos <= fade_pos + 1;
-      end
-
-      // Snap to target if bypass hasn't changed for a full ramp
-      // (handles startup: bypass=1 → fade_pos stays 0)
+      fade_pos <= '0;
+    end else if (effect_valid) begin
+      // Step on effect_valid only (once per sample) to keep crossfade
+      // in sync with the audio rate.
+      if (bypass && fade_pos != '0)
+        fade_pos <= fade_pos - 1;
+      else if (!bypass && fade_pos != FADE_W'(FADE_LEN))
+        fade_pos <= fade_pos + 1;
     end
   end
 
@@ -402,18 +393,7 @@ module axis_effect_slot #(
        longint'(efx_r) * longint'(fade_pos)) / longint'(FADE_LEN));
   end
 
-  // Output uses whichever valid strobe fires (both paths run in parallel)
-  logic              out_valid;
-  logic [DATA_W-1:0] out_data;
-
-  assign out_data  = pack_stereo(mix_l, mix_r);
-  // During crossfade both paths are blended, so either valid is sufficient.
-  // In steady state only one path matters but both are always running.
-  assign out_valid = (fade_pos == '0)              ? byp_valid :
-                     (fade_pos == FADE_W'(FADE_LEN)) ? efx_valid :
-                     (efx_valid | byp_valid);
-
-  assign m_axis_tdata  = out_data;
-  assign m_axis_tvalid = out_valid;
+  assign m_axis_tdata  = pack_stereo(mix_l, mix_r);
+  assign m_axis_tvalid = efx_valid;
 
 endmodule
