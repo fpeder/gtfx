@@ -15,7 +15,7 @@
 //       inference on large buffers.  Caller presents rd_ptr on the same
 //       cycle as rd_en; data appears on rd_data one clock later.
 //
-// Separate wr_en / rd_en strobes support 2-phase pipelines (e.g. DD-3):
+// Separate wr_en / rd_en strobes support 2-phase pipelines (e.g. delay):
 //   Phase 1 (rd_en):  Issue BRAM reads.
 //   Phase 2 (wr_en):  Read data valid; process and write back.
 // For single-phase designs, tie rd_en = wr_en (or leave unconnected when
@@ -53,9 +53,9 @@
 //       .interp_frac('0), .interp_out()
 //   );
 //
-// Example (flanger - two taps + interpolation, non-PoT, combinational):
+// Example (flanger - two taps + interpolation, PoT, combinational):
 //
-//   delay_line #(.DATA_W(24), .DEPTH(240), .NUM_TAPS(2),
+//   delay_line #(.DATA_W(24), .DEPTH(256), .NUM_TAPS(2),
 //                .INTERP_EN(1), .FRAC_W(10)) u_delay (
 //       .clk(clk), .rst_n(rst_n),
 //       .wr_en(sample_en), .wr_data(delay_input_sat),
@@ -65,7 +65,7 @@
 //       .interp_frac(delay_frac), .interp_out(wet_interp)
 //   );
 //
-// Example (DD-3 - two taps + interpolation, PoT BRAM, registered reads):
+// Example (delay - two taps + interpolation, PoT BRAM, registered reads):
 //
 //   delay_line #(.DATA_W(24), .DEPTH(32768), .NUM_TAPS(2),
 //                .REG_RD(1), .INTERP_EN(1), .FRAC_W(8)) u_delay (

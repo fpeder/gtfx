@@ -14,19 +14,21 @@
 //   0 = tremolo        (mono in, mono out,   1-cycle latency)
 //   1 = phaser         (mono in, mono out,   1-cycle latency)
 //   2 = chorus         (mono in, stereo out, 1-cycle latency)
-//   3 = dd3            (mono in, wet+dry mix,1-cycle latency)
-//   4 = tube_distortion(mono in, mono out,   valid_out-driven, 9-cycle latency)
+//   3 = delay          (mono in, dry/wet crossfade, 3-cycle latency)
+//   4 = tube_distortion(mono in, mono out,   1-cycle latency)
 //   5 = flanger       (mono in, mono out,   1-cycle latency)
 //   6 = big_muff      (mono in, mono out,   1-cycle latency)
+//   7 = reverb        (mono in, stereo out, 1-cycle latency)
 //
 // Register map (per slot, 8 bytes, indexed from cfg_mem[SLOT_ID*CTRL_DEPTH]):
 //   tremolo:         [0]=rate  [1]=depth  [2]=shape(bit0)           [7]=bypass(bit0)
 //   phaser:          [0]=speed [1]=feedback_en(bit0)                [7]=bypass(bit0)
 //   chorus:          [0]=rate  [1]=depth  [2]=effect_lvl [3..4]=eq  [7]=bypass(bit0)
-//   dd3:             [0]=tone  [1]=level  [2]=feedback [3..4]=time  [7]=bypass(bit0)
+//   delay:           [0]=rpt [1]=mix [2]=flt [3..4]=time [5]=mod [6]=grit+mode [7]=bypass(bit0)
 //   tube_distortion: [0]=gain  [1]=bass   [2]=mid [3]=treble [4]=lvl [7]=bypass(bit0)
-//   flanger:         [0]=manual [1]=width [2]=speed [3]=regen       [7]=bypass(bit0)
+//   flanger:         [0]=manual [1]=width [2]=speed [3]=regen [4]=mix [7]=bypass(bit0)
 //   big_muff:        [0]=sustain [1]=tone [2]=volume                [7]=bypass(bit0)
+//   reverb:          [0]=decay [1]=damping [2]=mix [3]=pre_dly [4]=tone [5]=level [7]=bypass(bit0)
 //
 // bypass is read directly from cfg_slice[7][0].  The separate bypass input port
 // has been removed; ctrl_bus writes the bypass bit into cfg_mem[slot*CTRL_DEPTH+7].
@@ -46,16 +48,14 @@
 
 module axis_effect_slot #(
     parameter int SLOT_ID          = 0,
-    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=dd3, 4=tube, 5=flanger, 6=big_muff
+    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=delay, 4=tube, 5=flanger, 6=big_muff, 7=reverb
     parameter int DATA_W           = 48,
     parameter int CTRL_DEPTH       = 8,
     parameter int CTRL_W           = 8,
     parameter int AUDIO_W          = 24,
     // Effect-specific parameters
     parameter int CHORUS_DELAY_MAX = 2048,
-    parameter int DD3_RAM_DEPTH    = 65536,
-    parameter int TUBE_LUT_ADDR    = 12,     // tube: 4096-entry LUT
-    parameter int TUBE_FRAC_W      = 12      // tube: interpolation fraction bits
+    parameter int DELAY_RAM_DEPTH  = 65536
 ) (
     input logic clk,
     input logic rst_n,
@@ -110,7 +110,7 @@ module axis_effect_slot #(
   // =====================================================================
   // Shared sample_en delay (1-cycle latency strobe)
   //
-  // All effect types except tube_distortion (type 4) use this as effect_valid.
+  // All effect types use this as effect_valid.
   // Hoisted here to avoid duplicating the identical logic in every branch.
   // =====================================================================
   logic sample_en_d1;
@@ -189,8 +189,8 @@ module axis_effect_slot #(
 
       assign effect_valid = sample_en_d1;
 
-      // ---- DD3 DELAY (type 3): mono in → wet-only out + dry/wet mix ----
-    end else if (EFFECT_TYPE == 3) begin : gen_dd3
+      // ---- TIMELINE DELAY (type 3): mono in → dry/wet crossfade ----
+    end else if (EFFECT_TYPE == 3) begin : gen_delay
       logic signed [AUDIO_W-1:0] core_out;
 
       // Reconstruct 16-bit time_val from two consecutive 8-bit registers (LE)
@@ -199,15 +199,17 @@ module axis_effect_slot #(
 
       delay #(
           .AUDIO_W     (AUDIO_W),
-          .RAM_DEPTH   (DD3_RAM_DEPTH)
+          .RAM_DEPTH   (DELAY_RAM_DEPTH)
       ) core (
           .clk         (clk),
           .rst_n       (rst_n),
           .sample_en   (sample_en_reg),
-          .tone_val    (cfg_slice[0]),
-          .level_val   (cfg_slice[1]),
-          .feedback_val(cfg_slice[2]),
+          .repeats_val (cfg_slice[0]),
+          .mix_val     (cfg_slice[1]),
+          .filter_val  (cfg_slice[2]),
           .time_val    (time_val_16),
+          .mod_val     (cfg_slice[5]),
+          .grit_val    (cfg_slice[6]),
           .audio_in    (audio_in_reg),
           .audio_out   (core_out)
       );
@@ -216,27 +218,21 @@ module axis_effect_slot #(
       assign effect_out_r = core_out;
       assign effect_valid = sample_en_d1;
 
-      // ---- TUBE DISTORTION (type 4): mono in → mono out, valid_out-driven ----
-      //
-      // tube_distortion has a 10-cycle pipelined latency and drives its own
-      // valid_out strobe, used directly as effect_valid.
+      // ---- TUBE DISTORTION (type 4): mono in → mono out, 1-cycle latency ----
       // cfg_slice mapping:
       //   [0]=gain  [1]=tone_bass  [2]=tone_mid  [3]=tone_treble  [4]=level
     end else if (EFFECT_TYPE == 4) begin : gen_tube
       logic signed [AUDIO_W-1:0] core_out;
-      logic                      core_valid;
 
       tube_distortion #(
-          .DATA_W  (AUDIO_W),
-          .LUT_ADDR(TUBE_LUT_ADDR),
-          .FRAC_W  (TUBE_FRAC_W)
+          .DATA_W(AUDIO_W)
       ) core (
           .clk        (clk),
           .rst_n      (rst_n),
           .sample_en  (sample_en_reg),
           .audio_in   (audio_in_reg),
           .audio_out  (core_out),
-          .valid_out  (core_valid),
+          .valid_out  (),
           .gain       (cfg_slice[0]),
           .tone_bass  (cfg_slice[1]),
           .tone_mid   (cfg_slice[2]),
@@ -246,7 +242,7 @@ module axis_effect_slot #(
 
       assign effect_out_l = core_out;
       assign effect_out_r = core_out;
-      assign effect_valid = core_valid;
+      assign effect_valid = sample_en_d1;
 
       // ---- FLANGER (type 5): mono in → mono out ----
     end else if (EFFECT_TYPE == 5) begin : gen_flanger
@@ -266,7 +262,8 @@ module axis_effect_slot #(
           .manual_val(cfg_slice[0]),
           .width_val (cfg_slice[1]),
           .speed_val (cfg_slice[2]),
-          .regen_val (cfg_slice[3])
+          .regen_val (cfg_slice[3]),
+          .mix_val   (cfg_slice[4])
       );
 
       assign effect_out_l = core_out;
@@ -294,6 +291,28 @@ module axis_effect_slot #(
       assign effect_out_r = core_out;
       assign effect_valid = sample_en_d1;
 
+      // ---- REVERB (type 7): mono in → stereo out ----
+    end else if (EFFECT_TYPE == 7) begin : gen_reverb
+      reverb #(
+          .DATA_W(AUDIO_W),
+          .CTRL_W(CTRL_W)
+      ) core (
+          .clk        (clk),
+          .rst_n      (rst_n),
+          .sample_en  (sample_en_reg),
+          .audio_in   (audio_in_reg),
+          .audio_out_l(effect_out_l),
+          .audio_out_r(effect_out_r),
+          .decay      (cfg_slice[0]),
+          .damping    (cfg_slice[1]),
+          .mix        (cfg_slice[2]),
+          .pre_dly    (cfg_slice[3]),
+          .tone       (cfg_slice[4]),
+          .level      (cfg_slice[5])
+      );
+
+      assign effect_valid = sample_en_d1;
+
       // ---- DEFAULT: passthrough ----
     end else begin : gen_passthrough
       assign effect_out_l = dry_l_hold;
@@ -305,10 +324,7 @@ module axis_effect_slot #(
   // =====================================================================
   // Output capture + bypass mux
   //
-  // All effect types now use effect_valid as the output strobe.
-  // Types 0-3 (1-cycle latency) produce effect_valid = sample_en_d1,
-  // which is functionally identical to the previous sample_en_d1 logic.
-  // Type 4 (tube) uses valid_out from the core's 9-cycle pipeline.
+  // All effect types use effect_valid = sample_en_d1 as the output strobe.
   // =====================================================================
   logic [DATA_W-1:0] efx_data;
   logic              efx_valid;

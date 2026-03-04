@@ -4,7 +4,7 @@ efx_control.py — ncurses controller for FPGA guitar effects (cmd_proc_v2).
 
 Architecture
 ────────────
-  Routing   Declarative route table mirroring the FPGA's shadow_route[0..6].
+  Routing   Declarative route table mirroring the FPGA's shadow_route[0..8].
   Model     Param / Param16 / EffectSlot — pure data, no I/O.
   Serial    SerialLink wraps pyserial; every public method maps 1-to-1
             to a cmd_proc_v2 CLI command.
@@ -24,11 +24,11 @@ Usage
 Keys (normal mode)
 ──────────────────
     TAB / Shift-TAB    Cycle effect slots (chain order)
+    h / j / k / l      Vim-style navigation (left/down/up/right column)
     UP / DOWN          Navigate parameters (wraps across slots)
     LEFT / RIGHT       Fine adjust  ±1  (±0x100 for 16-bit params)
     PgUp / PgDn        Coarse adjust ±16  (±0x1000 for 16-bit)
     SPACE / ENTER      Toggle bypass on/off
-    o / f              Force ON / OFF
     c                  Enter connection editor
     s                  Request hardware status dump
     w                  Enter raw register write mode
@@ -56,7 +56,7 @@ except ImportError:
 # ╔═══════════════════════════════════════════════════════════════════════════╗
 # ║  Routing model — mirrors cmd_proc_v2 shadow_route[0..6]                 ║
 # ║                                                                         ║
-# ║  Port indices:  0=ADC  1=TRM  2=PHA  3=CHO  4=DLY  5=TUB  6=FLN       ║
+# ║  Port indices:  0=ADC 1=TRM 2=PHA 3=CHO 4=DLY 5=TUB 6=FLN 7=BMF 8=REV ║
 # ║  route[sink] = source_port   (who feeds into *sink*)                    ║
 # ║  DAC = sink index 0 ;  ADC = ultimate source (port 0)                  ║
 # ╚═══════════════════════════════════════════════════════════════════════════╝
@@ -72,6 +72,7 @@ class Port(IntEnum):
     TUB = 5
     FLN = 6
     BMF = 7
+    REV = 8
 
 
 PORT_TAG: dict[int, str] = {p.value: p.name.lower() for p in Port}
@@ -83,9 +84,9 @@ SOURCE_NODES = [p.name.lower() for p in Port]  # adc … fln
 SINK_NODES = ["dac"] + [p.name.lower() for p in Port if p != Port.ADC]
 SINK_ROUTE_IDX = {tag: i for i, tag in enumerate(SINK_NODES)}
 
-# Default route: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→DAC
+# Default route: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→REV→DAC
 DEFAULT_ROUTE: list[int] = [
-    Port.DLY,  # route[0]  DAC ← DLY
+    Port.REV,  # route[0]  DAC ← REV
     Port.CHO,  # route[1]  TRM ← CHO
     Port.TUB,  # route[2]  PHA ← TUB
     Port.FLN,  # route[3]  CHO ← FLN
@@ -93,6 +94,7 @@ DEFAULT_ROUTE: list[int] = [
     Port.BMF,  # route[5]  TUB ← BMF
     Port.PHA,  # route[6]  FLN ← PHA
     Port.ADC,  # route[7]  BMF ← ADC
+    Port.DLY,  # route[8]  REV ← DLY
 ]
 
 ROUTE_ADDR_BASE = 0x40  # ctrl_bus base address for route registers
@@ -182,6 +184,7 @@ class EffectSlot:
     params: list[Param]
     bypass_addr: int
     bypassed: bool = True
+    disabled: bool = False
     selected_param: int = 0
 
     @property
@@ -219,31 +222,34 @@ EFFECT_DEFS: list[EffectSlot] = [
                ],
                bypass_addr=0x17),
     EffectSlot("dly",
-               "Delay (DD3)",
+               "Timeline Delay",
                Port.DLY, [
-                   Param("ton", "Tone", 0x18, 0xFF),
-                   Param("lvl", "Level", 0x19, 0x80),
-                   Param("fdb", "Feedback", 0x1A, 0x64),
+                   Param("rpt", "Repeats", 0x18, 0x64),
+                   Param("mix", "Mix", 0x19, 0x80),
+                   Param("flt", "Filter", 0x1A, 0xFF),
                    Param16("tim", "Time", 0x1B, 0x3000),
+                   Param("mod", "Mod", 0x1D, 0x00),
+                   Param("grt", "Grit", 0x1E, 0x00),
                ],
                bypass_addr=0x1F),
     EffectSlot("tub",
                "Tube Distortion",
                Port.TUB, [
-                   Param("gai", "Gain", 0x20, 0x40),
+                   Param("gai", "Gain", 0x20, 0x60),
                    Param("bas", "Tone Bass", 0x21, 0x80),
                    Param("mid", "Tone Mid", 0x22, 0x80),
                    Param("tre", "Tone Treble", 0x23, 0x80),
-                   Param("lvl", "Level", 0x24, 0xA0),
+                   Param("lvl", "Level", 0x24, 0xC0),
                ],
                bypass_addr=0x27),
     EffectSlot("fln",
                "Flanger",
                Port.FLN, [
-                   Param("man", "Manual", 0x28, 0x80),
-                   Param("wid", "Width", 0x29, 0xC0),
+                   Param("man", "Manual", 0x28, 0x40),
+                   Param("wid", "Width", 0x29, 0x80),
                    Param("spd", "Speed", 0x2A, 0x30),
-                   Param("reg", "Regen", 0x2B, 0xA0),
+                   Param("reg", "Regen", 0x2B, 0x90),
+                   Param("mix", "Mix", 0x2C, 0x60),
                ],
                bypass_addr=0x2F),
     EffectSlot("bmf",
@@ -254,6 +260,17 @@ EFFECT_DEFS: list[EffectSlot] = [
                    Param("vol", "Volume", 0x32, 0xA0),
                ],
                bypass_addr=0x37),
+    EffectSlot("rev",
+               "BigSky Reverb",
+               Port.REV, [
+                   Param("dec", "Decay", 0x38, 0x80),
+                   Param("dmp", "Damping", 0x39, 0x60),
+                   Param("mix", "Mix", 0x3A, 0x60),
+                   Param("pre", "Pre-delay", 0x3B, 0x20),
+                   Param("ton", "Tone", 0x3C, 0x80),
+                   Param("lvl", "Level", 0x3D, 0x80),
+               ],
+               bypass_addr=0x3F),
 ]
 
 
@@ -389,6 +406,10 @@ class SerialLink:
     def raw_write(self, addr: int, data: int) -> str:
         return self._send(f"wr {addr:02X}{data:02X}")
 
+    def chain(self, tags: list[str]) -> str:
+        """Send ``chain <tag1> <tag2> ...`` — redefine signal chain."""
+        return self._send(f"chain {' '.join(tags)}")
+
     def request_status(self) -> str:
         """Send ';' and read the full status dump until the '>' prompt.
 
@@ -437,7 +458,7 @@ class SerialLink:
 # ║    FLN man:80 wid:C0 spd:30 reg:A0                                     ║
 # ║    CHO rat:50 dep:64 efx:80 eqh:C8 eql:80                              ║
 # ║    TRM rat:3C dep:B4 shp:00                                             ║
-# ║    DLY ton:FF lvl:80 fdb:64 tim:3000                                    ║
+# ║    DLY rpt:64 mix:80 flt:FF tim:3000 mod:00 grt:00                      ║
 # ║                                                                         ║
 # ║  The route line is always present.  Effect lines are only printed       ║
 # ║  for effects that are NOT bypassed — omitted effects are bypassed.      ║
@@ -454,6 +475,7 @@ _ROUTE_NAME_PORT: dict[str, int] = {
     "TUB": Port.TUB,
     "FLN": Port.FLN,
     "BMF": Port.BMF,
+    "REV": Port.REV,
     "DAC": 0,
 }
 
@@ -489,10 +511,20 @@ def parse_status(raw: str, slot_dict: dict[str, EffectSlot],
 
     # ── Determine which effects appeared (= active / not bypassed) ──
     seen_tags: set[str] = set()
+    disabled_tags: set[str] = set()
 
     for line in lines:
         if "<" in line and ":" not in line:
             continue  # skip route line
+
+        # "--- TAG" → disabled effect (not in chain)
+        if line.startswith("---"):
+            tag = line[4:].strip().lower()
+            if tag in slot_dict:
+                disabled_tags.add(tag)
+                seen_tags.add(tag)
+            continue
+
         if ":" not in line:
             continue
 
@@ -524,9 +556,17 @@ def parse_status(raw: str, slot_dict: dict[str, EffectSlot],
             except ValueError:
                 pass
 
-    # ── Update bypass state ──
+    # ── Update bypass / disabled state ──
     for tag, slot in slot_dict.items():
-        slot.bypassed = tag not in seen_tags
+        if tag in disabled_tags:
+            slot.disabled = True
+            slot.bypassed = False
+        elif tag in seen_tags:
+            slot.disabled = False
+            slot.bypassed = False
+        else:
+            slot.disabled = False
+            slot.bypassed = True
 
     return route_parsed
 
@@ -626,16 +666,24 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
     w = SLOT_WIDTH
 
     # Determine header style
-    if is_active:
+    if slot.disabled:
+        hdr = _cp(Color.BYPASSED)
+    elif is_active:
         hdr = _cp(Color.HEADER, bold=True)
     elif slot.bypassed:
         hdr = _cp(Color.BYPASSED)
     else:
         hdr = _cp(Color.ACTIVE, bold=True)
 
-    byp_text = " ON" if not slot.bypassed else "OFF"
-    byp_attr = _cp(Color.ACTIVE, bold=True) if not slot.bypassed \
-               else _cp(Color.WARN)
+    if slot.disabled:
+        byp_text = "---"
+        byp_attr = _cp(Color.BYPASSED)
+    elif not slot.bypassed:
+        byp_text = " ON"
+        byp_attr = _cp(Color.ACTIVE, bold=True)
+    else:
+        byp_text = "OFF"
+        byp_attr = _cp(Color.WARN)
 
     # Header row:  + NAME               ON +
     name_w = w - 2 - 4  # 4 chars for bypass tag + space
@@ -646,11 +694,11 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
 
     # Parameter rows
     for i, p in enumerate(slot.params):
-        is_sel = is_active and i == slot.selected_param
+        is_sel = is_active and i == slot.selected_param and not slot.disabled
         if is_sel:
             attr = _cp(Color.SELECTED, bold=True)
             marker = ">"
-        elif slot.bypassed:
+        elif slot.disabled or slot.bypassed:
             attr = _cp(Color.BYPASSED)
             marker = " "
         else:
@@ -690,7 +738,7 @@ def draw_title(scr, max_x: int, port: str, baud: int, connected: bool) -> None:
 def draw_chain(scr, slots: list[EffectSlot]) -> None:
     chain = "ADC"
     for s in slots:
-        if not s.bypassed:
+        if not s.disabled and not s.bypassed:
             chain += f">{s.tag}"
     chain += ">DAC"
     _safe(scr, 1, 1, "Chain: ", _cp(Color.HELP))
@@ -723,6 +771,33 @@ def draw_connection_editor(scr, con_sink: int, con_src: int,
             attr = _cp(Color.NORMAL)
         _safe(scr, 2, sx, f" {node.upper()} ", attr)
         sx += 5
+
+
+def draw_chain_editor(scr, st: "AppState") -> None:
+    """Draw the chain editor on rows 1-2."""
+    _safe(scr, 1, 1, "CHAIN EDIT ", _cp(Color.WARN, bold=True))
+    cx = 13
+    all_tags = [s.tag for s in EFFECT_DEFS]
+    # Show chain effects in order, then disabled ones
+    active = [t for t in st.chain_order if t not in st.chain_disabled_set]
+    disabled = [t for t in all_tags if t in st.chain_disabled_set]
+    display = active + disabled
+    for i, tag in enumerate(display):
+        is_disabled = tag in st.chain_disabled_set
+        is_cursor = (i == st.chain_cursor)
+        if is_cursor:
+            attr = _cp(Color.SELECTED, bold=True)
+        elif is_disabled:
+            attr = _cp(Color.BYPASSED)
+        else:
+            attr = _cp(Color.ACTIVE, bold=True)
+        _safe(scr, 1, cx, f" {tag.upper()} ", attr)
+        cx += 5
+        if i == len(active) - 1 and disabled:
+            _safe(scr, 1, cx, "|", _cp(Color.NORMAL))
+            cx += 2
+    _safe(scr, 2, 1, " ^v:select  u/d:move  SPC:toggle  Enter:apply  ESC:cancel ",
+          _cp(Color.HELP))
 
 
 def compute_two_col_layout(
@@ -792,14 +867,16 @@ def draw_help_bar(scr, max_y: int, max_x: int, mode: "InputMode", raw_buf: str,
                   raw_field: int) -> None:
     if mode == InputMode.CONNECTION:
         text = " CON | </>:sink  ^/v:source  Enter:apply  ESC:cancel "
+    elif mode == InputMode.CHAIN_EDIT:
+        text = " CHAIN | ^v:select  u/d:move  SPC:toggle  Enter:apply  ESC:cancel "
     elif mode == InputMode.RAW_WRITE:
         if raw_field == 0:
             text = f" RAW | Addr: {raw_buf}_ | 2 hex, Enter=next, ESC=cancel "
         else:
             text = f" RAW | {raw_buf[:2]}:{raw_buf[2:]}_ | 2 hex, Enter=send "
     else:
-        text = (" TAB:slot ^v:prm <>:+-1 PgU/D:+-16"
-                "  SPC:byp o:ON f:OFF c:con s:stat w:raw q:quit ")
+        text = (" TAB:slot hjkl:nav ^v:prm <>:+-1 PgU/D:+-16"
+                "  SPC:byp c:con o:chain s:stat w:raw q:quit ")
     _safe(scr, max_y - 1, 0, text[:max_x - 1].ljust(max_x - 1),
           _cp(Color.TITLE))
 
@@ -813,6 +890,7 @@ class InputMode(IntEnum):
     NORMAL = auto()
     RAW_WRITE = auto()
     CONNECTION = auto()
+    CHAIN_EDIT = auto()
 
 
 @dataclass
@@ -836,6 +914,11 @@ class AppState:
     # connection editor sub-mode
     con_sink: int = 0  # index into SINK_NODES
     con_src: int = 0  # index into SOURCE_NODES
+
+    # chain editor sub-mode
+    chain_order: list[str] = field(default_factory=list)
+    chain_disabled_set: set[str] = field(default_factory=set)
+    chain_cursor: int = 0
 
     running: bool = True
 
@@ -867,6 +950,37 @@ class AppState:
         self.con_sink = 0
         self.con_src = self._current_src_for_sink()
         self.flash("Connection editor: pick sink then source")
+
+    def enter_chain_mode(self) -> None:
+        self.mode = InputMode.CHAIN_EDIT
+        chain_ports = trace_chain(self.route)
+        self.chain_order = [PORT_TAG[p] for p in chain_ports
+                            if PORT_TAG.get(p, "adc") in self.slot_dict]
+        all_tags = [s.tag for s in EFFECT_DEFS]
+        in_chain = set(self.chain_order)
+        self.chain_disabled_set = {t for t in all_tags if t not in in_chain}
+        self.chain_cursor = 0
+        self.flash("Chain: ^v select, u/d move, SPC toggle, Enter apply, ESC cancel")
+
+    def apply_chain(self) -> None:
+        """Send chain command and update local route table."""
+        active = [t for t in self.chain_order
+                  if t not in self.chain_disabled_set]
+        if not active:
+            self.flash("Chain must have at least one effect")
+            return
+        self.link.chain(active)
+        # Update local route
+        ports = [TAG_PORT[t] for t in active]
+        for i, p in enumerate(ports):
+            if p < len(self.route):
+                self.route[p] = Port.ADC if i == 0 else ports[i - 1]
+        self.route[0] = ports[-1]
+        # Update disabled state on slots
+        for tag, slot in self.slot_dict.items():
+            slot.disabled = tag in self.chain_disabled_set
+        self.mode = InputMode.NORMAL
+        self.flash(f"Chain: {' > '.join(t.upper() for t in active)}")
 
     def enter_raw_write_mode(self) -> None:
         self.mode = InputMode.RAW_WRITE
@@ -938,25 +1052,38 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
         st.link.set_bypass(slot, not slot.bypassed)
         st.flash(f"{slot.full_name}: {'ON' if not slot.bypassed else 'OFF'}")
 
-    elif ch in (ord('o'), ord('O')):
-        if slot.bypassed:
-            slot.bypassed = False
-            st.link.set_bypass(slot, True)
-            st.flash(f"{slot.full_name}: ON")
-        else:
-            st.flash(f"{slot.full_name}: already ON")
+    # ── hjkl vim navigation (2-column grid) ──
+    elif ch in (ord('j'), ord('J'), ord('k'), ord('K'),
+                ord('h'), ord('H'), ord('l'), ord('L')):
+        mid = (n + 1) // 2  # same split as compute_two_col_layout
+        col = 0 if ai < mid else 1
+        row = ai if col == 0 else ai - mid
+        left_len = mid
+        right_len = n - mid
 
-    elif ch in (ord('f'), ord('F')):
-        if not slot.bypassed:
-            slot.bypassed = True
-            st.link.set_bypass(slot, False)
-            st.flash(f"{slot.full_name}: OFF")
-        else:
-            st.flash(f"{slot.full_name}: already OFF")
+        if ch in (ord('j'), ord('J')):
+            col_len = left_len if col == 0 else right_len
+            row = (row + 1) % col_len
+        elif ch in (ord('k'), ord('K')):
+            col_len = left_len if col == 0 else right_len
+            row = (row - 1) % col_len
+        elif ch in (ord('l'), ord('L')):
+            if col == 0 and right_len > 0:
+                col = 1
+                row = min(row, right_len - 1)
+        elif ch in (ord('h'), ord('H')):
+            if col == 1:
+                col = 0
+                row = min(row, left_len - 1)
+
+        new_ai = row if col == 0 else mid + row
+        st.active_tag = slots[new_ai].tag
 
     # ── mode switches ──
     elif ch in (ord('c'), ord('C')):
         st.enter_connection_mode()
+    elif ch in (ord('o'), ord('O')):
+        st.enter_chain_mode()
     elif ch in (ord('w'), ord('W')):
         st.enter_raw_write_mode()
     elif ch in (ord('s'), ord('S')):
@@ -1016,7 +1143,7 @@ def _handle_raw_write(ch: int, st: AppState) -> None:
                 return
             st.link.raw_write(addr, data)
             # Keep local route table in sync
-            if ROUTE_ADDR_BASE <= addr <= ROUTE_ADDR_BASE + 7:
+            if ROUTE_ADDR_BASE <= addr <= ROUTE_ADDR_BASE + 8:
                 st.update_route(addr - ROUTE_ADDR_BASE, data)
                 st.flash(f"wr {addr:02X}{data:02X} (route updated)")
             else:
@@ -1037,6 +1164,62 @@ def _handle_raw_write(ch: int, st: AppState) -> None:
         c = chr(ch) if 0 <= ch < 256 else ""
         if c in HEX_CHARS and len(st.raw_buf) < 4:
             st.raw_buf += c.upper()
+
+
+def _handle_chain_edit(ch: int, st: AppState) -> None:
+    """Process a keypress in CHAIN_EDIT mode."""
+    all_tags = [s.tag for s in EFFECT_DEFS]
+    active = [t for t in st.chain_order if t not in st.chain_disabled_set]
+    disabled = [t for t in all_tags if t in st.chain_disabled_set]
+    display = active + disabled
+    n = len(display)
+    if n == 0:
+        st.mode = InputMode.NORMAL
+        return
+
+    if ch == 27:
+        st.mode = InputMode.NORMAL
+        st.flash("Chain edit cancelled")
+
+    elif ch == curses.KEY_UP:
+        st.chain_cursor = (st.chain_cursor - 1) % n
+
+    elif ch == curses.KEY_DOWN:
+        st.chain_cursor = (st.chain_cursor + 1) % n
+
+    elif ch in (ord('u'), ord('U')):
+        # Move selected effect up in chain order
+        if st.chain_cursor < len(active) and st.chain_cursor > 0:
+            tag = display[st.chain_cursor]
+            idx = st.chain_order.index(tag)
+            if idx > 0:
+                st.chain_order[idx - 1], st.chain_order[idx] = \
+                    st.chain_order[idx], st.chain_order[idx - 1]
+                st.chain_cursor -= 1
+
+    elif ch in (ord('d'), ord('D')):
+        # Move selected effect down in chain order
+        if st.chain_cursor < len(active) - 1:
+            tag = display[st.chain_cursor]
+            idx = st.chain_order.index(tag)
+            if idx < len(st.chain_order) - 1:
+                st.chain_order[idx], st.chain_order[idx + 1] = \
+                    st.chain_order[idx + 1], st.chain_order[idx]
+                st.chain_cursor += 1
+
+    elif ch == ord(' '):
+        # Toggle effect in/out of chain
+        tag = display[st.chain_cursor]
+        if tag in st.chain_disabled_set:
+            st.chain_disabled_set.discard(tag)
+            if tag not in st.chain_order:
+                st.chain_order.append(tag)
+        else:
+            if len(active) > 1:  # keep at least one
+                st.chain_disabled_set.add(tag)
+
+    elif ch in ENTER_KEYS:
+        st.apply_chain()
 
 
 # ╔═══════════════════════════════════════════════════════════════════════════╗
@@ -1091,6 +1274,8 @@ def main(stdscr, args: argparse.Namespace) -> None:
 
         if st.mode == InputMode.CONNECTION:
             draw_connection_editor(stdscr, st.con_sink, st.con_src, st.route)
+        elif st.mode == InputMode.CHAIN_EDIT:
+            draw_chain_editor(stdscr, st)
         else:
             draw_chain(stdscr, slots)
 
@@ -1128,6 +1313,8 @@ def main(stdscr, args: argparse.Namespace) -> None:
             _handle_connection(ch, st)
         elif st.mode == InputMode.RAW_WRITE:
             _handle_raw_write(ch, st)
+        elif st.mode == InputMode.CHAIN_EDIT:
+            _handle_chain_edit(ch, st)
         else:
             _handle_normal(ch, st, slots, ai)
 

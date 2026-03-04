@@ -12,14 +12,14 @@
 //   Biquad:       Q2.COEFF_FRAC coefficients      e.g. Q2.22
 //
 // Controls (CTRL_W-bit unsigned, default 8):
-//   manual_val, width_val, speed_val, regen_val
+//   manual_val, width_val, speed_val, regen_val, mix_val
 
 module flanger #(
     parameter int WIDTH      = 24,   // Audio sample width (signed Q1.(WIDTH-1))
     parameter int CTRL_W     = 8,    // Control knob width (unsigned)
     parameter int LFO_W      = 16,   // LFO output width (signed Q1.(LFO_W-1))
-    parameter int MAX_DELAY  = 240,  // 5 ms @ 48 kHz
-    parameter int MIN_DELAY  = 12,   // 0.25 ms @ 48 kHz
+    parameter int MAX_DELAY  = 256,  // 5.33 ms @ 48 kHz  (must be power of 2)
+    parameter int MIN_DELAY  = 16,   // 0.33 ms @ 48 kHz
     parameter int LFO_ACC_W  = 28,   // LFO phase accumulator width
     parameter int FRAC_W     = 10,   // Fractional delay bits for interpolation
     parameter int COEFF_W    = 24,   // Biquad coefficient width
@@ -35,7 +35,8 @@ module flanger #(
     input logic [CTRL_W-1:0] manual_val,
     input logic [CTRL_W-1:0] width_val,
     input logic [CTRL_W-1:0] speed_val,
-    input logic [CTRL_W-1:0] regen_val
+    input logic [CTRL_W-1:0] regen_val,
+    input logic [CTRL_W-1:0] mix_val
 );
 
   // =========================================================================
@@ -61,13 +62,13 @@ module flanger #(
   // =========================================================================
   // BBD Reconstruction LPF coefficients (Q2.COEFF_FRAC)
   //
-  // 2nd-order Butterworth, Fc = 6 kHz, Fs = 48 kHz
+  // 2nd-order Butterworth, Fc = 12 kHz (fs/4), Fs = 48 kHz
   // Quantised to Q2.COEFF_FRAC (range ±2.0):
-  localparam logic signed [COEFF_W-1:0] LPF_B0     =  COEFF_W'(int'( 0.09763107 * (2.0**COEFF_FRAC)));
-  localparam logic signed [COEFF_W-1:0] LPF_B1     =  COEFF_W'(int'( 0.19526215 * (2.0**COEFF_FRAC)));
-  localparam logic signed [COEFF_W-1:0] LPF_B2     =  COEFF_W'(int'( 0.09763107 * (2.0**COEFF_FRAC)));
-  localparam logic signed [COEFF_W-1:0] LPF_A1_NEG =  COEFF_W'(int'( 0.94280904 * (2.0**COEFF_FRAC)));
-  localparam logic signed [COEFF_W-1:0] LPF_A2_NEG = -COEFF_W'(int'( 0.33333333 * (2.0**COEFF_FRAC)));
+  localparam logic signed [COEFF_W-1:0] LPF_B0     =  COEFF_W'(int'( 0.29289 * (2.0**COEFF_FRAC)));
+  localparam logic signed [COEFF_W-1:0] LPF_B1     =  COEFF_W'(int'( 0.58579 * (2.0**COEFF_FRAC)));
+  localparam logic signed [COEFF_W-1:0] LPF_B2     =  COEFF_W'(int'( 0.29289 * (2.0**COEFF_FRAC)));
+  localparam logic signed [COEFF_W-1:0] LPF_A1_NEG =  COEFF_W'(int'( 0.0     * (2.0**COEFF_FRAC)));
+  localparam logic signed [COEFF_W-1:0] LPF_A2_NEG = -COEFF_W'(int'( 0.17157 * (2.0**COEFF_FRAC)));
 
   // =========================================================================
   // LFO - Triangle wave via lfo_core
@@ -167,16 +168,10 @@ module flanger #(
   logic signed [WIDTH-1:0]  tap_a, tap_b;                   // Q1.AUDIO_FRAC
   logic signed [WIDTH-1:0]  wet_interp;                      // Q1.AUDIO_FRAC
 
+  // PoT depth: natural unsigned subtraction wraps correctly
   always_comb begin
-    if (wr_ptr >= delay_int)
-      rd_ptr_a = wr_ptr - delay_int;
-    else
-      rd_ptr_a = wr_ptr + ADDR_W'(MAX_DELAY) - delay_int;
-
-    if (wr_ptr >= delay_int + ADDR_W'(1))
-      rd_ptr_b = wr_ptr - delay_int - ADDR_W'(1);
-    else
-      rd_ptr_b = wr_ptr + ADDR_W'(MAX_DELAY) - delay_int - ADDR_W'(1);
+    rd_ptr_a = wr_ptr - delay_int;
+    rd_ptr_b = wr_ptr - delay_int - ADDR_W'(1);
   end
 
   delay_line #(
@@ -246,13 +241,20 @@ module flanger #(
   );
 
   // =========================================================================
-  // Output mix: (dry + wet_filtered) >>> 1  (50/50)
+  // Output mix: dry + wet_scaled  (additive — body always preserved)
+  //
+  // mix_val=0x00: pure dry
+  // mix_val=0x60: dry + 37.5% wet (default)
+  // mix_val=0xFF: dry + ~100% wet (maximum depth)
   // =========================================================================
+  logic signed [INT_W-1:0] wet_scaled;                       // Q1.AUDIO_FRAC + guard
   logic signed [INT_W-1:0] mix;                              // Q1.AUDIO_FRAC + guard
   logic signed [WIDTH-1:0] mix_sat;                          // Q1.AUDIO_FRAC
 
   always_comb begin
-    mix = (INT_W'(signed'(audio_in)) + INT_W'(signed'(wet_filtered))) >>> 1;
+    wet_scaled = INT_W'((longint'(wet_filtered) * longint'(mix_val)
+                         + longint'(1 << (CTRL_W-1))) >>> CTRL_W);
+    mix = INT_W'(signed'(audio_in)) + wet_scaled;
   end
 
   saturate #(.IN_W(INT_W), .OUT_W(WIDTH)) u_sat_mix (

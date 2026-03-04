@@ -6,7 +6,7 @@
 // pack/unpack wires and a sample_en edge detect, matching the proven
 // original design's I2S interface exactly.
 //
-// Symmetric 8-port crossbar (N_XBAR = N_SLOTS + 1 = 8):
+// Symmetric 9-port crossbar (N_XBAR = N_SLOTS + 1 = 9):
 //
 //   Port  Master (source)          Slave (sink)
 //   ----  ----------------------   ----------------------
@@ -14,22 +14,23 @@
 //    1    Slot 0 (tremolo)         Slot 0 input
 //    2    Slot 1 (phaser)          Slot 1 input
 //    3    Slot 2 (chorus)          Slot 2 input
-//    4    Slot 3 (dd3 delay)       Slot 3 input
+//    4    Slot 3 (delay)           Slot 3 input
 //    5    Slot 4 (tube_distortion) Slot 4 input
 //    6    Slot 5 (flanger)         Slot 5 input
 //    7    Slot 6 (big_muff)        Slot 6 input
+//    8    Slot 7 (reverb)          Slot 7 input
 //
 // Default linear chain:
 //   route[7]=0 BMF←ADC  route[5]=7 TUB←BMF  route[2]=5 PHA←TUB
 //   route[6]=2 FLN←PHA  route[3]=6 CHO←FLN  route[1]=3 TRM←CHO
-//   route[4]=1 DLY←TRM  route[0]=4 DAC←DLY
+//   route[4]=1 DLY←TRM  route[8]=4 REV←DLY  route[0]=8 DAC←REV
 //
 // Bypass is software-controlled via "set <efx> on/off" CLI commands.
 // Each slot reads its own bypass bit from cfg_slice[7][0] (no sw_effect port).
 // ============================================================================
 
 module top #(
-    parameter int N_SLOTS  = 7,
+    parameter int N_SLOTS  = 8,
     parameter int REGS_PER = 8,
     parameter int REG_W    = 8
 ) (
@@ -252,7 +253,7 @@ module top #(
   end
 
   // =========================================================================
-  // Crossbar (5 symmetric ports)
+  // Crossbar (9 symmetric ports)
   // =========================================================================
   logic [47:0] xbar_m_tdata [N_XBAR];
   logic        xbar_m_tvalid[N_XBAR];
@@ -287,9 +288,7 @@ module top #(
   // =========================================================================
   // Effect Slots
   // =========================================================================
-  localparam int EFFECT_TYPES[N_SLOTS] = '{0, 1, 2, 3, 4, 5, 6};
-  localparam int TUBE_LUT_ADDR = 12;  // 4096-entry 12AX7 LUT
-  localparam int TUBE_FRAC_W = 12;  // interpolation fraction bits
+  localparam int EFFECT_TYPES[N_SLOTS] = '{0, 1, 2, 3, 4, 5, 6, 7};
 
   for (genvar i = 0; i < N_SLOTS; i++) begin : gen_slot
     axis_effect_slot #(
@@ -300,9 +299,7 @@ module top #(
         .CTRL_W          (REG_W),
         .AUDIO_W         (24),
         .CHORUS_DELAY_MAX(2048),
-        .DD3_RAM_DEPTH   (65536),
-        .TUBE_LUT_ADDR   (TUBE_LUT_ADDR),
-        .TUBE_FRAC_W     (TUBE_FRAC_W)
+        .DELAY_RAM_DEPTH (65536)
     ) slot_inst (
         .clk          (clk_audio),
         .rst_n        (rst_audio_n),
