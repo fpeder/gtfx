@@ -796,7 +796,7 @@ def draw_chain_editor(scr, st: "AppState") -> None:
         if i == len(active) - 1 and disabled:
             _safe(scr, 1, cx, "|", _cp(Color.NORMAL))
             cx += 2
-    _safe(scr, 2, 1, " ^v:select  u/d:move  SPC:toggle  Enter:apply  ESC:cancel ",
+    _safe(scr, 2, 1, " UP/DN:sel  u/d:move  SPC:toggle  Enter:apply  ESC:cancel ",
           _cp(Color.HELP))
 
 
@@ -866,16 +866,16 @@ def draw_status(scr, y: int, max_x: int, msg: str, msg_time: float,
 def draw_help_bar(scr, max_y: int, max_x: int, mode: "InputMode", raw_buf: str,
                   raw_field: int) -> None:
     if mode == InputMode.CONNECTION:
-        text = " CON | </>:sink  ^/v:source  Enter:apply  ESC:cancel "
+        text = " CON | </>:sink  UP/DN:src  Enter:apply  ESC:cancel "
     elif mode == InputMode.CHAIN_EDIT:
-        text = " CHAIN | ^v:select  u/d:move  SPC:toggle  Enter:apply  ESC:cancel "
+        text = " CHAIN | UP/DN:sel  u/d:move  SPC:toggle  Enter:apply  ESC:cancel "
     elif mode == InputMode.RAW_WRITE:
         if raw_field == 0:
             text = f" RAW | Addr: {raw_buf}_ | 2 hex, Enter=next, ESC=cancel "
         else:
             text = f" RAW | {raw_buf[:2]}:{raw_buf[2:]}_ | 2 hex, Enter=send "
     else:
-        text = (" TAB:slot hjkl:nav ^v:prm <>:+-1 PgU/D:+-16"
+        text = (" TAB:slot hjkl:nav UP/DN:prm <>:+-1 PgU/D:+-16"
                 "  SPC:byp c:con o:chain s:stat w:raw q:quit ")
     _safe(scr, max_y - 1, 0, text[:max_x - 1].ljust(max_x - 1),
           _cp(Color.TITLE))
@@ -1188,8 +1188,15 @@ def _handle_chain_edit(ch: int, st: AppState) -> None:
         st.chain_cursor = (st.chain_cursor + 1) % n
 
     elif ch in (ord('u'), ord('U')):
-        # Move selected effect up in chain order
-        if st.chain_cursor < len(active) and st.chain_cursor > 0:
+        if st.chain_cursor >= len(active):
+            # Re-enable disabled effect, insert at end of active
+            tag = display[st.chain_cursor]
+            st.chain_disabled_set.discard(tag)
+            if tag not in st.chain_order:
+                st.chain_order.append(tag)
+            new_active = [t for t in st.chain_order if t not in st.chain_disabled_set]
+            st.chain_cursor = len(new_active) - 1
+        elif st.chain_cursor > 0:
             tag = display[st.chain_cursor]
             idx = st.chain_order.index(tag)
             if idx > 0:
@@ -1198,8 +1205,15 @@ def _handle_chain_edit(ch: int, st: AppState) -> None:
                 st.chain_cursor -= 1
 
     elif ch in (ord('d'), ord('D')):
-        # Move selected effect down in chain order
-        if st.chain_cursor < len(active) - 1:
+        if st.chain_cursor >= len(active):
+            # Re-enable disabled effect, insert at end of active
+            tag = display[st.chain_cursor]
+            st.chain_disabled_set.discard(tag)
+            if tag not in st.chain_order:
+                st.chain_order.append(tag)
+            new_active = [t for t in st.chain_order if t not in st.chain_disabled_set]
+            st.chain_cursor = len(new_active) - 1
+        elif st.chain_cursor < len(active) - 1:
             tag = display[st.chain_cursor]
             idx = st.chain_order.index(tag)
             if idx < len(st.chain_order) - 1:
@@ -1217,6 +1231,12 @@ def _handle_chain_edit(ch: int, st: AppState) -> None:
         else:
             if len(active) > 1:  # keep at least one
                 st.chain_disabled_set.add(tag)
+        # Recompute display and follow the item
+        new_active = [t for t in st.chain_order if t not in st.chain_disabled_set]
+        new_disabled = [t for t in all_tags if t in st.chain_disabled_set]
+        new_display = new_active + new_disabled
+        if tag in new_display:
+            st.chain_cursor = new_display.index(tag)
 
     elif ch in ENTER_KEYS:
         st.apply_chain()
