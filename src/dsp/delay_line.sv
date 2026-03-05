@@ -115,12 +115,10 @@ module delay_line #(
     // ====================================================================
     // Buffer storage
     //
-    // The ram_style attribute hints for block RAM when REG_RD=1 (large
-    // buffers with registered reads).  Synthesis tools ignore the hint
-    // when the array is too small for BRAM, so it is safe to apply
-    // unconditionally.
+    // No ram_style attribute — Vivado infers BRAM automatically when
+    // REG_RD=1 (registered reads).  Forcing "block" on combinational-read
+    // instances causes infeasible-attribute warnings.
     // ====================================================================
-    (* ram_style = "block" *)
     logic signed [DATA_W-1:0] mem [0:DEPTH-1];
 
     initial begin

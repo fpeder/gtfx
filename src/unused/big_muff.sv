@@ -68,41 +68,49 @@ module big_muff #(
   localparam signed [WIDTH-1:0] CLIP_PEAK = signed'(WIDTH'(1 << (WIDTH - 2)));            // 0.50 FS
 
   // =========================================================================
-  // Filter coefficients - all Q4.20 (COEFF_W=24, FRAC=20)
+  // Filter coefficients - Q4.14 (COEFF_W=18, FRAC=14)
+  // 18-bit coefficients fit in a single DSP48E1 (25×18 signed multiply).
   // =========================================================================
-  // Computed via 2nd-order Butterworth cookbook formulae, verified in Python.
-  localparam int COEFF_W = 24;
-  localparam int FRAC    = 20;
+  localparam int COEFF_W = 18;
+  localparam int FRAC    = 14;
 
   // --- Post-clip smoothing: 2nd-order Butterworth LPF, Fc = 10 kHz ---
-  // Models the feedback-network capacitors in each clipping stage.
-  // Response: -0.1 dB @ 4 kHz, -3 dB @ 10 kHz, -14 dB @ 16 kHz.
-  //
   //   b0 =  0.2201947003  b1 =  0.4403894005  b2 =  0.2201947003
   //   a1 = -0.3075663598  a2 =  0.1883451609
-  localparam logic signed [COEFF_W-1:0] SM_B0     =  24'sd230891;    //  0.2201947003 * 2^20
-  localparam logic signed [COEFF_W-1:0] SM_B1     =  24'sd461782;    //  0.4403894005 * 2^20
-  localparam logic signed [COEFF_W-1:0] SM_B2     =  24'sd230891;    //  0.2201947003 * 2^20
-  localparam logic signed [COEFF_W-1:0] SM_A1_NEG =  24'sd322507;    //  0.3075663598 * 2^20
-  localparam logic signed [COEFF_W-1:0] SM_A2_NEG = -24'sd197494;    // -0.1883451609 * 2^20
+  localparam logic signed [COEFF_W-1:0] SM_B0     =  18'sd3608;
+  localparam logic signed [COEFF_W-1:0] SM_B1     =  18'sd7215;
+  localparam logic signed [COEFF_W-1:0] SM_B2     =  18'sd3608;
+  localparam logic signed [COEFF_W-1:0] SM_A1_NEG =  18'sd5039;
+  localparam logic signed [COEFF_W-1:0] SM_A2_NEG = -18'sd3086;
 
   // --- Tone LP: 2nd-order Butterworth LPF, Fc = 1200 Hz ---
   //   b0 =  0.0055427172  b1 =  0.0110854344  b2 =  0.0055427172
   //   a1 = -1.7786317778  a2 =  0.8008026467
-  localparam logic signed [COEFF_W-1:0] LP_B0     =  24'sd5812;
-  localparam logic signed [COEFF_W-1:0] LP_B1     =  24'sd11624;
-  localparam logic signed [COEFF_W-1:0] LP_B2     =  24'sd5812;
-  localparam logic signed [COEFF_W-1:0] LP_A1_NEG =  24'sd1865031;
-  localparam logic signed [COEFF_W-1:0] LP_A2_NEG = -24'sd839702;
+  localparam logic signed [COEFF_W-1:0] LP_B0     =  18'sd91;
+  localparam logic signed [COEFF_W-1:0] LP_B1     =  18'sd182;
+  localparam logic signed [COEFF_W-1:0] LP_B2     =  18'sd91;
+  localparam logic signed [COEFF_W-1:0] LP_A1_NEG =  18'sd29141;
+  localparam logic signed [COEFF_W-1:0] LP_A2_NEG = -18'sd13120;
 
   // --- Tone HP: 2nd-order Butterworth HPF, Fc = 1000 Hz ---
   //   b0 =  0.9115866680  b1 = -1.8231733360  b2 =  0.9115866680
   //   a1 = -1.8153410827  a2 =  0.8310055893
-  localparam logic signed [COEFF_W-1:0] HP_B0     =  24'sd955868;
-  localparam logic signed [COEFF_W-1:0] HP_B1     = -24'sd1911736;
-  localparam logic signed [COEFF_W-1:0] HP_B2     =  24'sd955868;
-  localparam logic signed [COEFF_W-1:0] HP_A1_NEG =  24'sd1903523;
-  localparam logic signed [COEFF_W-1:0] HP_A2_NEG = -24'sd871373;
+  localparam logic signed [COEFF_W-1:0] HP_B0     =  18'sd14935;
+  localparam logic signed [COEFF_W-1:0] HP_B1     = -18'sd29871;
+  localparam logic signed [COEFF_W-1:0] HP_B2     =  18'sd14935;
+  localparam logic signed [COEFF_W-1:0] HP_A1_NEG =  18'sd29743;
+  localparam logic signed [COEFF_W-1:0] HP_A2_NEG = -18'sd13615;
+
+  // --- Input HPF: 2nd-order Butterworth HPF, Fc = 80 Hz (Q4.20) ---
+  // Blocks DC offset from ADC before high-gain stages.
+  // Same coefficients as tube_distortion u_hpf.
+  localparam int HPF_CW   = 24;
+  localparam int HPF_FRAC = 20;
+  localparam logic signed [HPF_CW-1:0] HPF_B0     =  24'sd1040840;
+  localparam logic signed [HPF_CW-1:0] HPF_B1     = -24'sd2081680;
+  localparam logic signed [HPF_CW-1:0] HPF_B2     =  24'sd1040840;
+  localparam logic signed [HPF_CW-1:0] HPF_A1_NEG =  24'sd2081623;
+  localparam logic signed [HPF_CW-1:0] HPF_A2_NEG = -24'sd1033161;
 
   // =========================================================================
   // Per-stage gain from sustain knob
@@ -121,6 +129,28 @@ module big_muff #(
   end
 
   // =========================================================================
+  // Input HPF — remove DC before high-gain stages
+  // =========================================================================
+  logic signed [WIDTH-1:0] hpf_out;
+
+  biquad_tdf2 #(
+      .DATA_W (WIDTH),
+      .COEFF_W(HPF_CW),
+      .FRAC   (HPF_FRAC)
+  ) u_input_hpf (
+      .clk   (clk),
+      .rst_n (rst_n),
+      .en    (sample_en),
+      .x_in  (audio_in),
+      .y_out (hpf_out),
+      .b0    (HPF_B0),
+      .b1    (HPF_B1),
+      .b2    (HPF_B2),
+      .a1_neg(HPF_A1_NEG),
+      .a2_neg(HPF_A2_NEG)
+  );
+
+  // =========================================================================
   // Clipping stage 1 + post-clip smoothing
   // =========================================================================
   logic signed [INT_W-1:0] stage1_gained;
@@ -128,7 +158,7 @@ module big_muff #(
   logic signed [WIDTH-1:0] stage1_smooth;
 
   always_comb begin
-    stage1_gained  = INT_W'((longint'(audio_in) * longint'(signed'({1'b0, stage1_gain}))) >>> 8);
+    stage1_gained  = INT_W'((longint'(hpf_out) * longint'(signed'({1'b0, stage1_gain}))) >>> 8);
   end
 
   soft_clip #(

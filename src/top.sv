@@ -15,15 +15,13 @@
 //    2    Slot 1 (phaser)          Slot 1 input
 //    3    Slot 2 (chorus)          Slot 2 input
 //    4    Slot 3 (delay)           Slot 3 input
-//    5    Slot 4 (tube_distortion) Slot 4 input
-//    6    Slot 5 (flanger)         Slot 5 input
-//    7    Slot 6 (big_muff)        Slot 6 input
-//    8    Slot 7 (reverb)          Slot 7 input
+//    5    Slot 4 (flanger)         Slot 4 input
+//    6    Slot 5 (reverb)          Slot 5 input
+//    7    Slot 6 (compressor)      Slot 6 input
+//    8    Slot 7 (wah)             Slot 7 input
 //
 // Default linear chain:
-//   route[7]=0 BMF←ADC  route[5]=7 TUB←BMF  route[2]=5 PHA←TUB
-//   route[6]=2 FLN←PHA  route[3]=6 CHO←FLN  route[1]=3 TRM←CHO
-//   route[4]=1 DLY←TRM  route[8]=4 REV←DLY  route[0]=8 DAC←REV
+//   ADC → WAH → CMP → PHA → FLN → CHO → TRM → DLY → REV → DAC
 //
 // Bypass is software-controlled via "set <efx> on/off" CLI commands.
 // Each slot reads its own bypass bit from cfg_slice[7][0] (no sw_effect port).

@@ -14,7 +14,7 @@
 
 module tb_axis_crossbar;
 
-    localparam int NP    = 6;
+    localparam int NP    = 12;
     localparam int DW    = 48;
     localparam int SEL_W = $clog2(NP);
 

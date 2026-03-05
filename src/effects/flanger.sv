@@ -22,8 +22,8 @@ module flanger #(
     parameter int MIN_DELAY  = 16,   // 0.33 ms @ 48 kHz
     parameter int LFO_ACC_W  = 28,   // LFO phase accumulator width
     parameter int FRAC_W     = 10,   // Fractional delay bits for interpolation
-    parameter int COEFF_W    = 24,   // Biquad coefficient width
-    parameter int COEFF_FRAC = 22    // Biquad coefficient fractional bits (Q2.22)
+    parameter int COEFF_W    = 18,   // Biquad coefficient width (18b fits 1 DSP48E1)
+    parameter int COEFF_FRAC = 16    // Biquad coefficient fractional bits (Q2.16)
 ) (
     input logic clk,
     input logic rst_n,

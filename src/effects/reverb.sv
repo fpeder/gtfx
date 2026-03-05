@@ -18,10 +18,22 @@
 //   [5] = level     (output level)
 //   [7] = bypass    (bit 0, managed by axis_effect_slot)
 //
-// Pipeline: single-cycle (combinational delay line reads with REG_RD=0).
-//           effect_valid = sample_en_d1 in the slot wrapper.
+// Pipeline: 6-cycle (registered BRAM reads with REG_RD=1).
 //
-// Resource estimate: ~10 BRAM36 out of 135 available on xc7a100t.
+//   Cycle 0 (sample_en):  Assert rd_en for pre-delay + all 8 combs
+//   Cycle 1:              BRAM data valid. Compute comb LP/feedback/saturation,
+//                          write combs. Sum 8 comb outputs → comb_sum.
+//                          Assert rd_en for AP[0] L&R.
+//   Cycle 2:              AP[0] data valid. Compute AP[0] out + write.
+//                          Assert rd_en for AP[1].
+//   Cycle 3:              AP[1] data valid. Compute AP[1] out + write.
+//                          Assert rd_en for AP[2].
+//   Cycle 4:              AP[2] data valid. Compute AP[2] out + write.
+//                          Assert rd_en for AP[3].
+//   Cycle 5:              AP[3] data valid. Compute tone/level/mix.
+//                          Register output. Assert valid_out.
+//
+// Resource estimate: ~25 BRAM36 out of 135 available on xc7a100t.
 // ============================================================================
 
 module reverb #(
@@ -36,6 +48,7 @@ module reverb #(
     input  logic signed [DATA_W-1:0]   audio_in,
     output logic signed [DATA_W-1:0]   audio_out_l,
     output logic signed [DATA_W-1:0]   audio_out_r,
+    output logic                       valid_out,
 
     // Controls from cfg_slice
     input  logic [CTRL_W-1:0]          decay,      // comb feedback gain
@@ -75,7 +88,36 @@ module reverb #(
   localparam int PRE_ADDR_W  = $clog2(PRE_MAX);
 
   // =========================================================================
-  // Pre-delay line
+  // Pipeline shift register (6 phases)
+  //
+  // pipe_sr[0] = cycle 0: issue BRAM reads for pre-delay + combs
+  // pipe_sr[1] = cycle 1: comb data valid, compute+write combs, read AP[0]
+  // pipe_sr[2] = cycle 2: AP[0] data valid, compute+write AP[0], read AP[1]
+  // pipe_sr[3] = cycle 3: AP[1] data valid, compute+write AP[1], read AP[2]
+  // pipe_sr[4] = cycle 4: AP[2] data valid, compute+write AP[2], read AP[3]
+  // pipe_sr[5] = cycle 5: AP[3] data valid, compute output, assert valid_out
+  // =========================================================================
+  logic [5:0] pipe_sr;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n)
+      pipe_sr <= '0;
+    else
+      pipe_sr <= {pipe_sr[4:0], sample_en};
+  end
+
+  // Hold audio_in for mix computation in cycle 5
+  logic signed [DATA_W-1:0] audio_in_held;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n)
+      audio_in_held <= '0;
+    else if (sample_en)
+      audio_in_held <= audio_in;
+  end
+
+  // =========================================================================
+  // Pre-delay line (REG_RD=1)
   // =========================================================================
   logic [PRE_ADDR_W-1:0] pre_wr_ptr;
   logic [PRE_ADDR_W-1:0] pre_rd_ptr_arr [1];
@@ -91,7 +133,7 @@ module reverb #(
       .DATA_W  (DATA_W),
       .DEPTH   (PRE_MAX),
       .NUM_TAPS(1),
-      .REG_RD  (0)
+      .REG_RD  (1)
   ) u_pre_delay (
       .clk          (clk),
       .rst_n        (rst_n),
@@ -99,23 +141,21 @@ module reverb #(
       .wr_data      (audio_in),
       .wr_ptr_o     (pre_wr_ptr),
       .wr_ptr_next_o(),
-      .rd_en        (1'b0),
+      .rd_en        (pipe_sr[0]),
       .rd_ptr       (pre_rd_ptr_arr),
       .rd_data      (pre_rd_data),
       .interp_frac  ('0),
       .interp_out   ()
   );
 
+  // pre_out valid in cycle 1 (pipe_sr[1])
   assign pre_out = pre_rd_data[0];
 
   // =========================================================================
-  // 8 Parallel Comb Filters with LP damping in feedback path
+  // 8 Parallel Comb Filters with LP damping in feedback path (REG_RD=1)
   //
-  // Each comb: out = buf[wr_ptr - M]
-  //            buf[wr_ptr] = in + feedback * lpf(out)
-  //
-  // 1-pole LP damping: lpf_state = (1 - damp) * out + damp * lpf_state_prev
-  //   where damp = damping / 256  (Q0.8)
+  // Cycle 0: rd_en asserted, read oldest sample from each comb
+  // Cycle 1: data valid, compute LP/feedback/saturation, write back
   // =========================================================================
   logic signed [DATA_W-1:0] comb_out [N_COMB];
 
@@ -146,7 +186,7 @@ module reverb #(
       // 1-pole LP damping state
       logic signed [DATA_W-1:0] lpf_state;
 
-      // Feedback input (LP-filtered comb output scaled by feedback)
+      // Feedback computation (combinational, used in cycle 1 when data valid)
       logic signed [DATA_W-1:0] lpf_out;
       logic signed [INT_W-1:0]  fb_scaled;
       logic signed [DATA_W-1:0] fb_sat;
@@ -192,26 +232,26 @@ module reverb #(
           .DATA_W  (DATA_W),
           .DEPTH   (DEPTH_I),
           .NUM_TAPS(1),
-          .REG_RD  (0)
+          .REG_RD  (1)
       ) u_comb_dl (
           .clk          (clk),
           .rst_n        (rst_n),
-          .wr_en        (sample_en),
+          .wr_en        (pipe_sr[1]),
           .wr_data      (wr_sample),
           .wr_ptr_o     (c_wr_ptr),
           .wr_ptr_next_o(c_wr_ptr_next),
-          .rd_en        (1'b0),
+          .rd_en        (pipe_sr[0]),
           .rd_ptr       (c_rd_ptr_arr),
           .rd_data      (c_rd_data),
           .interp_frac  ('0),
           .interp_out   ()
       );
 
-      // Update LP damping state
+      // Update LP damping state in cycle 1
       always_ff @(posedge clk) begin
         if (!rst_n)
           lpf_state <= '0;
-        else if (sample_en)
+        else if (pipe_sr[1])
           lpf_state <= lpf_out;
       end
 
@@ -220,27 +260,36 @@ module reverb #(
   endgenerate
 
   // =========================================================================
-  // Sum comb outputs (÷8 to prevent overflow)
+  // Sum comb outputs (÷8 to prevent overflow) — registered in cycle 1
   // =========================================================================
   logic signed [DATA_W-1:0] comb_sum;
 
-  always_comb begin
-    automatic longint acc = 0;
-    for (int i = 0; i < N_COMB; i++)
-      acc = acc + longint'(comb_out[i]);
-    comb_sum = DATA_W'(acc >>> 3);  // ÷8
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      comb_sum <= '0;
+    end else if (pipe_sr[1]) begin
+      automatic longint acc = 0;
+      for (int i = 0; i < N_COMB; i++)
+        acc = acc + longint'(comb_out[i]);
+      comb_sum <= DATA_W'(acc >>> 3);  // ÷8
+    end
   end
 
   // =========================================================================
-  // 4 Series Allpass Diffusers (L channel)
+  // 4 Series Allpass Diffusers (L channel, REG_RD=1)
+  //
+  // AP[i]: rd_en in cycle 1+i, data valid in cycle 2+i, write in cycle 2+i
   //
   // Each allpass: buf_out = buf[n-M]
   //               out = -g*in + buf_out
   //               buf[n] = in + g*buf_out
   // g = 0.5 (AP_COEFF/256)
   // =========================================================================
-  logic signed [DATA_W-1:0] ap_chain_l [N_AP+1];
-  assign ap_chain_l[0] = comb_sum;
+  logic signed [DATA_W-1:0] ap_in_l [N_AP];
+  logic signed [DATA_W-1:0] ap_out_l [N_AP];
+
+  // AP[0] input is comb_sum (registered), available from cycle 2 onwards
+  assign ap_in_l[0] = comb_sum;
 
   genvar ai;
   generate
@@ -253,7 +302,7 @@ module reverb #(
       logic [ADDR_W_I-1:0] a_rd_ptr_arr [1];
       logic signed [DATA_W-1:0] a_rd_data [1];
       logic signed [DATA_W-1:0] a_buf_out;
-      logic signed [DATA_W-1:0] ap_out;
+      logic signed [DATA_W-1:0] ap_computed;
       logic signed [DATA_W-1:0] ap_wr_data;
 
       always_comb begin
@@ -261,13 +310,13 @@ module reverb #(
         a_buf_out = a_rd_data[0];
 
         // out = -g*in + buf_out  (g = 0.5 → shift right 1)
-        ap_out = DATA_W'(
-          -longint'(ap_chain_l[ai]) / 2 + longint'(a_buf_out)
+        ap_computed = DATA_W'(
+          -longint'(ap_in_l[ai]) / 2 + longint'(a_buf_out)
         );
 
         // buf[n] = in + g*buf_out
         ap_wr_data = DATA_W'(
-          longint'(ap_chain_l[ai]) + longint'(a_buf_out) / 2
+          longint'(ap_in_l[ai]) + longint'(a_buf_out) / 2
         );
       end
 
@@ -275,30 +324,42 @@ module reverb #(
           .DATA_W  (DATA_W),
           .DEPTH   (DEPTH_I),
           .NUM_TAPS(1),
-          .REG_RD  (0)
+          .REG_RD  (1)
       ) u_ap_dl (
           .clk          (clk),
           .rst_n        (rst_n),
-          .wr_en        (sample_en),
+          .wr_en        (pipe_sr[2+ai]),
           .wr_data      (ap_wr_data),
           .wr_ptr_o     (a_wr_ptr),
           .wr_ptr_next_o(a_wr_ptr_next),
-          .rd_en        (1'b0),
+          .rd_en        (pipe_sr[1+ai]),
           .rd_ptr       (a_rd_ptr_arr),
           .rd_data      (a_rd_data),
           .interp_frac  ('0),
           .interp_out   ()
       );
 
-      assign ap_chain_l[ai+1] = ap_out;
+      assign ap_out_l[ai] = ap_computed;
+
+      // Chain: register AP output to feed next stage on next cycle
+      if (ai < N_AP - 1) begin : gen_chain_l
+        always_ff @(posedge clk) begin
+          if (!rst_n)
+            ap_in_l[ai+1] <= '0;
+          else if (pipe_sr[2+ai])
+            ap_in_l[ai+1] <= ap_computed;
+        end
+      end
     end
   endgenerate
 
   // =========================================================================
-  // 4 Series Allpass Diffusers (R channel — offset depths)
+  // 4 Series Allpass Diffusers (R channel — offset depths, REG_RD=1)
   // =========================================================================
-  logic signed [DATA_W-1:0] ap_chain_r [N_AP+1];
-  assign ap_chain_r[0] = comb_sum;
+  logic signed [DATA_W-1:0] ap_in_r [N_AP];
+  logic signed [DATA_W-1:0] ap_out_r [N_AP];
+
+  assign ap_in_r[0] = comb_sum;
 
   generate
     for (ai = 0; ai < N_AP; ai++) begin : gen_ap_r
@@ -310,19 +371,19 @@ module reverb #(
       logic [ADDR_W_I-1:0] a_rd_ptr_arr [1];
       logic signed [DATA_W-1:0] a_rd_data [1];
       logic signed [DATA_W-1:0] a_buf_out;
-      logic signed [DATA_W-1:0] ap_out;
+      logic signed [DATA_W-1:0] ap_computed;
       logic signed [DATA_W-1:0] ap_wr_data;
 
       always_comb begin
         a_rd_ptr_arr[0] = a_wr_ptr_next;
         a_buf_out = a_rd_data[0];
 
-        ap_out = DATA_W'(
-          -longint'(ap_chain_r[ai]) / 2 + longint'(a_buf_out)
+        ap_computed = DATA_W'(
+          -longint'(ap_in_r[ai]) / 2 + longint'(a_buf_out)
         );
 
         ap_wr_data = DATA_W'(
-          longint'(ap_chain_r[ai]) + longint'(a_buf_out) / 2
+          longint'(ap_in_r[ai]) + longint'(a_buf_out) / 2
         );
       end
 
@@ -330,27 +391,38 @@ module reverb #(
           .DATA_W  (DATA_W),
           .DEPTH   (DEPTH_I),
           .NUM_TAPS(1),
-          .REG_RD  (0)
+          .REG_RD  (1)
       ) u_ap_dl (
           .clk          (clk),
           .rst_n        (rst_n),
-          .wr_en        (sample_en),
+          .wr_en        (pipe_sr[2+ai]),
           .wr_data      (ap_wr_data),
           .wr_ptr_o     (a_wr_ptr),
           .wr_ptr_next_o(a_wr_ptr_next),
-          .rd_en        (1'b0),
+          .rd_en        (pipe_sr[1+ai]),
           .rd_ptr       (a_rd_ptr_arr),
           .rd_data      (a_rd_data),
           .interp_frac  ('0),
           .interp_out   ()
       );
 
-      assign ap_chain_r[ai+1] = ap_out;
+      assign ap_out_r[ai] = ap_computed;
+
+      if (ai < N_AP - 1) begin : gen_chain_r
+        always_ff @(posedge clk) begin
+          if (!rst_n)
+            ap_in_r[ai+1] <= '0;
+          else if (pipe_sr[2+ai])
+            ap_in_r[ai+1] <= ap_computed;
+        end
+      end
     end
   endgenerate
 
   // =========================================================================
   // Output tone filter (1-pole LP controlled by tone knob)
+  //
+  // Computed in cycle 5 using AP[3] output (data valid from cycle 5 read).
   //
   // Simple 1-pole: y = (1 - tone/256)*x + (tone/256)*y_prev
   // tone=0x00 → no filtering (bright), tone=0xFF → heavy LP (dark)
@@ -360,12 +432,12 @@ module reverb #(
 
   always_comb begin
     wet_l = DATA_W'(
-      (longint'(ap_chain_l[N_AP]) * longint'(9'(256) - 9'(tone)) +
-       longint'(tone_l_state)     * longint'({1'b0, tone})) >>> 8
+      (longint'(ap_out_l[N_AP-1]) * longint'(9'(256) - 9'(tone)) +
+       longint'(tone_l_state)      * longint'({1'b0, tone})) >>> 8
     );
     wet_r = DATA_W'(
-      (longint'(ap_chain_r[N_AP]) * longint'(9'(256) - 9'(tone)) +
-       longint'(tone_r_state)     * longint'({1'b0, tone})) >>> 8
+      (longint'(ap_out_r[N_AP-1]) * longint'(9'(256) - 9'(tone)) +
+       longint'(tone_r_state)      * longint'({1'b0, tone})) >>> 8
     );
   end
 
@@ -373,7 +445,7 @@ module reverb #(
     if (!rst_n) begin
       tone_l_state <= '0;
       tone_r_state <= '0;
-    end else if (sample_en) begin
+    end else if (pipe_sr[5]) begin
       tone_l_state <= wet_l;
       tone_r_state <= wet_r;
     end
@@ -405,11 +477,11 @@ module reverb #(
   logic signed [DATA_W-1:0] mix_l_sat, mix_r_sat;
 
   always_comb begin
-    mix_l_raw = INT_W'(signed'(audio_in)) + INT_W'(
+    mix_l_raw = INT_W'(signed'(audio_in_held)) + INT_W'(
       (longint'(lvl_l_sat) * longint'(mix)
        + longint'(1 << (CTRL_W-1))) >>> CTRL_W
     );
-    mix_r_raw = INT_W'(signed'(audio_in)) + INT_W'(
+    mix_r_raw = INT_W'(signed'(audio_in_held)) + INT_W'(
       (longint'(lvl_r_sat) * longint'(mix)
        + longint'(1 << (CTRL_W-1))) >>> CTRL_W
     );
@@ -419,15 +491,19 @@ module reverb #(
   saturate #(.IN_W(INT_W), .OUT_W(DATA_W)) u_sat_mr (.din(mix_r_raw), .dout(mix_r_sat));
 
   // =========================================================================
-  // Registered output (1-cycle latency)
+  // Registered output (cycle 5 → valid_out)
   // =========================================================================
   always_ff @(posedge clk) begin
     if (!rst_n) begin
       audio_out_l <= '0;
       audio_out_r <= '0;
-    end else if (sample_en) begin
-      audio_out_l <= mix_l_sat;
-      audio_out_r <= mix_r_sat;
+      valid_out   <= 1'b0;
+    end else begin
+      valid_out <= pipe_sr[5];
+      if (pipe_sr[5]) begin
+        audio_out_l <= mix_l_sat;
+        audio_out_r <= mix_r_sat;
+      end
     end
   end
 

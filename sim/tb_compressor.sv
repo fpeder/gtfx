@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // =============================================================================
-// Testbench: delay (Strymon Timeline Multi-Mode Delay)
+// Testbench: compressor
 //
 // clk_audio : 12.288 MHz  (half period ≈ 41 ns)
 // sample_en : 1-cycle pulse every 256 clocks (48 kHz)
@@ -10,17 +10,17 @@
 //   TC1  Reset clears output
 //   TC2  Zero input → zero output
 //   TC3  No X/Z propagation after reset
-//   TC4  Input appears at output after delay time
-//   TC5  Repeats produce decaying echoes
-//   TC6  Mix blend
+//   TC4  Below-threshold signal passes at unity gain
+//   TC5  Above-threshold signal is reduced in level
+//   TC6  Higher ratio = more compression
+//   TC7  Makeup gain boosts output level
 // =============================================================================
 
-module tb_delay;
+module tb_compressor;
 
     localparam int WIDTH           = 24;
     localparam int CLK_HALF_NS     = 41;
     localparam int CLKS_PER_SAMPLE = 256;
-    localparam int RAM_DEPTH       = 65536;
 
     localparam signed [WIDTH-1:0] SAT_MAX = {1'b0, {(WIDTH-1){1'b1}}};
     localparam signed [WIDTH-1:0] SAT_MIN = {1'b1, {(WIDTH-1){1'b0}}};
@@ -51,25 +51,23 @@ module tb_delay;
     logic                    sample_en;
     logic signed [WIDTH-1:0] audio_in;
     logic signed [WIDTH-1:0] audio_out;
-    logic [15:0]             time_val;
-    logic [7:0]              repeats_val;
-    logic [7:0]              mix_val;
-    logic [7:0]              filter_val;
-    logic [7:0]              mod_val;
-    logic [7:0]              grit_val;
+    logic [7:0]              threshold_val;
+    logic [7:0]              ratio_val;
+    logic [7:0]              attack_val;
+    logic [7:0]              release_val;
+    logic [7:0]              makeup_val;
 
-    delay #(.AUDIO_W(WIDTH), .RAM_DEPTH(RAM_DEPTH)) dut (
-        .clk        (clk),
-        .rst_n      (rst_n),
-        .sample_en  (sample_en),
-        .audio_in   (audio_in),
-        .audio_out  (audio_out),
-        .time_val   (time_val),
-        .repeats_val(repeats_val),
-        .mix_val    (mix_val),
-        .filter_val (filter_val),
-        .mod_val    (mod_val),
-        .grit_val   (grit_val)
+    compressor #(.DATA_W(WIDTH), .CTRL_W(8)) dut (
+        .clk          (clk),
+        .rst_n        (rst_n),
+        .sample_en    (sample_en),
+        .audio_in     (audio_in),
+        .audio_out    (audio_out),
+        .threshold_val(threshold_val),
+        .ratio_val    (ratio_val),
+        .attack_val   (attack_val),
+        .release_val  (release_val),
+        .makeup_val   (makeup_val)
     );
 
     // Clock
@@ -113,14 +111,13 @@ module tb_delay;
     endtask
 
     task automatic do_reset();
-        rst_n       = 1'b0;
-        audio_in    = '0;
-        time_val    = 16'd1200;   // 25 ms @ 48 kHz
-        repeats_val = 8'd100;
-        mix_val     = 8'd128;     // 50/50
-        filter_val  = 8'd255;     // bright
-        mod_val     = 8'd0;       // no mod
-        grit_val    = 8'd0;       // digital mode
+        rst_n         = 1'b0;
+        audio_in      = '0;
+        threshold_val = 8'd128;
+        ratio_val     = 8'd128;
+        attack_val    = 8'd0;
+        release_val   = 8'd0;
+        makeup_val    = 8'd0;
         repeat (20) @(posedge clk);
         @(negedge clk);
         rst_n = 1'b1;
@@ -128,9 +125,10 @@ module tb_delay;
     endtask
 
     logic [5:0] lut_idx;
+    logic signed [WIDTH-1:0] out_val;
 
     initial begin
-        $display("=== delay testbench ===");
+        $display("=== compressor testbench ===");
 
         // -----------------------------------------------------------------
         // TC1: Reset clears output
@@ -138,12 +136,11 @@ module tb_delay;
         $display("\n-- TC1: Reset clears output --");
         rst_n    = 1'b0;
         audio_in = 24'sh3FFFFF;
-        time_val = 16'd1200;
-        repeats_val = 8'd128;
-        mix_val     = 8'd128;
-        filter_val  = 8'd255;
-        mod_val     = 8'd0;
-        grit_val    = 8'd0;
+        threshold_val = 8'd128;
+        ratio_val     = 8'd128;
+        attack_val    = 8'd0;
+        release_val   = 8'd0;
+        makeup_val    = 8'd0;
         repeat (10) @(posedge clk);
         check(audio_out === 24'sh0,
               "audio_out = 0 during reset");
@@ -153,7 +150,6 @@ module tb_delay;
         // -----------------------------------------------------------------
         $display("\n-- TC2: Zero input silence --");
         do_reset();
-        mix_val = 8'd0;  // dry only
         begin
             int nonzero = 0;
             for (int i = 0; i < 20; i++) begin
@@ -162,7 +158,7 @@ module tb_delay;
                 @(posedge clk);
                 if (audio_out !== 24'sh0) nonzero++;
             end
-            check(nonzero == 0, "zero input -> zero output for 20 samples (dry)");
+            check(nonzero == 0, "zero input -> zero output for 20 samples");
         end
 
         // -----------------------------------------------------------------
@@ -170,128 +166,143 @@ module tb_delay;
         // -----------------------------------------------------------------
         $display("\n-- TC3: No X/Z propagation --");
         do_reset();
-        mix_val = 8'd128;
         lut_idx = '0;
         begin
             logic any_x = 1'b0;
-            for (int i = 0; i < 256; i++) begin
+            for (int i = 0; i < 128; i++) begin
                 @(posedge clk iff sample_en);
                 audio_in = SINE_LUT[lut_idx];
                 lut_idx  = lut_idx + 1'b1;
                 @(posedge clk);
                 if ($isunknown(audio_out)) any_x = 1'b1;
             end
-            check(!any_x, "audio_out never X/Z over 256 samples");
+            check(!any_x, "audio_out never X/Z over 128 samples");
         end
 
         // -----------------------------------------------------------------
-        // TC4: Input appears at output after delay time
+        // TC4: Below-threshold signal passes at unity gain
         // -----------------------------------------------------------------
-        $display("\n-- TC4: Delayed echo appears --");
+        $display("\n-- TC4: Below threshold = unity gain --");
         do_reset();
-        time_val    = 16'd600;   // minimum delay (600 samples)
-        repeats_val = 8'd0;
-        mix_val     = 8'd255;    // full wet
-        filter_val  = 8'd255;
-        mod_val     = 8'd0;
-        grit_val    = 8'd0;
-        // Send impulse then silence
-        @(posedge clk iff sample_en);
-        audio_in = 24'sh500000;
-        @(posedge clk);
-        begin
-            logic found_echo = 1'b0;
-            for (int i = 0; i < 700; i++) begin
-                @(posedge clk iff sample_en);
-                audio_in = 24'sh0;
-                @(posedge clk);
-                if (!found_echo && audio_out !== 24'sh0)
-                    found_echo = 1'b1;
-            end
-            check(found_echo,
-                  "echo: non-zero output appears after delay time");
-        end
-
-        // -----------------------------------------------------------------
-        // TC5: Repeats produce decaying echoes
-        // -----------------------------------------------------------------
-        $display("\n-- TC5: Repeats produce echoes --");
-        // Run A: no repeats
-        do_reset();
-        time_val    = 16'd600;
-        repeats_val = 8'd0;
-        mix_val     = 8'd200;
-        filter_val  = 8'd255;
-        mod_val     = 8'd0;
-        grit_val    = 8'd0;
-        @(posedge clk iff sample_en);
-        audio_in = 24'sh500000;
-        @(posedge clk);
-        begin
-            int echoes_no_rpt = 0;
-            for (int i = 0; i < 2000; i++) begin
-                @(posedge clk iff sample_en);
-                audio_in = 24'sh0;
-                @(posedge clk);
-                begin
-                    logic signed [WIDTH-1:0] abs_o;
-                    abs_o = audio_out[WIDTH-1] ? -audio_out : audio_out;
-                    if (abs_o > 24'sh001000) echoes_no_rpt++;
-                end
-            end
-
-            // Run B: with repeats
-            do_reset();
-            time_val    = 16'd600;
-            repeats_val = 8'd200;  // high feedback
-            mix_val     = 8'd200;
-            filter_val  = 8'd255;
-            mod_val     = 8'd0;
-            grit_val    = 8'd0;
-            @(posedge clk iff sample_en);
-            audio_in = 24'sh500000;
-            @(posedge clk);
-            begin
-                int echoes_with_rpt = 0;
-                for (int i = 0; i < 2000; i++) begin
-                    @(posedge clk iff sample_en);
-                    audio_in = 24'sh0;
-                    @(posedge clk);
-                    begin
-                        logic signed [WIDTH-1:0] abs_o;
-                        abs_o = audio_out[WIDTH-1] ? -audio_out : audio_out;
-                        if (abs_o > 24'sh001000) echoes_with_rpt++;
-                    end
-                end
-                check(echoes_with_rpt >= echoes_no_rpt,
-                      "higher repeats produces more non-zero echo samples");
-            end
-        end
-
-        // -----------------------------------------------------------------
-        // TC6: Mix blend
-        // -----------------------------------------------------------------
-        $display("\n-- TC6: Mix blend --");
-        // Run A: mix=0 (dry only)
-        do_reset();
-        mix_val = 8'd0;
+        threshold_val = 8'd250;  // very high threshold
+        ratio_val     = 8'd255;  // max compression
+        attack_val    = 8'd0;
+        release_val   = 8'd0;
+        makeup_val    = 8'd0;    // no makeup
+        // Feed moderate signal (well below threshold)
         for (int i = 0; i < 50; i++) begin
             @(posedge clk iff sample_en);
-            audio_in = 24'sh300000;
+            audio_in = 24'sh100000;
+            @(posedge clk);
+        end
+        // Output should be close to input (unity with 1.0x makeup)
+        begin
+            logic signed [WIDTH-1:0] abs_diff;
+            abs_diff = (audio_out > audio_in) ?
+                       (audio_out - audio_in) : (audio_in - audio_out);
+            check(abs_diff < 24'sh040000,
+                  "below threshold: output ≈ input (within tolerance)");
+        end
+
+        // -----------------------------------------------------------------
+        // TC5: Above-threshold signal is reduced in level
+        // -----------------------------------------------------------------
+        $display("\n-- TC5: Above threshold = level reduced --");
+        do_reset();
+        threshold_val = 8'd20;   // low threshold
+        ratio_val     = 8'd255;  // max compression ratio
+        attack_val    = 8'd0;    // instant attack
+        release_val   = 8'd0;
+        makeup_val    = 8'd0;
+        // Feed loud signal
+        for (int i = 0; i < 100; i++) begin
+            @(posedge clk iff sample_en);
+            audio_in = 24'sh600000;
             @(posedge clk);
         end
         begin
-            logic signed [WIDTH-1:0] dry_out = audio_out;
-            // Run B: mix=255 (wet only)
+            logic signed [WIDTH-1:0] abs_out;
+            abs_out = audio_out[WIDTH-1] ? -audio_out : audio_out;
+            check(abs_out < 24'sh600000,
+                  "above threshold: output < input (compressed)");
+            check(abs_out > 24'sh000000,
+                  "above threshold: output > 0 (not silenced)");
+        end
+
+        // -----------------------------------------------------------------
+        // TC6: Higher ratio = more compression
+        // -----------------------------------------------------------------
+        $display("\n-- TC6: Higher ratio = more compression --");
+        // Run A: low ratio
+        do_reset();
+        threshold_val = 8'd30;
+        ratio_val     = 8'd50;   // mild compression
+        attack_val    = 8'd0;
+        release_val   = 8'd0;
+        makeup_val    = 8'd0;
+        for (int i = 0; i < 100; i++) begin
+            @(posedge clk iff sample_en);
+            audio_in = 24'sh600000;
+            @(posedge clk);
+        end
+        begin
+            logic signed [WIDTH-1:0] out_low_ratio = audio_out;
+            // Run B: high ratio
             do_reset();
-            mix_val = 8'd255;
-            for (int i = 0; i < 50; i++) begin
+            threshold_val = 8'd30;
+            ratio_val     = 8'd250;  // heavy compression
+            attack_val    = 8'd0;
+            release_val   = 8'd0;
+            makeup_val    = 8'd0;
+            for (int i = 0; i < 100; i++) begin
                 @(posedge clk iff sample_en);
-                audio_in = 24'sh300000;
+                audio_in = 24'sh600000;
                 @(posedge clk);
             end
-            check(audio_out !== dry_out,
-                  "mix=0 and mix=255 produce different outputs");
+            begin
+                logic signed [WIDTH-1:0] abs_low  = out_low_ratio[WIDTH-1] ? -out_low_ratio : out_low_ratio;
+                logic signed [WIDTH-1:0] abs_high = audio_out[WIDTH-1] ? -audio_out : audio_out;
+                check(abs_high <= abs_low,
+                      "higher ratio produces equal or lower output level");
+            end
+        end
+
+        // -----------------------------------------------------------------
+        // TC7: Makeup gain boosts output level
+        // -----------------------------------------------------------------
+        $display("\n-- TC7: Makeup gain boosts output --");
+        // Run A: no makeup
+        do_reset();
+        threshold_val = 8'd30;
+        ratio_val     = 8'd200;
+        attack_val    = 8'd0;
+        release_val   = 8'd0;
+        makeup_val    = 8'd0;
+        for (int i = 0; i < 100; i++) begin
+            @(posedge clk iff sample_en);
+            audio_in = 24'sh400000;
+            @(posedge clk);
+        end
+        begin
+            logic signed [WIDTH-1:0] out_no_makeup = audio_out;
+            // Run B: with makeup
+            do_reset();
+            threshold_val = 8'd30;
+            ratio_val     = 8'd200;
+            attack_val    = 8'd0;
+            release_val   = 8'd0;
+            makeup_val    = 8'd200;  // substantial makeup gain
+            for (int i = 0; i < 100; i++) begin
+                @(posedge clk iff sample_en);
+                audio_in = 24'sh400000;
+                @(posedge clk);
+            end
+            begin
+                logic signed [WIDTH-1:0] abs_no  = out_no_makeup[WIDTH-1] ? -out_no_makeup : out_no_makeup;
+                logic signed [WIDTH-1:0] abs_yes = audio_out[WIDTH-1] ? -audio_out : audio_out;
+                check(abs_yes > abs_no,
+                      "makeup gain increases output level");
+            end
         end
 
         // =====================================================================
@@ -308,7 +319,7 @@ module tb_delay;
 
     // Timeout watchdog
     initial begin
-        #(500_000_000);  // 500ms - delay needs longer for echo tests
+        #(200_000_000);
         $display("ERROR: Simulation timeout.");
         $fatal(1, "Timeout");
     end

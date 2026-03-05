@@ -15,20 +15,20 @@
 //   1 = phaser         (mono in, mono out,   1-cycle latency)
 //   2 = chorus         (mono in, stereo out, 1-cycle latency)
 //   3 = delay          (mono in, dry/wet crossfade, 3-cycle latency)
-//   4 = tube_distortion(mono in, mono out,   1-cycle latency)
-//   5 = flanger       (mono in, mono out,   1-cycle latency)
-//   6 = big_muff      (mono in, mono out,   1-cycle latency)
-//   7 = reverb        (mono in, stereo out, 1-cycle latency)
+//   4 = flanger       (mono in, mono out,   1-cycle latency)
+//   5 = reverb        (mono in, stereo out, 6-cycle pipeline)
+//   6 = compressor    (mono in, mono out,   1-cycle latency)
+//   7 = wah           (mono in, mono out,   1-cycle latency)
 //
 // Register map (per slot, 8 bytes, indexed from cfg_mem[SLOT_ID*CTRL_DEPTH]):
 //   tremolo:         [0]=rate  [1]=depth  [2]=shape(bit0)           [7]=bypass(bit0)
 //   phaser:          [0]=speed [1]=feedback_en(bit0)                [7]=bypass(bit0)
 //   chorus:          [0]=rate  [1]=depth  [2]=effect_lvl [3..4]=eq  [7]=bypass(bit0)
 //   delay:           [0]=rpt [1]=mix [2]=flt [3..4]=time [5]=mod [6]=grit+mode [7]=bypass(bit0)
-//   tube_distortion: [0]=gain  [1]=bass   [2]=mid [3]=treble [4]=lvl [7]=bypass(bit0)
 //   flanger:         [0]=manual [1]=width [2]=speed [3]=regen [4]=mix [7]=bypass(bit0)
-//   big_muff:        [0]=sustain [1]=tone [2]=volume                [7]=bypass(bit0)
 //   reverb:          [0]=decay [1]=damping [2]=mix [3]=pre_dly [4]=tone [5]=level [7]=bypass(bit0)
+//   compressor:      [0]=threshold [1]=ratio  [2]=attack  [3]=release [4]=makeup [7]=bypass(bit0)
+//   wah:             [0]=freq [1]=resonance [2]=depth [3]=mode [4]=mix [7]=bypass(bit0)
 //
 // bypass is read directly from cfg_slice[7][0].  The separate bypass input port
 // has been removed; ctrl_bus writes the bypass bit into cfg_mem[slot*CTRL_DEPTH+7].
@@ -48,7 +48,7 @@
 
 module axis_effect_slot #(
     parameter int SLOT_ID          = 0,
-    parameter int EFFECT_TYPE      = 0,      // 0=trem, 1=pha, 2=cho, 3=delay, 4=tube, 5=flanger, 6=big_muff, 7=reverb
+    parameter int EFFECT_TYPE      = 0,      // 0=tremolo, 1=phaser, 2=chorus, 3=delay, 4=flanger, 5=reverb, 6=compressor, 7=wah
     parameter int DATA_W           = 48,
     parameter int CTRL_DEPTH       = 8,
     parameter int CTRL_W           = 8,
@@ -218,34 +218,8 @@ module axis_effect_slot #(
       assign effect_out_r = core_out;
       assign effect_valid = sample_en_d1;
 
-      // ---- TUBE DISTORTION (type 4): mono in → mono out, 1-cycle latency ----
-      // cfg_slice mapping:
-      //   [0]=gain  [1]=tone_bass  [2]=tone_mid  [3]=tone_treble  [4]=level
-    end else if (EFFECT_TYPE == 4) begin : gen_tube
-      logic signed [AUDIO_W-1:0] core_out;
-
-      tube_distortion #(
-          .DATA_W(AUDIO_W)
-      ) core (
-          .clk        (clk),
-          .rst_n      (rst_n),
-          .sample_en  (sample_en_reg),
-          .audio_in   (audio_in_reg),
-          .audio_out  (core_out),
-          .valid_out  (),
-          .gain       (cfg_slice[0]),
-          .tone_bass  (cfg_slice[1]),
-          .tone_mid   (cfg_slice[2]),
-          .tone_treble(cfg_slice[3]),
-          .level      (cfg_slice[4])
-      );
-
-      assign effect_out_l = core_out;
-      assign effect_out_r = core_out;
-      assign effect_valid = sample_en_d1;
-
-      // ---- FLANGER (type 5): mono in → mono out ----
-    end else if (EFFECT_TYPE == 5) begin : gen_flanger
+      // ---- FLANGER (type 4): mono in → mono out ----
+    end else if (EFFECT_TYPE == 4) begin : gen_flanger
       logic signed [AUDIO_W-1:0] core_out;
 
       flanger #(
@@ -270,29 +244,10 @@ module axis_effect_slot #(
       assign effect_out_r = core_out;
       assign effect_valid = sample_en_d1;
 
-      // ---- BIG MUFF (type 6): mono in → mono out ----
-    end else if (EFFECT_TYPE == 6) begin : gen_big_muff
-      logic signed [AUDIO_W-1:0] core_out;
+      // ---- REVERB (type 5): mono in → stereo out, 6-cycle pipeline ----
+    end else if (EFFECT_TYPE == 5) begin : gen_reverb
+      logic reverb_valid;
 
-      big_muff #(
-          .WIDTH(AUDIO_W)
-      ) core (
-          .clk        (clk),
-          .rst_n      (rst_n),
-          .sample_en  (sample_en_reg),
-          .audio_in   (audio_in_reg),
-          .audio_out  (core_out),
-          .sustain_val(cfg_slice[0]),
-          .tone_val   (cfg_slice[1]),
-          .volume_val (cfg_slice[2])
-      );
-
-      assign effect_out_l = core_out;
-      assign effect_out_r = core_out;
-      assign effect_valid = sample_en_d1;
-
-      // ---- REVERB (type 7): mono in → stereo out ----
-    end else if (EFFECT_TYPE == 7) begin : gen_reverb
       reverb #(
           .DATA_W(AUDIO_W),
           .CTRL_W(CTRL_W)
@@ -303,6 +258,7 @@ module axis_effect_slot #(
           .audio_in   (audio_in_reg),
           .audio_out_l(effect_out_l),
           .audio_out_r(effect_out_r),
+          .valid_out  (reverb_valid),
           .decay      (cfg_slice[0]),
           .damping    (cfg_slice[1]),
           .mix        (cfg_slice[2]),
@@ -311,6 +267,54 @@ module axis_effect_slot #(
           .level      (cfg_slice[5])
       );
 
+      assign effect_valid = reverb_valid;
+
+      // ---- COMPRESSOR (type 6): mono in → mono out ----
+    end else if (EFFECT_TYPE == 6) begin : gen_compressor
+      logic signed [AUDIO_W-1:0] core_out;
+
+      compressor #(
+          .DATA_W(AUDIO_W),
+          .CTRL_W(CTRL_W)
+      ) core (
+          .clk           (clk),
+          .rst_n         (rst_n),
+          .sample_en     (sample_en_reg),
+          .audio_in      (audio_in_reg),
+          .audio_out     (core_out),
+          .threshold_val (cfg_slice[0]),
+          .ratio_val     (cfg_slice[1]),
+          .attack_val    (cfg_slice[2]),
+          .release_val   (cfg_slice[3]),
+          .makeup_val    (cfg_slice[4])
+      );
+
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
+      assign effect_valid = sample_en_d1;
+
+      // ---- WAH (type 7): mono in → mono out ----
+    end else if (EFFECT_TYPE == 7) begin : gen_wah
+      logic signed [AUDIO_W-1:0] core_out;
+
+      wah #(
+          .DATA_W(AUDIO_W),
+          .CTRL_W(CTRL_W)
+      ) core (
+          .clk            (clk),
+          .rst_n          (rst_n),
+          .sample_en      (sample_en_reg),
+          .audio_in       (audio_in_reg),
+          .audio_out      (core_out),
+          .freq_val       (cfg_slice[0]),
+          .resonance_val  (cfg_slice[1]),
+          .depth_val      (cfg_slice[2]),
+          .mode_val       (cfg_slice[3]),
+          .mix_val        (cfg_slice[4])
+      );
+
+      assign effect_out_l = core_out;
+      assign effect_out_r = core_out;
       assign effect_valid = sample_en_d1;
 
       // ---- DEFAULT: passthrough ----

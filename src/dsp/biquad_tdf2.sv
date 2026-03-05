@@ -34,8 +34,10 @@ module biquad_tdf2 #(
 
   logic signed [ACC_W-1:0] s1, s2;
 
+  localparam signed [ACC_W-1:0] ROUND = ACC_W'(1) <<< (FRAC - 1);
+
   wire signed [ACC_W-1:0] xe = {{COEFF_W{x_in[DATA_W-1]}}, x_in};
-  wire signed [ACC_W-1:0] y_full = (xe * b0 + s1) >>> FRAC;
+  wire signed [ACC_W-1:0] y_full = (xe * b0 + s1 + ROUND) >>> FRAC;
   wire signed [ACC_W-1:0] s1_next = xe * b1 + y_full * a1_neg + s2;
   wire signed [ACC_W-1:0] s2_next = xe * b2 + y_full * a2_neg;
 

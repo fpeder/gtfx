@@ -53,26 +53,26 @@ try:
 except ImportError:
     HAS_SERIAL = False
 
-# ╔═══════════════════════════════════════════════════════════════════════════╗
-# ║  Routing model — mirrors cmd_proc_v2 shadow_route[0..6]                 ║
-# ║                                                                         ║
-# ║  Port indices:  0=ADC 1=TRM 2=PHA 3=CHO 4=DLY 5=TUB 6=FLN 7=BMF 8=REV ║
-# ║  route[sink] = source_port   (who feeds into *sink*)                    ║
-# ║  DAC = sink index 0 ;  ADC = ultimate source (port 0)                  ║
-# ╚═══════════════════════════════════════════════════════════════════════════╝
+# ╔════════════════════════════════════════════════════════════════════════════════╗
+# ║  Routing model — mirrors cmd_proc shadow_route[0..8]                         ║
+# ║                                                                              ║
+# ║  Port indices: 0=ADC 1=TRM 2=PHA 3=CHO 4=DLY 5=FLN 6=REV 7=CMP 8=WAH      ║
+# ║  route[sink] = source_port   (who feeds into *sink*)                         ║
+# ║  DAC = sink index 0 ;  ADC = ultimate source (port 0)                       ║
+# ╚════════════════════════════════════════════════════════════════════════════════╝
 
 
 class Port(IntEnum):
-    """Hardware port indices (must match cmd_proc_v2)."""
+    """Hardware port indices (must match cmd_proc)."""
     ADC = 0
     TRM = 1
     PHA = 2
     CHO = 3
     DLY = 4
-    TUB = 5
-    FLN = 6
-    BMF = 7
-    REV = 8
+    FLN = 5
+    REV = 6
+    CMP = 7
+    WAH = 8
 
 
 PORT_TAG: dict[int, str] = {p.value: p.name.lower() for p in Port}
@@ -84,20 +84,20 @@ SOURCE_NODES = [p.name.lower() for p in Port]  # adc … fln
 SINK_NODES = ["dac"] + [p.name.lower() for p in Port if p != Port.ADC]
 SINK_ROUTE_IDX = {tag: i for i, tag in enumerate(SINK_NODES)}
 
-# Default route: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→REV→DAC
+# Default route: ADC→WAH→CMP→PHA→FLN→CHO→TRM→DLY→REV→DAC
 DEFAULT_ROUTE: list[int] = [
-    Port.REV,  # route[0]  DAC ← REV
-    Port.CHO,  # route[1]  TRM ← CHO
-    Port.TUB,  # route[2]  PHA ← TUB
-    Port.FLN,  # route[3]  CHO ← FLN
-    Port.TRM,  # route[4]  DLY ← TRM
-    Port.BMF,  # route[5]  TUB ← BMF
-    Port.PHA,  # route[6]  FLN ← PHA
-    Port.ADC,  # route[7]  BMF ← ADC
-    Port.DLY,  # route[8]  REV ← DLY
+    Port.REV,  # route[0]   DAC ← REV
+    Port.CHO,  # route[1]   TRM ← CHO
+    Port.CMP,  # route[2]   PHA ← CMP
+    Port.FLN,  # route[3]   CHO ← FLN
+    Port.TRM,  # route[4]   DLY ← TRM
+    Port.PHA,  # route[5]   FLN ← PHA
+    Port.DLY,  # route[6]   REV ← DLY
+    Port.WAH,  # route[7]   CMP ← WAH
+    Port.ADC,  # route[8]   WAH ← ADC
 ]
 
-ROUTE_ADDR_BASE = 0x40  # ctrl_bus base address for route registers
+ROUTE_ADDR_BASE = 0x60  # ctrl_bus base address for route registers
 
 
 def trace_chain(route: list[int]) -> list[int]:
@@ -222,7 +222,7 @@ EFFECT_DEFS: list[EffectSlot] = [
                ],
                bypass_addr=0x17),
     EffectSlot("dly",
-               "Timeline Delay",
+               "Delay",
                Port.DLY, [
                    Param("rpt", "Repeats", 0x18, 0x64),
                    Param("mix", "Mix", 0x19, 0x80),
@@ -232,43 +232,45 @@ EFFECT_DEFS: list[EffectSlot] = [
                    Param("grt", "Grit", 0x1E, 0x00),
                ],
                bypass_addr=0x1F),
-    EffectSlot("tub",
-               "Tube Distortion",
-               Port.TUB, [
-                   Param("gai", "Gain", 0x20, 0x60),
-                   Param("bas", "Tone Bass", 0x21, 0x80),
-                   Param("mid", "Tone Mid", 0x22, 0x80),
-                   Param("tre", "Tone Treble", 0x23, 0x80),
-                   Param("lvl", "Level", 0x24, 0xC0),
-               ],
-               bypass_addr=0x27),
     EffectSlot("fln",
                "Flanger",
                Port.FLN, [
-                   Param("man", "Manual", 0x28, 0x40),
-                   Param("wid", "Width", 0x29, 0x80),
-                   Param("spd", "Speed", 0x2A, 0x30),
-                   Param("reg", "Regen", 0x2B, 0x90),
-                   Param("mix", "Mix", 0x2C, 0x60),
+                   Param("man", "Manual", 0x20, 0x40),
+                   Param("wid", "Width", 0x21, 0x80),
+                   Param("spd", "Speed", 0x22, 0x30),
+                   Param("reg", "Regen", 0x23, 0x90),
+                   Param("mix", "Mix", 0x24, 0x60),
+               ],
+               bypass_addr=0x27),
+    EffectSlot("rev",
+               "Reverb",
+               Port.REV, [
+                   Param("dec", "Decay", 0x28, 0x80),
+                   Param("dmp", "Damping", 0x29, 0x60),
+                   Param("mix", "Mix", 0x2A, 0x60),
+                   Param("pre", "Pre-delay", 0x2B, 0x20),
+                   Param("ton", "Tone", 0x2C, 0x80),
+                   Param("lvl", "Level", 0x2D, 0x80),
                ],
                bypass_addr=0x2F),
-    EffectSlot("bmf",
-               "Big Muff",
-               Port.BMF, [
-                   Param("sus", "Sustain", 0x30, 0x80),
-                   Param("ton", "Tone", 0x31, 0x80),
-                   Param("vol", "Volume", 0x32, 0xA0),
+    EffectSlot("cmp",
+               "Compressor",
+               Port.CMP, [
+                   Param("thr", "Threshold", 0x30, 0x60),
+                   Param("rat", "Ratio", 0x31, 0x40),
+                   Param("atk", "Attack", 0x32, 0x20),
+                   Param("rel", "Release", 0x33, 0x40),
+                   Param("mak", "Makeup", 0x34, 0x40),
                ],
                bypass_addr=0x37),
-    EffectSlot("rev",
-               "BigSky Reverb",
-               Port.REV, [
-                   Param("dec", "Decay", 0x38, 0x80),
-                   Param("dmp", "Damping", 0x39, 0x60),
-                   Param("mix", "Mix", 0x3A, 0x60),
-                   Param("pre", "Pre-delay", 0x3B, 0x20),
-                   Param("ton", "Tone", 0x3C, 0x80),
-                   Param("lvl", "Level", 0x3D, 0x80),
+    EffectSlot("wah",
+               "Wah / Auto-Wah",
+               Port.WAH, [
+                   Param("frq", "Frequency", 0x38, 0x30),
+                   Param("res", "Resonance", 0x39, 0x60),
+                   Param("dpt", "Depth", 0x3A, 0xFF),
+                   Param("mod", "Mode", 0x3B, 0x01),
+                   Param("mix", "Mix", 0x3C, 0xFF),
                ],
                bypass_addr=0x3F),
 ]
@@ -472,10 +474,10 @@ _ROUTE_NAME_PORT: dict[str, int] = {
     "PHA": Port.PHA,
     "CHO": Port.CHO,
     "DLY": Port.DLY,
-    "TUB": Port.TUB,
     "FLN": Port.FLN,
-    "BMF": Port.BMF,
     "REV": Port.REV,
+    "CMP": Port.CMP,
+    "WAH": Port.WAH,
     "DAC": 0,
 }
 
@@ -1036,21 +1038,25 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
     # ── value adjust ──
     elif ch in (curses.KEY_RIGHT, curses.KEY_LEFT, curses.KEY_PPAGE,
                 curses.KEY_NPAGE):
-        p = slot.params[slot.selected_param]
-        if ch in (curses.KEY_RIGHT, curses.KEY_PPAGE):
-            step = p.step_coarse if ch == curses.KEY_PPAGE else p.step_fine
-            p.value = min(p.value + step, p.hi)
-        else:
-            step = p.step_coarse if ch == curses.KEY_NPAGE else p.step_fine
-            p.value = max(p.value - step, p.lo)
-        st.link.set_param(slot, p)
-        st.flash(f"set {slot.tag} {p.name} {p.format_cmd_value()}")
+        if not slot.disabled:
+            p = slot.params[slot.selected_param]
+            if ch in (curses.KEY_RIGHT, curses.KEY_PPAGE):
+                step = p.step_coarse if ch == curses.KEY_PPAGE else p.step_fine
+                p.value = min(p.value + step, p.hi)
+            else:
+                step = p.step_coarse if ch == curses.KEY_NPAGE else p.step_fine
+                p.value = max(p.value - step, p.lo)
+            st.link.set_param(slot, p)
+            st.flash(f"set {slot.tag} {p.name} {p.format_cmd_value()}")
 
     # ── bypass ──
     elif ch == ord(' ') or ch in ENTER_KEYS:
-        slot.bypassed = not slot.bypassed
-        st.link.set_bypass(slot, not slot.bypassed)
-        st.flash(f"{slot.full_name}: {'ON' if not slot.bypassed else 'OFF'}")
+        if not slot.disabled:
+            slot.bypassed = not slot.bypassed
+            st.link.set_bypass(slot, not slot.bypassed)
+            st.flash(f"{slot.full_name}: {'ON' if not slot.bypassed else 'OFF'}")
+        else:
+            st.flash(f"{slot.full_name}: not in chain")
 
     # ── hjkl vim navigation (2-column grid) ──
     elif ch in (ord('j'), ord('J'), ord('k'), ord('K'),

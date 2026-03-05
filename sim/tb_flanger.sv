@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // =============================================================================
-// Testbench: delay (Strymon Timeline Multi-Mode Delay)
+// Testbench: flanger (MXR M117R-style)
 //
 // clk_audio : 12.288 MHz  (half period ≈ 41 ns)
 // sample_en : 1-cycle pulse every 256 clocks (48 kHz)
@@ -10,17 +10,16 @@
 //   TC1  Reset clears output
 //   TC2  Zero input → zero output
 //   TC3  No X/Z propagation after reset
-//   TC4  Input appears at output after delay time
-//   TC5  Repeats produce decaying echoes
-//   TC6  Mix blend
+//   TC4  Non-zero output with sine input (comb filtering)
+//   TC5  Regen increases feedback (output grows over cycles)
+//   TC6  Mix blend between dry and wet
 // =============================================================================
 
-module tb_delay;
+module tb_flanger;
 
     localparam int WIDTH           = 24;
     localparam int CLK_HALF_NS     = 41;
     localparam int CLKS_PER_SAMPLE = 256;
-    localparam int RAM_DEPTH       = 65536;
 
     localparam signed [WIDTH-1:0] SAT_MAX = {1'b0, {(WIDTH-1){1'b1}}};
     localparam signed [WIDTH-1:0] SAT_MIN = {1'b1, {(WIDTH-1){1'b0}}};
@@ -51,25 +50,23 @@ module tb_delay;
     logic                    sample_en;
     logic signed [WIDTH-1:0] audio_in;
     logic signed [WIDTH-1:0] audio_out;
-    logic [15:0]             time_val;
-    logic [7:0]              repeats_val;
+    logic [7:0]              manual_val;
+    logic [7:0]              width_val;
+    logic [7:0]              speed_val;
+    logic [7:0]              regen_val;
     logic [7:0]              mix_val;
-    logic [7:0]              filter_val;
-    logic [7:0]              mod_val;
-    logic [7:0]              grit_val;
 
-    delay #(.AUDIO_W(WIDTH), .RAM_DEPTH(RAM_DEPTH)) dut (
-        .clk        (clk),
-        .rst_n      (rst_n),
-        .sample_en  (sample_en),
-        .audio_in   (audio_in),
-        .audio_out  (audio_out),
-        .time_val   (time_val),
-        .repeats_val(repeats_val),
-        .mix_val    (mix_val),
-        .filter_val (filter_val),
-        .mod_val    (mod_val),
-        .grit_val   (grit_val)
+    flanger #(.WIDTH(WIDTH), .CTRL_W(8)) dut (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .sample_en (sample_en),
+        .audio_in  (audio_in),
+        .audio_out (audio_out),
+        .manual_val(manual_val),
+        .width_val (width_val),
+        .speed_val (speed_val),
+        .regen_val (regen_val),
+        .mix_val   (mix_val)
     );
 
     // Clock
@@ -113,14 +110,13 @@ module tb_delay;
     endtask
 
     task automatic do_reset();
-        rst_n       = 1'b0;
-        audio_in    = '0;
-        time_val    = 16'd1200;   // 25 ms @ 48 kHz
-        repeats_val = 8'd100;
-        mix_val     = 8'd128;     // 50/50
-        filter_val  = 8'd255;     // bright
-        mod_val     = 8'd0;       // no mod
-        grit_val    = 8'd0;       // digital mode
+        rst_n      = 1'b0;
+        audio_in   = '0;
+        manual_val = 8'd64;
+        width_val  = 8'd128;
+        speed_val  = 8'd48;
+        regen_val  = 8'd144;  // slight positive feedback
+        mix_val    = 8'd96;
         repeat (20) @(posedge clk);
         @(negedge clk);
         rst_n = 1'b1;
@@ -130,7 +126,7 @@ module tb_delay;
     logic [5:0] lut_idx;
 
     initial begin
-        $display("=== delay testbench ===");
+        $display("=== flanger testbench ===");
 
         // -----------------------------------------------------------------
         // TC1: Reset clears output
@@ -138,12 +134,11 @@ module tb_delay;
         $display("\n-- TC1: Reset clears output --");
         rst_n    = 1'b0;
         audio_in = 24'sh3FFFFF;
-        time_val = 16'd1200;
-        repeats_val = 8'd128;
-        mix_val     = 8'd128;
-        filter_val  = 8'd255;
-        mod_val     = 8'd0;
-        grit_val    = 8'd0;
+        manual_val = 8'd64;
+        width_val  = 8'd128;
+        speed_val  = 8'd48;
+        regen_val  = 8'd128;
+        mix_val    = 8'd96;
         repeat (10) @(posedge clk);
         check(audio_out === 24'sh0,
               "audio_out = 0 during reset");
@@ -153,7 +148,8 @@ module tb_delay;
         // -----------------------------------------------------------------
         $display("\n-- TC2: Zero input silence --");
         do_reset();
-        mix_val = 8'd0;  // dry only
+        regen_val = 8'd128;  // zero regen (centre)
+        mix_val   = 8'd0;
         begin
             int nonzero = 0;
             for (int i = 0; i < 20; i++) begin
@@ -162,7 +158,7 @@ module tb_delay;
                 @(posedge clk);
                 if (audio_out !== 24'sh0) nonzero++;
             end
-            check(nonzero == 0, "zero input -> zero output for 20 samples (dry)");
+            check(nonzero == 0, "zero input -> zero output for 20 samples");
         end
 
         // -----------------------------------------------------------------
@@ -170,7 +166,7 @@ module tb_delay;
         // -----------------------------------------------------------------
         $display("\n-- TC3: No X/Z propagation --");
         do_reset();
-        mix_val = 8'd128;
+        mix_val = 8'd96;
         lut_idx = '0;
         begin
             logic any_x = 1'b0;
@@ -185,111 +181,96 @@ module tb_delay;
         end
 
         // -----------------------------------------------------------------
-        // TC4: Input appears at output after delay time
+        // TC4: Non-zero output with sine input (comb filtering)
         // -----------------------------------------------------------------
-        $display("\n-- TC4: Delayed echo appears --");
+        $display("\n-- TC4: Comb filtering produces output --");
         do_reset();
-        time_val    = 16'd600;   // minimum delay (600 samples)
-        repeats_val = 8'd0;
-        mix_val     = 8'd255;    // full wet
-        filter_val  = 8'd255;
-        mod_val     = 8'd0;
-        grit_val    = 8'd0;
-        // Send impulse then silence
-        @(posedge clk iff sample_en);
-        audio_in = 24'sh500000;
-        @(posedge clk);
+        manual_val = 8'd64;
+        width_val  = 8'd128;
+        speed_val  = 8'd48;
+        regen_val  = 8'd128;  // zero feedback
+        mix_val    = 8'd128;  // 50% wet
+        lut_idx = '0;
         begin
-            logic found_echo = 1'b0;
-            for (int i = 0; i < 700; i++) begin
+            logic any_nonzero = 1'b0;
+            for (int i = 0; i < 300; i++) begin
                 @(posedge clk iff sample_en);
-                audio_in = 24'sh0;
+                audio_in = SINE_LUT[lut_idx];
+                lut_idx  = lut_idx + 1'b1;
                 @(posedge clk);
-                if (!found_echo && audio_out !== 24'sh0)
-                    found_echo = 1'b1;
+                if (audio_out !== 24'sh0) any_nonzero = 1'b1;
             end
-            check(found_echo,
-                  "echo: non-zero output appears after delay time");
+            check(any_nonzero, "sine input produces non-zero output");
         end
 
         // -----------------------------------------------------------------
-        // TC5: Repeats produce decaying echoes
+        // TC5: Regen increases feedback effect
         // -----------------------------------------------------------------
-        $display("\n-- TC5: Repeats produce echoes --");
-        // Run A: no repeats
+        $display("\n-- TC5: Regen feedback --");
+        // Run A: no regen (centre = 0x80)
         do_reset();
-        time_val    = 16'd600;
-        repeats_val = 8'd0;
-        mix_val     = 8'd200;
-        filter_val  = 8'd255;
-        mod_val     = 8'd0;
-        grit_val    = 8'd0;
-        @(posedge clk iff sample_en);
-        audio_in = 24'sh500000;
-        @(posedge clk);
-        begin
-            int echoes_no_rpt = 0;
-            for (int i = 0; i < 2000; i++) begin
-                @(posedge clk iff sample_en);
-                audio_in = 24'sh0;
-                @(posedge clk);
-                begin
-                    logic signed [WIDTH-1:0] abs_o;
-                    abs_o = audio_out[WIDTH-1] ? -audio_out : audio_out;
-                    if (abs_o > 24'sh001000) echoes_no_rpt++;
-                end
-            end
-
-            // Run B: with repeats
-            do_reset();
-            time_val    = 16'd600;
-            repeats_val = 8'd200;  // high feedback
-            mix_val     = 8'd200;
-            filter_val  = 8'd255;
-            mod_val     = 8'd0;
-            grit_val    = 8'd0;
+        manual_val = 8'd64;
+        width_val  = 8'd0;    // no LFO mod
+        speed_val  = 8'd0;
+        regen_val  = 8'd128;  // zero regen
+        mix_val    = 8'd200;
+        lut_idx = '0;
+        for (int i = 0; i < 300; i++) begin
             @(posedge clk iff sample_en);
-            audio_in = 24'sh500000;
+            audio_in = SINE_LUT[lut_idx];
+            lut_idx  = lut_idx + 1'b1;
             @(posedge clk);
+        end
+        begin
+            logic signed [WIDTH-1:0] abs_no_regen;
+            abs_no_regen = audio_out[WIDTH-1] ? -audio_out : audio_out;
+
+            // Run B: positive regen
+            do_reset();
+            manual_val = 8'd64;
+            width_val  = 8'd0;
+            speed_val  = 8'd0;
+            regen_val  = 8'd230;  // strong positive regen
+            mix_val    = 8'd200;
+            lut_idx = '0;
+            for (int i = 0; i < 300; i++) begin
+                @(posedge clk iff sample_en);
+                audio_in = SINE_LUT[lut_idx];
+                lut_idx  = lut_idx + 1'b1;
+                @(posedge clk);
+            end
             begin
-                int echoes_with_rpt = 0;
-                for (int i = 0; i < 2000; i++) begin
-                    @(posedge clk iff sample_en);
-                    audio_in = 24'sh0;
-                    @(posedge clk);
-                    begin
-                        logic signed [WIDTH-1:0] abs_o;
-                        abs_o = audio_out[WIDTH-1] ? -audio_out : audio_out;
-                        if (abs_o > 24'sh001000) echoes_with_rpt++;
-                    end
-                end
-                check(echoes_with_rpt >= echoes_no_rpt,
-                      "higher repeats produces more non-zero echo samples");
+                logic signed [WIDTH-1:0] abs_with_regen;
+                abs_with_regen = audio_out[WIDTH-1] ? -audio_out : audio_out;
+                check(abs_with_regen != abs_no_regen,
+                      "regen changes output compared to no regen");
             end
         end
 
         // -----------------------------------------------------------------
-        // TC6: Mix blend
+        // TC6: Mix blend between dry and wet
         // -----------------------------------------------------------------
         $display("\n-- TC6: Mix blend --");
-        // Run A: mix=0 (dry only)
+        // Run A: mix=0 (pure dry)
         do_reset();
         mix_val = 8'd0;
-        for (int i = 0; i < 50; i++) begin
+        for (int i = 0; i < 100; i++) begin
             @(posedge clk iff sample_en);
             audio_in = 24'sh300000;
             @(posedge clk);
         end
         begin
             logic signed [WIDTH-1:0] dry_out = audio_out;
-            // Run B: mix=255 (wet only)
+            // Run B: mix=255 (max wet)
             do_reset();
             mix_val = 8'd255;
-            for (int i = 0; i < 50; i++) begin
+            for (int i = 0; i < 100; i++) begin
                 @(posedge clk iff sample_en);
                 audio_in = 24'sh300000;
                 @(posedge clk);
             end
+            // With mix=0, output = dry only; with mix=255, output = dry + wet
+            // They should differ
             check(audio_out !== dry_out,
                   "mix=0 and mix=255 produce different outputs");
         end
@@ -308,7 +289,7 @@ module tb_delay;
 
     // Timeout watchdog
     initial begin
-        #(500_000_000);  // 500ms - delay needs longer for echo tests
+        #(200_000_000);
         $display("ERROR: Simulation timeout.");
         $fatal(1, "Timeout");
     end

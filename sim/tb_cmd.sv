@@ -1,15 +1,40 @@
 `timescale 1ns / 1ps
 
+// ============================================================================
+// tb_cmd.sv — Testbench for cmd (UART + cmd_proc + FIFOs)
+//
+// The cmd module now outputs a flat register write bus:
+//   wr_en (toggle), wr_addr, wr_data
+// Each toggle edge on wr_en captures a new register write.
+//
+// Tests:
+//   1. Boot prompt
+//   2. Empty CR → prompt
+//   3. Character echo
+//   4. Set delay repeats
+//   5. Set chorus rate
+//   6. Set phaser speed
+//   7. Set tremolo rate
+//   8. Set compressor threshold
+//   9. Set compressor ratio (new effect)
+//  10. Set wah frequency (new effect)
+//  11. Set big muff sustain
+//  12. Set reverb decay
+//  13. Invalid command → Err
+//  14. Backspace handling
+//  15. Sequential commands
+// ============================================================================
+
 module tb_cmd;
 
   // ---------------------------------------------------------------
   // Parameters - use high baud rate to keep simulation fast
   // ---------------------------------------------------------------
-  localparam int CLK_FREQ   = 10_000_000;   // 10 MHz
-  localparam int BAUD_RATE  = 1_000_000;    // 1 Mbaud
+  localparam int CLK_FREQ   = 10_000_000;
+  localparam int BAUD_RATE  = 1_000_000;
   localparam int FIFO_DEPTH = 16;
   localparam int CLK_PERIOD = 100;           // 100 ns -> 10 MHz
-  localparam int BIT_PERIOD = CLK_FREQ / BAUD_RATE * CLK_PERIOD; // ns per UART bit
+  localparam int BIT_PERIOD = CLK_FREQ / BAUD_RATE * CLK_PERIOD;
 
   // ---------------------------------------------------------------
   // DUT signals
@@ -18,16 +43,11 @@ module tb_cmd;
   logic        rst_n = 0;
   logic        tx_din = 1;    // serial line into DUT RX (idle high)
   logic        rx_dout;       // serial line out of DUT TX
-  logic [ 3:0] sw_effect = 4'b1111;
 
-  logic [ 7:0] tone_val, level_val, feedback_val;
-  logic [31:0] time_val;
-  logic [ 7:0] chorus_rate_val, chorus_depth_val, chorus_efx_val;
-  logic [ 7:0] chorus_eqhi_val, chorus_eqlo_val;
-  logic [ 7:0] phaser_speed_val;
-  logic        phaser_fben_val;
-  logic [ 7:0] trem_rate_val, trem_depth_val;
-  logic        trem_shape_val;
+  // Flat register write bus (toggle CDC)
+  logic        wr_en;
+  logic [7:0]  wr_addr;
+  logic [7:0]  wr_data;
 
   // ---------------------------------------------------------------
   // Clock generation
@@ -46,52 +66,64 @@ module tb_cmd;
       .rst_n     (rst_n),
       .tx_din    (tx_din),
       .rx_dout   (rx_dout),
-      .sw_effect (sw_effect),
-      .tone_val        (tone_val),
-      .level_val       (level_val),
-      .feedback_val    (feedback_val),
-      .time_val        (time_val),
-      .chorus_rate_val (chorus_rate_val),
-      .chorus_depth_val(chorus_depth_val),
-      .chorus_efx_val  (chorus_efx_val),
-      .chorus_eqhi_val (chorus_eqhi_val),
-      .chorus_eqlo_val (chorus_eqlo_val),
-      .phaser_speed_val(phaser_speed_val),
-      .phaser_fben_val (phaser_fben_val),
-      .trem_rate_val   (trem_rate_val),
-      .trem_depth_val  (trem_depth_val),
-      .trem_shape_val  (trem_shape_val)
+      .wr_en     (wr_en),
+      .wr_addr   (wr_addr),
+      .wr_data   (wr_data)
   );
+
+  // ---------------------------------------------------------------
+  // Write bus monitor — capture register writes on toggle edges
+  // ---------------------------------------------------------------
+  logic        wr_en_prev = 0;
+  logic [7:0]  last_wr_addr;
+  logic [7:0]  last_wr_data;
+  logic        wr_seen;
+  int          wr_count = 0;
+
+  always_ff @(posedge clk) begin
+    wr_en_prev <= wr_en;
+    if (wr_en !== wr_en_prev) begin
+      last_wr_addr <= wr_addr;
+      last_wr_data <= wr_data;
+      wr_seen      <= 1'b1;
+      wr_count     <= wr_count + 1;
+    end else begin
+      wr_seen <= 1'b0;
+    end
+  end
+
+  task automatic clear_wr_log();
+    wr_count = 0;
+  endtask
+
+  // Wait for a write to occur (with timeout)
+  task automatic wait_for_write(input int timeout_bits = 100);
+    int waited = 0;
+    while (!wr_seen && waited < timeout_bits) begin
+      @(posedge clk);
+      waited++;
+    end
+  endtask
 
   // ---------------------------------------------------------------
   // UART TX task - send one byte serially into DUT (tx_din)
   // ---------------------------------------------------------------
   task automatic uart_send_byte(input [7:0] data);
-    // Start bit
-    tx_din = 0;
+    tx_din = 0;           // Start bit
     #(BIT_PERIOD);
-    // Data bits (LSB first)
     for (int i = 0; i < 8; i++) begin
-      tx_din = data[i];
+      tx_din = data[i];   // Data bits (LSB first)
       #(BIT_PERIOD);
     end
-    // Stop bit
-    tx_din = 1;
+    tx_din = 1;           // Stop bit
     #(BIT_PERIOD);
   endtask
 
-  // ---------------------------------------------------------------
-  // UART TX task - send a string (each char as a byte)
-  // ---------------------------------------------------------------
   task automatic uart_send_string(input string s);
-    for (int i = 0; i < s.len(); i++) begin
+    for (int i = 0; i < s.len(); i++)
       uart_send_byte(s[i]);
-    end
   endtask
 
-  // ---------------------------------------------------------------
-  // UART TX task - send a string followed by CR
-  // ---------------------------------------------------------------
   task automatic uart_send_cmd(input string s);
     uart_send_string(s);
     uart_send_byte(8'h0D);  // CR
@@ -101,25 +133,19 @@ module tb_cmd;
   // UART RX task - receive one byte from DUT (rx_dout)
   // ---------------------------------------------------------------
   task automatic uart_recv_byte(output [7:0] data);
-    // Wait for start bit (falling edge)
     @(negedge rx_dout);
-    // Sample at mid-bit
     #(BIT_PERIOD / 2);
-    // Verify start bit
-    if (rx_dout !== 0) begin
+    if (rx_dout !== 0)
       $display("[%0t] ERROR: Expected start bit=0, got %b", $time, rx_dout);
-    end
-    // Sample 8 data bits
     for (int i = 0; i < 8; i++) begin
       #(BIT_PERIOD);
       data[i] = rx_dout;
     end
-    // Wait through stop bit
     #(BIT_PERIOD);
   endtask
 
   // ---------------------------------------------------------------
-  // Background RX collector - captures everything DUT transmits
+  // Background RX collector
   // ---------------------------------------------------------------
   logic [7:0] rx_log     [0:511];
   int         rx_log_idx = 0;
@@ -149,8 +175,6 @@ module tb_cmd;
 
   // ---------------------------------------------------------------
   // Helper: wait for DUT to finish transmitting
-  //   Line must stay HIGH (idle) for idle_bits consecutive bit
-  //   periods before we declare transmission complete.
   // ---------------------------------------------------------------
   task automatic wait_tx_idle(input int idle_bits = 20);
     int idle_count;
@@ -164,30 +188,14 @@ module tb_cmd;
     end
   endtask
 
-  // ---------------------------------------------------------------
-  // Helper: clear the RX log
-  // ---------------------------------------------------------------
   task automatic clear_rx_log();
     rx_log_idx = 0;
     rx_string  = "";
   endtask
 
-  // ---------------------------------------------------------------
-  // Helper: print captured response
-  // ---------------------------------------------------------------
   task automatic print_rx_log(input string label);
     $display("[%0t] --- %s --- captured %0d bytes: \"%s\"", $time, label, rx_log_idx, rx_string);
   endtask
-
-  // ---------------------------------------------------------------
-  // FIFO internal probes (hierarchy access for verification)
-  // ---------------------------------------------------------------
-//  wire [$clog2(FIFO_DEPTH):0] rx_fifo_count = dut.rx_fifo_inst.count;
-//  wire [$clog2(FIFO_DEPTH):0] tx_fifo_count = dut.tx_fifo_inst.count;
-//  wire rx_fifo_full  = dut.rx_fifo_inst.full;
-//  wire rx_fifo_empty = dut.rx_fifo_inst.empty;
-//  wire tx_fifo_full  = dut.tx_fifo_inst.full;
-//  wire tx_fifo_empty = dut.tx_fifo_inst.empty;
 
   // ---------------------------------------------------------------
   // Test counters
@@ -213,7 +221,7 @@ module tb_cmd;
     $dumpvars(0, tb_cmd);
 
     $display("========================================");
-    $display(" CMD + FIFO Testbench");
+    $display(" CMD Testbench (flat write bus)");
     $display(" CLK_FREQ=%0d  BAUD=%0d  FIFO_DEPTH=%0d", CLK_FREQ, BAUD_RATE, FIFO_DEPTH);
     $display(" BIT_PERIOD=%0d ns", BIT_PERIOD);
     $display("========================================");
@@ -226,18 +234,15 @@ module tb_cmd;
 
     // ============================================================
     // TEST 1: Boot prompt
-    //   After reset, cmd_proc sends CR+LF then "Arty> "
-    //   All routed through the TX FIFO -> UART
     // ============================================================
     $display("\n--- TEST 1: Boot prompt ---");
     wait_tx_idle(30);
     print_rx_log("Boot");
     check("Boot: received bytes > 0", rx_log_idx > 0);
-    check("Boot: contains prompt chars", rx_log_idx >= 8);
     clear_rx_log();
 
     // ============================================================
-    // TEST 2: Empty command (just CR) -> should get CR+LF + prompt
+    // TEST 2: Empty command (just CR) -> should get prompt
     // ============================================================
     $display("\n--- TEST 2: Empty CR ---");
     uart_send_byte(8'h0D);
@@ -247,7 +252,7 @@ module tb_cmd;
     clear_rx_log();
 
     // ============================================================
-    // TEST 3: Echo test - send a char and verify it echoes back
+    // TEST 3: Character echo
     // ============================================================
     $display("\n--- TEST 3: Character echo ---");
     uart_send_byte("h");
@@ -256,134 +261,132 @@ module tb_cmd;
     check("Echo: received at least 1 byte", rx_log_idx >= 1);
     check("Echo: first byte is 'h'", rx_log[0] == "h");
     clear_rx_log();
-
-    // ============================================================
-    // TEST 4: Status command with all effects enabled
-    //   First clear the 'h' in cmd_buf with backspace
-    // ============================================================
-    $display("\n--- TEST 4: Status command (all effects) ---");
-    sw_effect = 4'b1111;
-    uart_send_byte(8'h08);  // BS to clear 'h'
+    // Clear the 'h' from buffer
+    uart_send_byte(8'h7F);
     wait_tx_idle(20);
     clear_rx_log();
-    uart_send_cmd("st");
-    wait_tx_idle(50);
-    print_rx_log("Status");
-    check("Status: received substantial response", rx_log_idx > 20);
-    clear_rx_log();
 
     // ============================================================
-    // TEST 5: Status command bypass mode (no effects)
+    // TEST 4: Set delay repeats (addr 0x18)
     // ============================================================
-    $display("\n--- TEST 5: Status command (bypass) ---");
-    sw_effect = 4'b0000;
-    uart_send_cmd("st");
+    $display("\n--- TEST 4: Set delay repeats ---");
+    clear_wr_log();
+    uart_send_cmd("set dly rpt 80");
     wait_tx_idle(40);
-    print_rx_log("Bypass status");
-    check("Bypass: received response", rx_log_idx > 0);
-    clear_rx_log();
-    sw_effect = 4'b1111;
-
-    // ============================================================
-    // TEST 6: Set delay level command
-    // ============================================================
-    $display("\n--- TEST 6: Set delay level ---");
-    uart_send_cmd("set dly level FF");
-    wait_tx_idle(30);
-    print_rx_log("set dly level FF");
-    #(CLK_PERIOD * 10);
-    $display("  level_val = 0x%02h", level_val);
-    check("Set dly level: level_val == 0xFF", level_val == 8'hFF);
+    print_rx_log("set dly rpt 80");
+    check("Set dly rpt: write occurred", wr_count > 0);
+    check("Set dly rpt: addr=0x18", last_wr_addr == 8'h18);
+    check("Set dly rpt: data=0x80", last_wr_data == 8'h80);
     clear_rx_log();
 
     // ============================================================
-    // TEST 7: Set delay feedback
+    // TEST 5: Set chorus rate (addr 0x10)
     // ============================================================
-    $display("\n--- TEST 7: Set delay feedback ---");
-    uart_send_cmd("set dly feedback 10");
-    wait_tx_idle(30);
-    print_rx_log("set dly feedback 10");
-    #(CLK_PERIOD * 10);
-    $display("  feedback_val = 0x%02h", feedback_val);
-    check("Set dly feedback: feedback_val == 0x10", feedback_val == 8'h10);
-    clear_rx_log();
-
-    // ============================================================
-    // TEST 8: Set delay time (32-bit value)
-    // ============================================================
-    $display("\n--- TEST 8: Set delay time ---");
-    uart_send_cmd("set dly time 00001000");
-    wait_tx_idle(30);
-    print_rx_log("set dly time");
-    #(CLK_PERIOD * 10);
-    $display("  time_val = 0x%08h", time_val);
-    check("Set dly time: time_val == 0x00001000", time_val == 32'h00001000);
-    clear_rx_log();
-
-    // ============================================================
-    // TEST 9: Set delay tone
-    // ============================================================
-    $display("\n--- TEST 9: Set delay tone ---");
-    uart_send_cmd("set dly tone 80");
-    wait_tx_idle(30);
-    print_rx_log("set dly tone");
-    #(CLK_PERIOD * 10);
-    $display("  tone_val = 0x%02h", tone_val);
-    check("Set dly tone: tone_val == 0x80", tone_val == 8'h80);
-    clear_rx_log();
-
-    // ============================================================
-    // TEST 10: Set chorus rate
-    // ============================================================
-    $display("\n--- TEST 10: Set chorus rate ---");
+    $display("\n--- TEST 5: Set chorus rate ---");
+    clear_wr_log();
     uart_send_cmd("set cho rate C0");
-    wait_tx_idle(30);
-    print_rx_log("set cho rate");
-    #(CLK_PERIOD * 10);
-    $display("  chorus_rate_val = 0x%02h", chorus_rate_val);
-    check("Set cho rate: chorus_rate_val == 0xC0", chorus_rate_val == 8'hC0);
+    wait_tx_idle(40);
+    print_rx_log("set cho rate C0");
+    check("Set cho rate: write occurred", wr_count > 0);
+    check("Set cho rate: addr=0x10", last_wr_addr == 8'h10);
+    check("Set cho rate: data=0xC0", last_wr_data == 8'hC0);
     clear_rx_log();
 
     // ============================================================
-    // TEST 11: Set chorus depth
+    // TEST 6: Set phaser speed (addr 0x08)
     // ============================================================
-    $display("\n--- TEST 11: Set chorus depth ---");
-    uart_send_cmd("set cho depth B0");
-    wait_tx_idle(30);
-    print_rx_log("set cho depth");
-    #(CLK_PERIOD * 10);
-    $display("  chorus_depth_val = 0x%02h", chorus_depth_val);
-    check("Set cho depth: chorus_depth_val == 0xB0", chorus_depth_val == 8'hB0);
-    clear_rx_log();
-
-    // ============================================================
-    // TEST 12: Set phaser speed
-    // ============================================================
-    $display("\n--- TEST 12: Set phaser speed ---");
+    $display("\n--- TEST 6: Set phaser speed ---");
+    clear_wr_log();
     uart_send_cmd("set pha speed 55");
-    wait_tx_idle(30);
-    print_rx_log("set pha speed");
-    #(CLK_PERIOD * 10);
-    $display("  phaser_speed_val = 0x%02h", phaser_speed_val);
-    check("Set pha speed: phaser_speed_val == 0x55", phaser_speed_val == 8'h55);
+    wait_tx_idle(40);
+    print_rx_log("set pha speed 55");
+    check("Set pha speed: write occurred", wr_count > 0);
+    check("Set pha speed: addr=0x08", last_wr_addr == 8'h08);
+    check("Set pha speed: data=0x55", last_wr_data == 8'h55);
     clear_rx_log();
 
     // ============================================================
-    // TEST 13: Set tremolo rate
+    // TEST 7: Set tremolo rate (addr 0x00)
     // ============================================================
-    $display("\n--- TEST 13: Set tremolo rate ---");
+    $display("\n--- TEST 7: Set tremolo rate ---");
+    clear_wr_log();
     uart_send_cmd("set trm rate 40");
-    wait_tx_idle(30);
-    print_rx_log("set trm rate");
-    #(CLK_PERIOD * 10);
-    $display("  trem_rate_val = 0x%02h", trem_rate_val);
-    check("Set trm rate: trem_rate_val == 0x40", trem_rate_val == 8'h40);
+    wait_tx_idle(40);
+    print_rx_log("set trm rate 40");
+    check("Set trm rate: write occurred", wr_count > 0);
+    check("Set trm rate: addr=0x00", last_wr_addr == 8'h00);
+    check("Set trm rate: data=0x40", last_wr_data == 8'h40);
     clear_rx_log();
 
     // ============================================================
-    // TEST 14: Invalid command -> "Err" response
+    // TEST 8: Set compressor threshold (addr 0x40)
     // ============================================================
-    $display("\n--- TEST 14: Invalid command ---");
+    $display("\n--- TEST 8: Set compressor threshold ---");
+    clear_wr_log();
+    uart_send_cmd("set cmp thr 80");
+    wait_tx_idle(40);
+    print_rx_log("set cmp thr 80");
+    check("Set cmp thr: write occurred", wr_count > 0);
+    check("Set cmp thr: addr=0x40", last_wr_addr == 8'h40);
+    check("Set cmp thr: data=0x80", last_wr_data == 8'h80);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 9: Set compressor ratio (addr 0x41)
+    // ============================================================
+    $display("\n--- TEST 9: Set compressor ratio ---");
+    clear_wr_log();
+    uart_send_cmd("set cmp rat 40");
+    wait_tx_idle(40);
+    print_rx_log("set cmp rat 40");
+    check("Set cmp rat: write occurred", wr_count > 0);
+    check("Set cmp rat: addr=0x41", last_wr_addr == 8'h41);
+    check("Set cmp rat: data=0x40", last_wr_data == 8'h40);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 10: Set wah frequency (addr 0x48)
+    // ============================================================
+    $display("\n--- TEST 10: Set wah frequency ---");
+    clear_wr_log();
+    uart_send_cmd("set wah frq A0");
+    wait_tx_idle(40);
+    print_rx_log("set wah frq A0");
+    check("Set wah frq: write occurred", wr_count > 0);
+    check("Set wah frq: addr=0x48", last_wr_addr == 8'h48);
+    check("Set wah frq: data=0xA0", last_wr_data == 8'hA0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 11: Set big muff sustain (addr 0x30)
+    // ============================================================
+    $display("\n--- TEST 11: Set big muff sustain ---");
+    clear_wr_log();
+    uart_send_cmd("set bmf sus FF");
+    wait_tx_idle(40);
+    print_rx_log("set bmf sus FF");
+    check("Set bmf sus: write occurred", wr_count > 0);
+    check("Set bmf sus: addr=0x30", last_wr_addr == 8'h30);
+    check("Set bmf sus: data=0xFF", last_wr_data == 8'hFF);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 12: Set reverb decay (addr 0x38)
+    // ============================================================
+    $display("\n--- TEST 12: Set reverb decay ---");
+    clear_wr_log();
+    uart_send_cmd("set rev dec C0");
+    wait_tx_idle(40);
+    print_rx_log("set rev dec C0");
+    check("Set rev dec: write occurred", wr_count > 0);
+    check("Set rev dec: addr=0x38", last_wr_addr == 8'h38);
+    check("Set rev dec: data=0xC0", last_wr_data == 8'hC0);
+    clear_rx_log();
+
+    // ============================================================
+    // TEST 13: Invalid command -> "Err" response
+    // ============================================================
+    $display("\n--- TEST 13: Invalid command ---");
     uart_send_cmd("xyz");
     wait_tx_idle(30);
     print_rx_log("Invalid cmd");
@@ -391,16 +394,14 @@ module tb_cmd;
     clear_rx_log();
 
     // ============================================================
-    // TEST 15: Backspace handling
-    //   Send 'x', wait for echo to fully complete, clear log,
-    //   then send DEL and wait for the 3-byte response to finish.
+    // TEST 14: Backspace handling
     // ============================================================
-    $display("\n--- TEST 15: Backspace ---");
+    $display("\n--- TEST 14: Backspace ---");
     uart_send_byte("x");
-    wait_tx_idle(20);       // wait for 'x' echo to fully transmit
+    wait_tx_idle(20);
     clear_rx_log();
-    uart_send_byte(8'h7F);  // DEL (treated as backspace by cmd_proc)
-    wait_tx_idle(20);       // wait for BS+SPC+BS (3 bytes) to finish
+    uart_send_byte(8'h7F);  // DEL
+    wait_tx_idle(20);
     print_rx_log("Backspace");
     check("Backspace: received 3 bytes (BS SPC BS)", rx_log_idx == 3);
     if (rx_log_idx >= 3) begin
@@ -409,79 +410,34 @@ module tb_cmd;
       check("Backspace: byte2 == 0x08", rx_log[2] == 8'h08);
     end
     clear_rx_log();
-    // Send CR to return to clean state
     uart_send_byte(8'h0D);
     wait_tx_idle(30);
     clear_rx_log();
 
     // ============================================================
-    // TEST 16: Burst input - send multiple chars rapidly
-    //   Tests that the RX FIFO buffers without dropping bytes
+    // TEST 15: Sequential commands
     // ============================================================
-    $display("\n--- TEST 16: Burst RX (FIFO buffering) ---");
-    uart_send_cmd("set dly level 42");
+    $display("\n--- TEST 15: Sequential commands ---");
+    clear_wr_log();
+    uart_send_cmd("set cmp atk 10");
     wait_tx_idle(30);
-    print_rx_log("Burst set dly level 42");
-    #(CLK_PERIOD * 10);
-    $display("  level_val = 0x%02h", level_val);
-    check("Burst: level_val == 0x42", level_val == 8'h42);
+    check("Seq cmp atk: addr=0x42", last_wr_addr == 8'h42);
+    check("Seq cmp atk: data=0x10", last_wr_data == 8'h10);
     clear_rx_log();
 
-    // ============================================================
-    // TEST 17: Verify TX FIFO drains correctly after long status
-    // ============================================================
-//    $display("\n--- TEST 17: TX FIFO drain after status ---");
-//    sw_effect = 4'b1111;
-//    uart_send_cmd("st");
-//    wait_tx_idle(50);
-//    print_rx_log("Full status drain");
-//    #(CLK_PERIOD * 20);
-//    check("TX FIFO empty after drain", tx_fifo_empty === 1'b1);
-//    check("RX FIFO empty after processing", rx_fifo_empty === 1'b1);
-//    clear_rx_log();
-
-    // ============================================================
-    // TEST 18: Set multiple registers in sequence
-    // ============================================================
-    $display("\n--- TEST 18: Sequential commands ---");
-    uart_send_cmd("set dly level 11");
+    clear_wr_log();
+    uart_send_cmd("set cmp mak 60");
     wait_tx_idle(30);
-    clear_rx_log();
-    uart_send_cmd("set dly feedback 22");
-    wait_tx_idle(30);
-    clear_rx_log();
-    uart_send_cmd("set dly tone 33");
-    wait_tx_idle(30);
-    clear_rx_log();
-    #(CLK_PERIOD * 10);
-    $display("  level_val    = 0x%02h", level_val);
-    $display("  feedback_val = 0x%02h", feedback_val);
-    $display("  tone_val     = 0x%02h", tone_val);
-    check("Seq: level_val == 0x11",    level_val    == 8'h11);
-    check("Seq: feedback_val == 0x22", feedback_val == 8'h22);
-    check("Seq: tone_val == 0x33",     tone_val     == 8'h33);
-
-    // ============================================================
-    // TEST 19: Set chorus EFX level
-    // ============================================================
-    $display("\n--- TEST 19: Set chorus efx ---");
-    uart_send_cmd("set cho efx 99");
-    wait_tx_idle(30);
-    print_rx_log("set cho efx");
-    #(CLK_PERIOD * 10);
-    $display("  chorus_efx_val = 0x%02h", chorus_efx_val);
-    check("Set cho efx: chorus_efx_val == 0x99", chorus_efx_val == 8'h99);
+    check("Seq cmp mak: addr=0x44", last_wr_addr == 8'h44);
+    check("Seq cmp mak: data=0x60", last_wr_data == 8'h60);
     clear_rx_log();
 
-    // ============================================================
-    // TEST 20: FIFO status check - both FIFOs idle
-    // ============================================================
-//    $display("\n--- TEST 20: Final FIFO state ---");
-//    #(CLK_PERIOD * 100);
-//    check("Final: TX FIFO empty", tx_fifo_empty === 1'b1);
-//    check("Final: RX FIFO empty", rx_fifo_empty === 1'b1);
-//    check("Final: TX FIFO not full", tx_fifo_full === 1'b0);
-//    check("Final: RX FIFO not full", rx_fifo_full === 1'b0);
+    clear_wr_log();
+    uart_send_cmd("set wah res B0");
+    wait_tx_idle(30);
+    check("Seq wah res: addr=0x49", last_wr_addr == 8'h49);
+    check("Seq wah res: data=0xB0", last_wr_data == 8'hB0);
+    clear_rx_log();
 
     // ============================================================
     // Summary
@@ -503,7 +459,7 @@ module tb_cmd;
   // Timeout watchdog
   // ---------------------------------------------------------------
   initial begin
-    #(500_000_000);  // 500 ms
+    #(500_000_000);
     $display("[TIMEOUT] Simulation exceeded max time");
     $finish;
   end

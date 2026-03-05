@@ -56,35 +56,37 @@ module cmd_proc (
   localparam logic [7:0] ADDR_DLY_TIM = 8'h1B;
   localparam logic [7:0] ADDR_DLY_MOD = 8'h1D;
   localparam logic [7:0] ADDR_DLY_GRT = 8'h1E;
-  localparam logic [7:0] ADDR_TUB_GAI = 8'h20;
-  localparam logic [7:0] ADDR_TUB_BAS = 8'h21;
-  localparam logic [7:0] ADDR_TUB_MID = 8'h22;
-  localparam logic [7:0] ADDR_TUB_TRE = 8'h23;
-  localparam logic [7:0] ADDR_TUB_LVL = 8'h24;
-  localparam logic [7:0] ADDR_FLN_MAN = 8'h28;
-  localparam logic [7:0] ADDR_FLN_WID = 8'h29;
-  localparam logic [7:0] ADDR_FLN_SPD = 8'h2A;
-  localparam logic [7:0] ADDR_FLN_REG = 8'h2B;
-  localparam logic [7:0] ADDR_FLN_MIX = 8'h2C;
-  localparam logic [7:0] ADDR_BMF_SUS = 8'h30;
-  localparam logic [7:0] ADDR_BMF_TON = 8'h31;
-  localparam logic [7:0] ADDR_BMF_VOL = 8'h32;
-  localparam logic [7:0] ADDR_REV_DEC = 8'h38;
-  localparam logic [7:0] ADDR_REV_DMP = 8'h39;
-  localparam logic [7:0] ADDR_REV_MIX = 8'h3A;
-  localparam logic [7:0] ADDR_REV_PRE = 8'h3B;
-  localparam logic [7:0] ADDR_REV_TON = 8'h3C;
-  localparam logic [7:0] ADDR_REV_LVL = 8'h3D;
-  localparam logic [7:0] ADDR_RTE_BASE = 8'h40;
+  localparam logic [7:0] ADDR_FLN_MAN = 8'h20;
+  localparam logic [7:0] ADDR_FLN_WID = 8'h21;
+  localparam logic [7:0] ADDR_FLN_SPD = 8'h22;
+  localparam logic [7:0] ADDR_FLN_REG = 8'h23;
+  localparam logic [7:0] ADDR_FLN_MIX = 8'h24;
+  localparam logic [7:0] ADDR_REV_DEC = 8'h28;
+  localparam logic [7:0] ADDR_REV_DMP = 8'h29;
+  localparam logic [7:0] ADDR_REV_MIX = 8'h2A;
+  localparam logic [7:0] ADDR_REV_PRE = 8'h2B;
+  localparam logic [7:0] ADDR_REV_TON = 8'h2C;
+  localparam logic [7:0] ADDR_REV_LVL = 8'h2D;
+  localparam logic [7:0] ADDR_CMP_THR = 8'h30;
+  localparam logic [7:0] ADDR_CMP_RAT = 8'h31;
+  localparam logic [7:0] ADDR_CMP_ATK = 8'h32;
+  localparam logic [7:0] ADDR_CMP_REL = 8'h33;
+  localparam logic [7:0] ADDR_CMP_MAK = 8'h34;
+  localparam logic [7:0] ADDR_WAH_FRQ = 8'h38;
+  localparam logic [7:0] ADDR_WAH_RES = 8'h39;
+  localparam logic [7:0] ADDR_WAH_DPT = 8'h3A;
+  localparam logic [7:0] ADDR_WAH_MOD = 8'h3B;
+  localparam logic [7:0] ADDR_WAH_MIX = 8'h3C;
+  localparam logic [7:0] ADDR_RTE_BASE = 8'h60;
 
   localparam logic [7:0] ADDR_BYP_TRM = 8'h07;
   localparam logic [7:0] ADDR_BYP_PHA = 8'h0F;
   localparam logic [7:0] ADDR_BYP_CHO = 8'h17;
   localparam logic [7:0] ADDR_BYP_DLY = 8'h1F;
-  localparam logic [7:0] ADDR_BYP_TUB = 8'h27;
-  localparam logic [7:0] ADDR_BYP_FLN = 8'h2F;
-  localparam logic [7:0] ADDR_BYP_BMF = 8'h37;
-  localparam logic [7:0] ADDR_BYP_REV = 8'h3F;
+  localparam logic [7:0] ADDR_BYP_FLN = 8'h27;
+  localparam logic [7:0] ADDR_BYP_REV = 8'h2F;
+  localparam logic [7:0] ADDR_BYP_CMP = 8'h37;
+  localparam logic [7:0] ADDR_BYP_WAH = 8'h3F;
   localparam logic [7:0] ADDR_RAW_SENTINEL = 8'hFF;
 
   localparam int CDC_WAIT_CYCLES = 31;
@@ -112,10 +114,10 @@ module cmd_proc (
     S_ST_PHA,
     S_ST_CHO,
     S_ST_DLY,
-    S_ST_TUB,
     S_ST_FLN,
-    S_ST_BMF,
     S_ST_REV,
+    S_ST_CMP,
+    S_ST_WAH,
     S_TX_START,
     S_TX_WAIT,
     S_LOAD_PROMPT,
@@ -139,7 +141,7 @@ module cmd_proc (
   logic [7:0] cmd_buf [0:47];
   logic [5:0] cmd_idx   = '0;
 
-  logic [7:0] tx_buf [0:79];
+  logic [7:0] tx_buf [0:99];
   logic [6:0] tx_len    = '0;
   logic [6:0] tx_idx    = '0;
 
@@ -158,14 +160,14 @@ module cmd_proc (
   logic [ 4:0] cdc_wait    = '0;
 
   // ─── Chain command state ─────────────────────────────────────────────
-  logic [3:0] chain_ports [0:7];   // parsed port numbers (up to 8 effects)
+  logic [3:0] chain_ports [0:8];   // parsed port numbers (up to 9 ports)
   logic [3:0] chain_count;         // how many effects in chain
   logic [4:0] chain_step;          // write step counter (2 phases per write)
   logic [7:0] chain_enabled;       // 1 bit per slot: slot is in chain
 
   // ─── Shadow registers ────────────────────────────────────────────────────
-  logic [7:0] shadow       [0:63];
-  logic [7:0] shadow_route [0:8];
+  logic [7:0] shadow       [0:63];  // 8 slots × 8 regs = 64
+  logic [7:0] shadow_route [0:8];   // 9 ports
 
   logic [7:0] init_idx;
 
@@ -213,10 +215,10 @@ module cmd_proc (
     else if (c0=="p" && c1=="h" && c2=="a") return 4'd2;
     else if (c0=="c" && c1=="h" && c2=="o") return 4'd3;
     else if (c0=="d" && c1=="l" && c2=="y") return 4'd4;
-    else if (c0=="t" && c1=="u" && c2=="b") return 4'd5;
-    else if (c0=="f" && c1=="l" && c2=="n") return 4'd6;
-    else if (c0=="b" && c1=="m" && c2=="f") return 4'd7;
-    else if (c0=="r" && c1=="e" && c2=="v") return 4'd8;
+    else if (c0=="f" && c1=="l" && c2=="n") return 4'd5;
+    else if (c0=="r" && c1=="e" && c2=="v") return 4'd6;
+    else if (c0=="c" && c1=="m" && c2=="p") return 4'd7;
+    else if (c0=="w" && c1=="a" && c2=="h") return 4'd8;
     else                                     return 4'd15; // invalid
   endfunction
 
@@ -265,15 +267,15 @@ module cmd_proc (
 
   task automatic emit_port_src(input logic [3:0] src, inout int p);
     case (src)
-      4'd0: begin tx_buf[p] <= "A"; p++; tx_buf[p] <= "D"; p++; tx_buf[p] <= "C"; p++; end
-      4'd1: begin tx_buf[p] <= "T"; p++; tx_buf[p] <= "R"; p++; tx_buf[p] <= "M"; p++; end
-      4'd2: begin tx_buf[p] <= "P"; p++; tx_buf[p] <= "H"; p++; tx_buf[p] <= "A"; p++; end
-      4'd3: begin tx_buf[p] <= "C"; p++; tx_buf[p] <= "H"; p++; tx_buf[p] <= "O"; p++; end
-      4'd4: begin tx_buf[p] <= "D"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "Y"; p++; end
-      4'd5: begin tx_buf[p] <= "T"; p++; tx_buf[p] <= "U"; p++; tx_buf[p] <= "B"; p++; end
-      4'd6: begin tx_buf[p] <= "F"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "N"; p++; end
-      4'd7: begin tx_buf[p] <= "B"; p++; tx_buf[p] <= "M"; p++; tx_buf[p] <= "F"; p++; end
-      4'd8: begin tx_buf[p] <= "R"; p++; tx_buf[p] <= "E"; p++; tx_buf[p] <= "V"; p++; end
+      4'd0:  begin tx_buf[p] <= "A"; p++; tx_buf[p] <= "D"; p++; tx_buf[p] <= "C"; p++; end
+      4'd1:  begin tx_buf[p] <= "T"; p++; tx_buf[p] <= "R"; p++; tx_buf[p] <= "M"; p++; end
+      4'd2:  begin tx_buf[p] <= "P"; p++; tx_buf[p] <= "H"; p++; tx_buf[p] <= "A"; p++; end
+      4'd3:  begin tx_buf[p] <= "C"; p++; tx_buf[p] <= "H"; p++; tx_buf[p] <= "O"; p++; end
+      4'd4:  begin tx_buf[p] <= "D"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "Y"; p++; end
+      4'd5:  begin tx_buf[p] <= "F"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "N"; p++; end
+      4'd6:  begin tx_buf[p] <= "R"; p++; tx_buf[p] <= "E"; p++; tx_buf[p] <= "V"; p++; end
+      4'd7:  begin tx_buf[p] <= "C"; p++; tx_buf[p] <= "M"; p++; tx_buf[p] <= "P"; p++; end
+      4'd8:  begin tx_buf[p] <= "W"; p++; tx_buf[p] <= "A"; p++; tx_buf[p] <= "H"; p++; end
       default: begin tx_buf[p] <= "?"; p++; tx_buf[p] <= "?"; p++; tx_buf[p] <= "?"; p++; end
     endcase
   endtask
@@ -376,32 +378,34 @@ module cmd_proc (
       shadow[27] <= 8'h00; shadow[28] <= 8'h30;
       shadow[29] <= 8'h00; shadow[30] <= 8'h00;
 
-      // Slot 4 (tube_distortion)
-      shadow[32] <= 8'h60;
-      shadow[33] <= 8'h80;
-      shadow[34] <= 8'h80;
-      shadow[35] <= 8'h80;
-      shadow[36] <= 8'hC0;
+      // Slot 4 (flanger)
+      shadow[32] <= 8'h40;   // manual
+      shadow[33] <= 8'h80;   // width
+      shadow[34] <= 8'h30;   // speed
+      shadow[35] <= 8'h90;   // regen
+      shadow[36] <= 8'h60;   // mix
 
-      // Slot 5 (flanger)
-      shadow[40] <= 8'h40;
-      shadow[41] <= 8'h80;
-      shadow[42] <= 8'h30;
-      shadow[43] <= 8'h90;
-      shadow[44] <= 8'h60;
+      // Slot 5 (reverb)
+      shadow[40] <= 8'h80;   // decay
+      shadow[41] <= 8'h60;   // damping
+      shadow[42] <= 8'h60;   // mix
+      shadow[43] <= 8'h20;   // pre-delay
+      shadow[44] <= 8'h80;   // tone
+      shadow[45] <= 8'h80;   // level
 
-      // Slot 6 (big_muff)
-      shadow[48] <= 8'h80;
-      shadow[49] <= 8'h80;
-      shadow[50] <= 8'hA0;
+      // Slot 6 (compressor)
+      shadow[48] <= 8'h60;   // threshold
+      shadow[49] <= 8'h40;   // ratio
+      shadow[50] <= 8'h20;   // attack
+      shadow[51] <= 8'h40;   // release
+      shadow[52] <= 8'h40;   // makeup
 
-      // Slot 7 (reverb)
-      shadow[56] <= 8'h80;   // decay
-      shadow[57] <= 8'h60;   // damping
-      shadow[58] <= 8'h60;   // mix
-      shadow[59] <= 8'h20;   // pre-delay
-      shadow[60] <= 8'h80;   // tone
-      shadow[61] <= 8'h80;   // level
+      // Slot 7 (wah)
+      shadow[56] <= 8'h80;   // freq
+      shadow[57] <= 8'h60;   // resonance
+      shadow[58] <= 8'hFF;   // depth
+      shadow[59] <= 8'h00;   // mode
+      shadow[60] <= 8'hFF;   // mix
 
       // Bypass bits - all bypassed at boot
       shadow[7]  <= 8'h01;
@@ -413,16 +417,16 @@ module cmd_proc (
       shadow[55] <= 8'h01;
       shadow[63] <= 8'h01;
 
-      // Default route: ADC→BMF→TUB→PHA→FLN→CHO→TRM→DLY→REV→DAC
-      shadow_route[0] <= 8'd8;
-      shadow_route[1] <= 8'd3;
-      shadow_route[2] <= 8'd5;
-      shadow_route[3] <= 8'd6;
-      shadow_route[4] <= 8'd1;
-      shadow_route[5] <= 8'd7;
-      shadow_route[6] <= 8'd2;
-      shadow_route[7] <= 8'd0;
-      shadow_route[8] <= 8'd4;
+      // Default route: ADC→WAH→CMP→PHA→FLN→CHO→TRM→DLY→REV→DAC
+      shadow_route[0] <= 8'd6;    // DAC ← REV
+      shadow_route[1] <= 8'd3;    // TRM ← CHO
+      shadow_route[2] <= 8'd7;    // PHA ← CMP
+      shadow_route[3] <= 8'd5;    // CHO ← FLN
+      shadow_route[4] <= 8'd1;    // DLY ← TRM
+      shadow_route[5] <= 8'd2;    // FLN ← PHA
+      shadow_route[6] <= 8'd4;    // REV ← DLY
+      shadow_route[7] <= 8'd8;    // CMP ← WAH
+      shadow_route[8] <= 8'd0;    // WAH ← ADC
 
       chain_enabled <= 8'hFF;  // all effects in chain at boot
       init_idx      <= 8'd0;
@@ -572,10 +576,10 @@ module cmd_proc (
               else if (m3(4,"p","h","a")) src_val = 8'd2;
               else if (m3(4,"c","h","o")) src_val = 8'd3;
               else if (m3(4,"d","l","y")) src_val = 8'd4;
-              else if (m3(4,"t","u","b")) src_val = 8'd5;
-              else if (m3(4,"f","l","n")) src_val = 8'd6;
-              else if (m3(4,"b","m","f")) src_val = 8'd7;
-              else if (m3(4,"r","e","v")) src_val = 8'd8;
+              else if (m3(4,"f","l","n")) src_val = 8'd5;
+              else if (m3(4,"r","e","v")) src_val = 8'd6;
+              else if (m3(4,"c","m","p")) src_val = 8'd7;
+              else if (m3(4,"w","a","h")) src_val = 8'd8;
               else begin src_val = '0; src_ok = 0; end
 
               if (cmd_buf[7] != CHAR_SPC || cmd_buf[8] != "t" || cmd_buf[9] != "o" || cmd_buf[10] != CHAR_SPC)
@@ -587,10 +591,10 @@ module cmd_proc (
                 else if (m3(11,"p","h","a")) snk_addr = ADDR_RTE_BASE + 8'd2;
                 else if (m3(11,"c","h","o")) snk_addr = ADDR_RTE_BASE + 8'd3;
                 else if (m3(11,"d","l","y")) snk_addr = ADDR_RTE_BASE + 8'd4;
-                else if (m3(11,"t","u","b")) snk_addr = ADDR_RTE_BASE + 8'd5;
-                else if (m3(11,"f","l","n")) snk_addr = ADDR_RTE_BASE + 8'd6;
-                else if (m3(11,"b","m","f")) snk_addr = ADDR_RTE_BASE + 8'd7;
-                else if (m3(11,"r","e","v")) snk_addr = ADDR_RTE_BASE + 8'd8;
+                else if (m3(11,"f","l","n")) snk_addr = ADDR_RTE_BASE + 8'd5;
+                else if (m3(11,"r","e","v")) snk_addr = ADDR_RTE_BASE + 8'd6;
+                else if (m3(11,"c","m","p")) snk_addr = ADDR_RTE_BASE + 8'd7;
+                else if (m3(11,"w","a","h")) snk_addr = ADDR_RTE_BASE + 8'd8;
                 else begin snk_addr = '0; snk_ok = 0; end
               end
 
@@ -653,17 +657,6 @@ module cmd_proc (
               else if (is_off())          do_bypass(ADDR_BYP_DLY, 8'h01);
               else                        send_err();
 
-            // ── tube distortion ──
-            end else if (m3(4, "t","u","b") && cmd_buf[7] == CHAR_SPC) begin
-              if      (m3(8,"g","a","i")) set_param(ADDR_TUB_GAI);
-              else if (m3(8,"b","a","s")) set_param(ADDR_TUB_BAS);
-              else if (m3(8,"m","i","d")) set_param(ADDR_TUB_MID);
-              else if (m3(8,"t","r","e")) set_param(ADDR_TUB_TRE);
-              else if (m3(8,"l","v","l")) set_param(ADDR_TUB_LVL);
-              else if (is_on())           do_bypass(ADDR_BYP_TUB, 8'h00);
-              else if (is_off())          do_bypass(ADDR_BYP_TUB, 8'h01);
-              else                        send_err();
-
             // ── flanger ──
             end else if (m3(4, "f","l","n") && cmd_buf[7] == CHAR_SPC) begin
               if      (m3(8,"m","a","n")) set_param(ADDR_FLN_MAN);
@@ -673,15 +666,6 @@ module cmd_proc (
               else if (m3(8,"m","i","x")) set_param(ADDR_FLN_MIX);
               else if (is_on())           do_bypass(ADDR_BYP_FLN, 8'h00);
               else if (is_off())          do_bypass(ADDR_BYP_FLN, 8'h01);
-              else                        send_err();
-
-            // ── big_muff ──
-            end else if (m3(4, "b","m","f") && cmd_buf[7] == CHAR_SPC) begin
-              if      (m3(8,"s","u","s")) set_param(ADDR_BMF_SUS);
-              else if (m3(8,"t","o","n")) set_param(ADDR_BMF_TON);
-              else if (m3(8,"v","o","l")) set_param(ADDR_BMF_VOL);
-              else if (is_on())           do_bypass(ADDR_BYP_BMF, 8'h00);
-              else if (is_off())          do_bypass(ADDR_BYP_BMF, 8'h01);
               else                        send_err();
 
             // ── reverb ──
@@ -696,6 +680,28 @@ module cmd_proc (
               else if (is_off())          do_bypass(ADDR_BYP_REV, 8'h01);
               else                        send_err();
 
+            // ── compressor ──
+            end else if (m3(4, "c","m","p") && cmd_buf[7] == CHAR_SPC) begin
+              if      (m3(8,"t","h","r")) set_param(ADDR_CMP_THR);
+              else if (m3(8,"r","a","t")) set_param(ADDR_CMP_RAT);
+              else if (m3(8,"a","t","k")) set_param(ADDR_CMP_ATK);
+              else if (m3(8,"r","e","l")) set_param(ADDR_CMP_REL);
+              else if (m3(8,"m","a","k")) set_param(ADDR_CMP_MAK);
+              else if (is_on())           do_bypass(ADDR_BYP_CMP, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_CMP, 8'h01);
+              else                        send_err();
+
+            // ── wah ──
+            end else if (m3(4, "w","a","h") && cmd_buf[7] == CHAR_SPC) begin
+              if      (m3(8,"f","r","q")) set_param(ADDR_WAH_FRQ);
+              else if (m3(8,"r","e","s")) set_param(ADDR_WAH_RES);
+              else if (m3(8,"d","p","t")) set_param(ADDR_WAH_DPT);
+              else if (m3(8,"m","o","d")) set_param(ADDR_WAH_MOD);
+              else if (m3(8,"m","i","x")) set_param(ADDR_WAH_MIX);
+              else if (is_on())           do_bypass(ADDR_BYP_WAH, 8'h00);
+              else if (is_off())          do_bypass(ADDR_BYP_WAH, 8'h01);
+              else                        send_err();
+
             end else begin
               send_err();
             end
@@ -703,7 +709,7 @@ module cmd_proc (
           // ── "chain <tag> ..." ─────────────────────────────────────
           end else if (m3(0, "c","h","a") && m3(3, "i","n"," ")) begin
             chain_count   <= 4'd0;
-            chain_enabled <= 8'd0;
+            chain_enabled <= '0;
             state         <= S_CHAIN_PARSE;
 
           end else begin
@@ -734,19 +740,19 @@ module cmd_proc (
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[4][3:0], p);
           tx_buf[p]<=" ";p++;
-          tx_buf[p]<="T";p++;tx_buf[p]<="U";p++;tx_buf[p]<="B";p++;
+          tx_buf[p]<="F";p++;tx_buf[p]<="L";p++;tx_buf[p]<="N";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[5][3:0], p);
           tx_buf[p]<=" ";p++;
-          tx_buf[p]<="F";p++;tx_buf[p]<="L";p++;tx_buf[p]<="N";p++;
+          tx_buf[p]<="R";p++;tx_buf[p]<="E";p++;tx_buf[p]<="V";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[6][3:0], p);
           tx_buf[p]<=" ";p++;
-          tx_buf[p]<="B";p++;tx_buf[p]<="M";p++;tx_buf[p]<="F";p++;
+          tx_buf[p]<="C";p++;tx_buf[p]<="M";p++;tx_buf[p]<="P";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[7][3:0], p);
           tx_buf[p]<=" ";p++;
-          tx_buf[p]<="R";p++;tx_buf[p]<="E";p++;tx_buf[p]<="V";p++;
+          tx_buf[p]<="W";p++;tx_buf[p]<="A";p++;tx_buf[p]<="H";p++;
           tx_buf[p]<="<";p++;
           emit_port_src(shadow_route[8][3:0], p);
           st_nl(p);
@@ -839,7 +845,7 @@ module cmd_proc (
             automatic int p = 0;
             emit_disabled("D", "L", "Y", p);
             tx_len <= 7'(p); tx_idx <= '0;
-            return_state <= S_ST_TUB;
+            return_state <= S_ST_FLN;
             state <= S_TX_START;
           end else if (!shadow[31][0]) begin
             automatic int p = 0;
@@ -860,33 +866,6 @@ module cmd_proc (
             st_nl(p);
             tx_len       <= 7'(p);
             tx_idx       <= '0;
-            return_state <= S_ST_TUB;
-            state        <= S_TX_START;
-          end else begin
-            state <= S_ST_TUB;
-          end
-        end
-
-        // ── Tube distortion (slot 4) ──
-        S_ST_TUB: begin
-          if (!chain_enabled[4]) begin
-            automatic int p = 0;
-            emit_disabled("T", "U", "B", p);
-            tx_len <= 7'(p); tx_idx <= '0;
-            return_state <= S_ST_FLN;
-            state <= S_TX_START;
-          end else if (!shadow[39][0]) begin
-            automatic int p = 0;
-            tx_buf[p] <= "T"; p++; tx_buf[p] <= "U"; p++; tx_buf[p] <= "B"; p++;
-            tx_buf[p] <= " "; p++;
-            emit_param("g","a","i", shadow[8'h20], p);
-            emit_param("b","a","s", shadow[8'h21], p);
-            emit_param("m","i","d", shadow[8'h22], p);
-            emit_param("t","r","e", shadow[8'h23], p);
-            emit_param("l","v","l", shadow[8'h24], p);
-            st_nl(p);
-            tx_len       <= 7'(p);
-            tx_idx       <= '0;
             return_state <= S_ST_FLN;
             state        <= S_TX_START;
           end else begin
@@ -894,48 +873,23 @@ module cmd_proc (
           end
         end
 
-        // ── Flanger (slot 5) ──
+        // ── Flanger (slot 4) ──
         S_ST_FLN: begin
-          if (!chain_enabled[5]) begin
+          if (!chain_enabled[4]) begin
             automatic int p = 0;
             emit_disabled("F", "L", "N", p);
             tx_len <= 7'(p); tx_idx <= '0;
-            return_state <= S_ST_BMF;
+            return_state <= S_ST_REV;
             state <= S_TX_START;
-          end else if (!shadow[47][0]) begin
+          end else if (!shadow[39][0]) begin
             automatic int p = 0;
             tx_buf[p] <= "F"; p++; tx_buf[p] <= "L"; p++; tx_buf[p] <= "N"; p++;
             tx_buf[p] <= " "; p++;
-            emit_param("m","a","n", shadow[8'h28], p);
-            emit_param("w","i","d", shadow[8'h29], p);
-            emit_param("s","p","d", shadow[8'h2A], p);
-            emit_param("r","e","g", shadow[8'h2B], p);
-            emit_param("m","i","x", shadow[8'h2C], p);
-            st_nl(p);
-            tx_len       <= 7'(p);
-            tx_idx       <= '0;
-            return_state <= S_ST_BMF;
-            state        <= S_TX_START;
-          end else begin
-            state <= S_ST_BMF;
-          end
-        end
-
-        // ── Big Muff (slot 6) ──
-        S_ST_BMF: begin
-          if (!chain_enabled[6]) begin
-            automatic int p = 0;
-            emit_disabled("B", "M", "F", p);
-            tx_len <= 7'(p); tx_idx <= '0;
-            return_state <= S_ST_REV;
-            state <= S_TX_START;
-          end else if (!shadow[55][0]) begin
-            automatic int p = 0;
-            tx_buf[p] <= "B"; p++; tx_buf[p] <= "M"; p++; tx_buf[p] <= "F"; p++;
-            tx_buf[p] <= " "; p++;
-            emit_param("s","u","s", shadow[8'h30], p);
-            emit_param("t","o","n", shadow[8'h31], p);
-            emit_param("v","o","l", shadow[8'h32], p);
+            emit_param("m","a","n", shadow[8'h20], p);
+            emit_param("w","i","d", shadow[8'h21], p);
+            emit_param("s","p","d", shadow[8'h22], p);
+            emit_param("r","e","g", shadow[8'h23], p);
+            emit_param("m","i","x", shadow[8'h24], p);
             st_nl(p);
             tx_len       <= 7'(p);
             tx_idx       <= '0;
@@ -946,24 +900,78 @@ module cmd_proc (
           end
         end
 
-        // ── Reverb (slot 7) ──
+        // ── Reverb (slot 5) ──
         S_ST_REV: begin
-          if (!chain_enabled[7]) begin
+          if (!chain_enabled[5]) begin
             automatic int p = 0;
             emit_disabled("R", "E", "V", p);
+            tx_len <= 7'(p); tx_idx <= '0;
+            return_state <= S_ST_CMP;
+            state <= S_TX_START;
+          end else if (!shadow[47][0]) begin
+            automatic int p = 0;
+            tx_buf[p] <= "R"; p++; tx_buf[p] <= "E"; p++; tx_buf[p] <= "V"; p++;
+            tx_buf[p] <= " "; p++;
+            emit_param("d","e","c", shadow[8'h28], p);
+            emit_param("d","m","p", shadow[8'h29], p);
+            emit_param("m","i","x", shadow[8'h2A], p);
+            emit_param("p","r","e", shadow[8'h2B], p);
+            emit_param("t","o","n", shadow[8'h2C], p);
+            emit_param("l","v","l", shadow[8'h2D], p);
+            st_nl(p);
+            tx_len       <= 7'(p);
+            tx_idx       <= '0;
+            return_state <= S_ST_CMP;
+            state        <= S_TX_START;
+          end else begin
+            state <= S_ST_CMP;
+          end
+        end
+
+        // ── Compressor (slot 6) ──
+        S_ST_CMP: begin
+          if (!chain_enabled[6]) begin
+            automatic int p = 0;
+            emit_disabled("C", "M", "P", p);
+            tx_len <= 7'(p); tx_idx <= '0;
+            return_state <= S_ST_WAH;
+            state <= S_TX_START;
+          end else if (!shadow[55][0]) begin
+            automatic int p = 0;
+            tx_buf[p] <= "C"; p++; tx_buf[p] <= "M"; p++; tx_buf[p] <= "P"; p++;
+            tx_buf[p] <= " "; p++;
+            emit_param("t","h","r", shadow[8'h30], p);
+            emit_param("r","a","t", shadow[8'h31], p);
+            emit_param("a","t","k", shadow[8'h32], p);
+            emit_param("r","e","l", shadow[8'h33], p);
+            emit_param("m","a","k", shadow[8'h34], p);
+            st_nl(p);
+            tx_len       <= 7'(p);
+            tx_idx       <= '0;
+            return_state <= S_ST_WAH;
+            state        <= S_TX_START;
+          end else begin
+            state <= S_ST_WAH;
+          end
+        end
+
+        // ── Wah (slot 7) ──
+        S_ST_WAH: begin
+          if (!chain_enabled[7]) begin
+            automatic int p = 0;
+            emit_disabled("W", "A", "H", p);
             tx_len <= 7'(p); tx_idx <= '0;
             return_state <= S_LOAD_PROMPT;
             state <= S_TX_START;
           end else if (!shadow[63][0]) begin
             automatic int p = 0;
-            tx_buf[p] <= "R"; p++; tx_buf[p] <= "E"; p++; tx_buf[p] <= "V"; p++;
+            tx_buf[p] <= "W"; p++; tx_buf[p] <= "A"; p++; tx_buf[p] <= "H"; p++;
             tx_buf[p] <= " "; p++;
-            emit_param("d","e","c", shadow[8'h38], p);
-            emit_param("d","m","p", shadow[8'h39], p);
-            emit_param("m","i","x", shadow[8'h3A], p);
-            emit_param("p","r","e", shadow[8'h3B], p);
-            emit_param("t","o","n", shadow[8'h3C], p);
-            emit_param("l","v","l", shadow[8'h3D], p);
+            emit_param("f","r","q", shadow[8'h38], p);
+            emit_param("r","e","s", shadow[8'h39], p);
+            emit_param("d","p","t", shadow[8'h3A], p);
+            emit_param("m","o","d", shadow[8'h3B], p);
+            emit_param("m","i","x", shadow[8'h3C], p);
             st_nl(p);
             tx_len       <= 7'(p);
             tx_idx       <= '0;

@@ -63,67 +63,71 @@ module tube_distortion #(
   localparam signed [DATA_W-1:0] CLIP3_PEAK = signed'(DATA_W'((3 * (1 << (DATA_W-1))) / 4));   // 0.75 FS
 
   // =========================================================================
-  // Filter coefficients -- all Q4.20 (COEFF_W=24, FRAC=20)
+  // Filter coefficients
   // =========================================================================
-  localparam int COEFF_W = 24;
-  localparam int FRAC    = 20;
 
-  // --- Input coupling HPF: 2nd-order Butterworth, Fc = 80 Hz ---
-  // Removes DC and sub-bass rumble (models coupling capacitor).
+  // --- HPF: Q4.20 (COEFF_W=24, FRAC=20) — kept at full precision ---
+  localparam int HPF_CW   = 24;
+  localparam int HPF_FRAC = 20;
+
+  // Input coupling HPF: 2nd-order Butterworth, Fc = 80 Hz
   //   b0 =  0.9926225428  b1 = -1.9852450855  b2 =  0.9926225428
   //   a1 = -1.9851906579  a2 =  0.9852995131
-  localparam logic signed [COEFF_W-1:0] HPF_B0     =  24'sd1040840;
-  localparam logic signed [COEFF_W-1:0] HPF_B1     = -24'sd2081680;
-  localparam logic signed [COEFF_W-1:0] HPF_B2     =  24'sd1040840;
-  localparam logic signed [COEFF_W-1:0] HPF_A1_NEG =  24'sd2081623;
-  localparam logic signed [COEFF_W-1:0] HPF_A2_NEG = -24'sd1033161;
+  localparam logic signed [HPF_CW-1:0] HPF_B0     =  24'sd1040840;
+  localparam logic signed [HPF_CW-1:0] HPF_B1     = -24'sd2081680;
+  localparam logic signed [HPF_CW-1:0] HPF_B2     =  24'sd1040840;
+  localparam logic signed [HPF_CW-1:0] HPF_A1_NEG =  24'sd2081623;
+  localparam logic signed [HPF_CW-1:0] HPF_A2_NEG = -24'sd1033161;
 
-  // --- Post-clip smoothing 1: 2nd-order Butterworth LPF, Fc = 8 kHz ---
-  // Warmer than 10 kHz, tames aliasing from stage 1 clipping.
+  // --- Smoothing + tone: Q4.14 (SM_CW=18, SM_FRAC=14) ---
+  // 18-bit coefficients fit in a single DSP48E1 (25×18 signed multiply).
+  localparam int SM_CW   = 18;
+  localparam int SM_FRAC = 14;
+
+  // Post-clip smoothing 1: 2nd-order Butterworth LPF, Fc = 8 kHz
   //   b0 =  0.1550510257  b1 =  0.3101020514  b2 =  0.1550510257
   //   a1 = -0.6202041029  a2 =  0.2404082058
-  localparam logic signed [COEFF_W-1:0] SM1_B0     =  24'sd162583;
-  localparam logic signed [COEFF_W-1:0] SM1_B1     =  24'sd325166;
-  localparam logic signed [COEFF_W-1:0] SM1_B2     =  24'sd162583;
-  localparam logic signed [COEFF_W-1:0] SM1_A1_NEG =  24'sd650331;
-  localparam logic signed [COEFF_W-1:0] SM1_A2_NEG = -24'sd252086;
+  localparam logic signed [SM_CW-1:0] SM1_B0     =  18'sd2540;
+  localparam logic signed [SM_CW-1:0] SM1_B1     =  18'sd5081;
+  localparam logic signed [SM_CW-1:0] SM1_B2     =  18'sd2540;
+  localparam logic signed [SM_CW-1:0] SM1_A1_NEG =  18'sd10161;
+  localparam logic signed [SM_CW-1:0] SM1_A2_NEG = -18'sd3939;
 
-  // --- Post-clip smoothing 2: 2nd-order Butterworth LPF, Fc = 10 kHz ---
-  // Same as big_muff smoothing filter.
+  // Post-clip smoothing 2: 2nd-order Butterworth LPF, Fc = 10 kHz
   //   b0 =  0.2201947003  b1 =  0.4403894005  b2 =  0.2201947003
   //   a1 = -0.3075663598  a2 =  0.1883451609
-  localparam logic signed [COEFF_W-1:0] SM2_B0     =  24'sd230891;
-  localparam logic signed [COEFF_W-1:0] SM2_B1     =  24'sd461782;
-  localparam logic signed [COEFF_W-1:0] SM2_B2     =  24'sd230891;
-  localparam logic signed [COEFF_W-1:0] SM2_A1_NEG =  24'sd322507;
-  localparam logic signed [COEFF_W-1:0] SM2_A2_NEG = -24'sd197494;
+  localparam logic signed [SM_CW-1:0] SM2_B0     =  18'sd3608;
+  localparam logic signed [SM_CW-1:0] SM2_B1     =  18'sd7215;
+  localparam logic signed [SM_CW-1:0] SM2_B2     =  18'sd3608;
+  localparam logic signed [SM_CW-1:0] SM2_A1_NEG =  18'sd5039;
+  localparam logic signed [SM_CW-1:0] SM2_A2_NEG = -18'sd3086;
 
-  // --- Tone Bass LPF: 2nd-order Butterworth, Fc = 250 Hz ---
+  // Tone Bass LPF: 2nd-order Butterworth, Fc = 250 Hz
   //   b0 =  0.0002616527  b1 =  0.0005233054  b2 =  0.0002616527
   //   a1 = -1.9537279491  a2 =  0.9547745599
-  localparam logic signed [COEFF_W-1:0] BASS_B0     =  24'sd274;
-  localparam logic signed [COEFF_W-1:0] BASS_B1     =  24'sd549;
-  localparam logic signed [COEFF_W-1:0] BASS_B2     =  24'sd274;
-  localparam logic signed [COEFF_W-1:0] BASS_A1_NEG =  24'sd2048632;
-  localparam logic signed [COEFF_W-1:0] BASS_A2_NEG = -24'sd1001154;
+  localparam logic signed [SM_CW-1:0] BASS_B0     =  18'sd4;
+  localparam logic signed [SM_CW-1:0] BASS_B1     =  18'sd9;
+  localparam logic signed [SM_CW-1:0] BASS_B2     =  18'sd4;
+  localparam logic signed [SM_CW-1:0] BASS_A1_NEG =  18'sd32010;
+  localparam logic signed [SM_CW-1:0] BASS_A2_NEG = -18'sd15643;
 
-  // --- Tone Mid BPF: 2nd-order, Fc = 1 kHz, Q = 1.5 ---
+  // Tone Mid BPF: 2nd-order, Fc = 1 kHz, Q = 1.5
   //   b0 =  0.0416946495  b1 =  0.0000000000  b2 = -0.0416946495
   //   a1 = -1.9002138308  a2 =  0.9166107011
-  localparam logic signed [COEFF_W-1:0] MID_B0     =  24'sd43720;
-  localparam logic signed [COEFF_W-1:0] MID_B1     =  24'sd0;
-  localparam logic signed [COEFF_W-1:0] MID_B2     = -24'sd43720;
-  localparam logic signed [COEFF_W-1:0] MID_A1_NEG =  24'sd1992519;
-  localparam logic signed [COEFF_W-1:0] MID_A2_NEG = -24'sd961136;
+  localparam logic signed [SM_CW-1:0] MID_B0     =  18'sd683;
+  localparam logic signed [SM_CW-1:0] MID_B1     =  18'sd0;
+  localparam logic signed [SM_CW-1:0] MID_B2     = -18'sd683;
+  localparam logic signed [SM_CW-1:0] MID_A1_NEG =  18'sd31133;
+  localparam logic signed [SM_CW-1:0] MID_A2_NEG = -18'sd15018;
 
-  // --- Tone Treble HPF: 2nd-order Butterworth, Fc = 4 kHz ---
+  // Tone Treble HPF: 2nd-order Butterworth, Fc = 4 kHz
   //   b0 =  0.6893061688  b1 = -1.3786123375  b2 =  0.6893061688
   //   a1 = -1.2796324250  a2 =  0.4775922501
-  localparam logic signed [COEFF_W-1:0] TREB_B0     =  24'sd722790;
-  localparam logic signed [COEFF_W-1:0] TREB_B1     = -24'sd1445580;
-  localparam logic signed [COEFF_W-1:0] TREB_B2     =  24'sd722790;
-  localparam logic signed [COEFF_W-1:0] TREB_A1_NEG =  24'sd1341792;
-  localparam logic signed [COEFF_W-1:0] TREB_A2_NEG = -24'sd500792;
+  localparam logic signed [SM_CW-1:0] TREB_B0     =  18'sd11294;
+  localparam logic signed [SM_CW-1:0] TREB_B1     = -18'sd22587;
+  localparam logic signed [SM_CW-1:0] TREB_B2     =  18'sd11294;
+  localparam logic signed [SM_CW-1:0] TREB_A1_NEG =  18'sd20966;
+  localparam logic signed [SM_CW-1:0] TREB_A2_NEG = -18'sd7825;
 
   // =========================================================================
   // Per-stage gain from gain knob (same formula as big_muff)
@@ -148,8 +152,8 @@ module tube_distortion #(
 
   biquad_tdf2 #(
       .DATA_W (DATA_W),
-      .COEFF_W(COEFF_W),
-      .FRAC   (FRAC)
+      .COEFF_W(HPF_CW),
+      .FRAC   (HPF_FRAC)
   ) u_hpf (
       .clk   (clk),
       .rst_n (rst_n),
@@ -187,8 +191,8 @@ module tube_distortion #(
 
   biquad_tdf2 #(
       .DATA_W (DATA_W),
-      .COEFF_W(COEFF_W),
-      .FRAC   (FRAC)
+      .COEFF_W(SM_CW),
+      .FRAC   (SM_FRAC)
   ) u_smooth1 (
       .clk   (clk),
       .rst_n (rst_n),
@@ -226,8 +230,8 @@ module tube_distortion #(
 
   biquad_tdf2 #(
       .DATA_W (DATA_W),
-      .COEFF_W(COEFF_W),
-      .FRAC   (FRAC)
+      .COEFF_W(SM_CW),
+      .FRAC   (SM_FRAC)
   ) u_smooth2 (
       .clk   (clk),
       .rst_n (rst_n),
@@ -272,8 +276,8 @@ module tube_distortion #(
 
   biquad_tdf2 #(
       .DATA_W (DATA_W),
-      .COEFF_W(COEFF_W),
-      .FRAC   (FRAC)
+      .COEFF_W(SM_CW),
+      .FRAC   (SM_FRAC)
   ) u_bass (
       .clk   (clk),
       .rst_n (rst_n),
@@ -289,8 +293,8 @@ module tube_distortion #(
 
   biquad_tdf2 #(
       .DATA_W (DATA_W),
-      .COEFF_W(COEFF_W),
-      .FRAC   (FRAC)
+      .COEFF_W(SM_CW),
+      .FRAC   (SM_FRAC)
   ) u_mid (
       .clk   (clk),
       .rst_n (rst_n),
@@ -306,8 +310,8 @@ module tube_distortion #(
 
   biquad_tdf2 #(
       .DATA_W (DATA_W),
-      .COEFF_W(COEFF_W),
-      .FRAC   (FRAC)
+      .COEFF_W(SM_CW),
+      .FRAC   (SM_FRAC)
   ) u_treb (
       .clk   (clk),
       .rst_n (rst_n),

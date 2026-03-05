@@ -141,24 +141,25 @@ module chorus #(
     // --------------------------------------------------------
     // 3.  2-Band EQ
     //
-    // Biquad crossover: Q1.(DATA_WIDTH-1) coefficients, FRAC = AUDIO_FRAC
-    //   b0 = 0.125 × 2^AUDIO_FRAC, a1_neg = 0.875 × 2^AUDIO_FRAC
+    // Biquad crossover: Q1.17 coefficients (18-bit, fits 1 DSP48E1)
+    //   b0 = 0.125 × 2^17, a1_neg = 0.875 × 2^17
     // --------------------------------------------------------
-    localparam int BIQUAD_FRAC = AUDIO_FRAC;
-    localparam logic signed [DATA_WIDTH-1:0] XO_B0     = DATA_WIDTH'(int'(0.125 * (2.0 ** BIQUAD_FRAC)));
-    localparam logic signed [DATA_WIDTH-1:0] XO_A1_NEG = DATA_WIDTH'(int'(0.875 * (2.0 ** BIQUAD_FRAC)));
+    localparam int XO_CW   = 18;
+    localparam int XO_FRAC = 17;
+    localparam logic signed [XO_CW-1:0] XO_B0     = XO_CW'(int'(0.125 * (2.0 ** XO_FRAC)));
+    localparam logic signed [XO_CW-1:0] XO_A1_NEG = XO_CW'(int'(0.875 * (2.0 ** XO_FRAC)));
 
     logic signed [DATA_WIDTH-1:0] lpf;                      // Q1.AUDIO_FRAC
 
     biquad_tdf2 #(
         .DATA_W  (DATA_WIDTH),
-        .COEFF_W (DATA_WIDTH),
-        .FRAC    (BIQUAD_FRAC)
+        .COEFF_W (XO_CW),
+        .FRAC    (XO_FRAC)
     ) crossover_lpf (
         .clk    (clk),    .rst_n (rst_n),   .en (sample_en),
         .x_in   (wet_raw), .y_out (lpf),
-        .b0     (XO_B0),   .b1 ('0), .b2 ('0),
-        .a1_neg (XO_A1_NEG), .a2_neg ('0)
+        .b0     (XO_B0),   .b1 (XO_CW'(0)), .b2 (XO_CW'(0)),
+        .a1_neg (XO_A1_NEG), .a2_neg (XO_CW'(0))
     );
 
     logic signed [DATA_WIDTH-1:0] low_band;                  // Q1.AUDIO_FRAC
