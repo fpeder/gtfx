@@ -310,7 +310,8 @@ module axis_effect_slot #(
           .resonance_val  (cfg_slice[1]),
           .depth_val      (cfg_slice[2]),
           .mode_val       (cfg_slice[3]),
-          .mix_val        (cfg_slice[4])
+          .mix_val        (cfg_slice[4]),
+          .decay_val      (cfg_slice[5])
       );
 
       assign effect_out_l = core_out;

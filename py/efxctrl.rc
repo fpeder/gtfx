@@ -1,0 +1,41 @@
+# efxctrl theme — Tokyo Night palette
+# Colors are hex "#RRGGBB". Use "default" for terminal default bg.
+# Search order: $EFXCTRL_THEME → ~/.config/efxctrl/theme.toml → py/efxctrl.rc
+
+[colors]
+fg          = "#a9b1d6"
+blue        = "#7aa2f7"
+bright_fg   = "#c0caf5"
+dark_blue   = "#414868"
+select_bg   = "#283457"
+comment     = "#565f89"
+dark_bg     = "#15161e"
+green       = "#9ece6a"
+yellow      = "#e0af68"
+red         = "#f7768e"
+
+[pairs]
+# Each pair is [fg_color_name, bg_color_name]
+normal   = ["fg",        "default"]
+header   = ["bright_fg", "dark_blue"]
+active   = ["blue",      "default"]
+bypassed = ["comment",   "default"]
+selected = ["bright_fg", "select_bg"]
+bar      = ["blue",      "default"]
+title    = ["dark_bg",   "blue"]
+log      = ["green",     "default"]
+help     = ["yellow",    "default"]
+warn     = ["red",       "default"]
+
+[fallback]
+# ANSI color names for terminals that can't redefine colors
+normal   = ["white",   "default"]
+header   = ["black",   "cyan"]
+active   = ["blue",    "default"]
+bypassed = ["black",   "default"]
+selected = ["black",   "blue"]
+bar      = ["cyan",    "default"]
+title    = ["black",   "blue"]
+log      = ["green",   "default"]
+help     = ["yellow",  "default"]
+warn     = ["red",     "default"]

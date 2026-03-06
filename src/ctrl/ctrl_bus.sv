@@ -139,6 +139,7 @@ module ctrl_bus #(
             cfg_mem[58] <= 8'h80;   // sensitivity
             cfg_mem[59] <= 8'h00;   // mode (0=manual)
             cfg_mem[60] <= 8'hFF;   // mix (full wet)
+            cfg_mem[61] <= 8'h60;   // decay
             // cfg_mem[63] = 0x01 bypass on - set above
 
         end else if (wr_en && wr_addr < ADDR_W'(SLOT_END)) begin

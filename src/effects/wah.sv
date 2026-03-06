@@ -3,25 +3,30 @@
 // ============================================================================
 // wah.sv - Wah / Auto-Wah Effect Core
 //
-// State-variable filter (SVF) for resonant bandpass — more efficient than
+// State-variable filter (SVF) with peaked-lowpass response (bandpass peak +
+// lowpass body) — more efficient than
 // biquad for swept filters (only 2 multiplies for frequency and damping).
 //
-// Two modes:
+// Three modes:
 //   0 = Manual:   freq_val sets filter frequency directly
-//   1 = Auto:     LFO sweeps frequency. freq_val = rate, depth_val = range
+//   1 = Auto LFO: LFO sweeps frequency. freq_val = rate, depth_val = range
+//   2 = Envelope: envelope follower tracks pick dynamics (Cry Baby style)
+//                 freq_val[7:5] = sensitivity, depth_val = sweep range,
+//                 decay_val[7:5] = decay speed
 //
-// Frequency range: ~400 Hz – 2.5 kHz (classic wah sweep)
+// Frequency range: ~200 Hz – 2.5 kHz (wide wah sweep)
 //
 // Parameters (from cfg_slice):
-//   [0] freq       - manual frequency / LFO rate (0-255)
+//   [0] freq       - manual frequency / LFO rate / envelope sensitivity (0-255)
 //   [1] resonance  - filter Q (0=mild, 255=near self-oscillation)
 //   [2] depth      - auto mode sweep depth (0=none, 255=full F_MIN→F_MAX)
-//   [3] mode       - 0=manual, 1=auto
+//   [3] mode       - 0=manual, 1=LFO auto, 2/3=envelope
 //   [4] mix        - dry/wet blend (0=dry, 255=full wet)
+//   [5] decay      - envelope decay speed (mode 2 only)
 //   [7] bypass     - bypass control (bit 0)
 //
 // Latency: 1 cycle (sample_en → audio_out registered)
-// DSP cost: ~3 DSP48E1 (SVF freq, SVF damping, mix)
+// DSP cost: ~4 DSP48E1 (SVF freq, SVF damping, BP gain comp, mix)
 // ============================================================================
 
 module wah #(
@@ -39,7 +44,8 @@ module wah #(
     input logic [CTRL_W-1:0] resonance_val,
     input logic [CTRL_W-1:0] depth_val,
     input logic [CTRL_W-1:0] mode_val,
-    input logic [CTRL_W-1:0] mix_val
+    input logic [CTRL_W-1:0] mix_val,
+    input logic [CTRL_W-1:0] decay_val
 );
 
   // =========================================================================
@@ -51,11 +57,11 @@ module wah #(
   localparam int COEFF_W = 16;
   localparam int COEFF_FRAC = 14;
 
-  // Frequency coefficient range: maps to ~400 Hz – 2.5 kHz @ 48 kHz
+  // Frequency coefficient range: maps to ~200 Hz – 2.5 kHz @ 48 kHz
   // f_coeff = 2 * sin(pi * f / fs)
-  // At 400 Hz:  2 * sin(pi * 400/48000)  ≈ 0.0524 → 859 in Q2.14
+  // At 200 Hz:  2 * sin(pi * 200/48000)  ≈ 0.0262 → 429 in Q2.14
   // At 2500 Hz: 2 * sin(pi * 2500/48000) ≈ 0.3249 → 5324 in Q2.14
-  localparam int F_MIN = 859;    // ~400 Hz
+  localparam int F_MIN = 429;    // ~200 Hz
   localparam int F_MAX = 5324;   // ~2500 Hz
   localparam int F_RANGE = F_MAX - F_MIN;
 
@@ -85,41 +91,113 @@ module wah #(
   );
 
   // =========================================================================
+  // Envelope follower (for mode 2 — Cry Baby style)
+  //
+  // Leaky peak detector: attack (>>>4, ~0.8ms), variable decay.
+  // decay_val[7:5] maps to shift 9–16 (~22ms to ~1.4s @ 48 kHz).
+  // Zero DSP48E1 cost — shifts and adds only.
+  // =========================================================================
+  logic [DATA_W-1:0] abs_in;
+  logic [DATA_W-1:0] env_level;
+
+  // Absolute value of audio input
+  always_comb begin
+    abs_in = audio_in[DATA_W-1] ? DATA_W'(-audio_in) : DATA_W'(audio_in);
+  end
+
+  // Decay shift: decay_val[7:5] → shift of 9..16
+  logic [3:0] decay_shift;
+  always_comb begin
+    decay_shift = 4'd9 + 4'(decay_val[7:5]);
+  end
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      env_level <= '0;
+    end else if (sample_en) begin
+      if (abs_in > env_level) begin
+        // Attack: close gap by 1/16 per sample (~0.8ms to 90%)
+        env_level <= env_level + ((abs_in - env_level) >>> 4);
+      end else begin
+        // Variable decay
+        env_level <= env_level - (env_level >>> decay_shift);
+      end
+    end
+  end
+
+  // =========================================================================
   // Frequency control selection
   // =========================================================================
-  logic [COEFF_W-1:0] f_coeff;
+  logic [COEFF_W-1:0] f_target;
   logic [CTRL_W-1:0] lfo_scaled;
   logic [CTRL_W-1:0] sweep_val;
+  logic [CTRL_W-1:0] env_scaled;
+
+  // Normalize envelope to 0–255 using sensitivity from freq_val[7:5]
+  // Sensitivity shift: 8 + freq_val[7:5] → shifts 8..15
+  logic [3:0] sens_shift;
+  always_comb begin
+    sens_shift = 4'd8 + 4'(freq_val[7:5]);
+  end
 
   always_comb begin
     lfo_scaled = '0;
     sweep_val  = '0;
+    env_scaled = '0;
 
-    case (mode_val[0])
-      1'b0: begin
+    case (mode_val[1:0])
+      2'b00: begin
         // Manual: freq_val directly maps to frequency
-        f_coeff = COEFF_W'(F_MIN + (int'(freq_val) * F_RANGE) / 256);
+        f_target = COEFF_W'(F_MIN + (int'(freq_val) * F_RANGE) / 256);
       end
-      1'b1: begin
-        // Auto: LFO sweeps frequency, depth_val scales range
+      2'b01: begin
+        // Auto LFO: LFO sweeps frequency, depth_val scales range
         lfo_scaled = lfo_unsigned[LFO_W-1:LFO_W-CTRL_W];                // Q0.8: 0–255
         sweep_val  = CTRL_W'((int'(depth_val) * int'(lfo_scaled)) / 256); // depth-scaled
-        f_coeff    = COEFF_W'(F_MIN + (int'(sweep_val) * F_RANGE) / 256);
+        f_target   = COEFF_W'(F_MIN + (int'(sweep_val) * F_RANGE) / 256);
+      end
+      default: begin
+        // Envelope follower (modes 2 & 3): pick dynamics → freq sweep
+        // Normalize envelope to 0–255, clamp
+        if ((env_level >>> sens_shift) > DATA_W'(255))
+          env_scaled = 8'hFF;
+        else
+          env_scaled = CTRL_W'(env_level >>> sens_shift);
+        // Apply depth scaling
+        sweep_val  = CTRL_W'((int'(depth_val) * int'(env_scaled)) / 256);
+        f_target   = COEFF_W'(F_MIN + (int'(sweep_val) * F_RANGE) / 256);
       end
     endcase
+  end
+
+  // =========================================================================
+  // Frequency smoother — one-pole LPF on f_target
+  //
+  // Prevents abrupt f_coeff changes from exciting SVF transients (the main
+  // cause of envelope-mode squealing). >>>3 gives ~8-sample time constant
+  // (~0.17 ms) — transparent for manual/LFO, tames envelope jumps.
+  // =========================================================================
+  logic [COEFF_W-1:0] f_coeff;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      f_coeff <= F_MIN[COEFF_W-1:0];
+    end else if (sample_en) begin
+      f_coeff <= COEFF_W'(int'(f_coeff) + ((int'(f_target) - int'(f_coeff)) >>> 3));
+    end
   end
 
   // =========================================================================
   // Damping coefficient from resonance
   //
   // damping = 2 * (1 - Q_factor)
-  // resonance_val=0 → damping ≈ 1.8 (low Q, mild)
-  // resonance_val=255 → damping ≈ 0.05 (high Q, resonant)
+  // resonance_val=0 → damping ≈ 0.5 (Q ≈ 2, mild wah)
+  // resonance_val=255 → damping ≈ 0.2 (Q ≈ 5, sharp resonant peak)
   //
-  // Q2.14: damping = 29491 (1.8) down to 819 (0.05)
+  // Q2.14: damping = 8192 (0.5) down to 3277 (0.2)
   // =========================================================================
-  localparam int D_MAX = 29491;  // 1.8 in Q2.14
-  localparam int D_MIN = 819;    // 0.05 in Q2.14
+  localparam int D_MAX = 8192;   // 0.5 in Q2.14 → Q_min ≈ 2
+  localparam int D_MIN = 3277;   // 0.2 in Q2.14 → Q_max ≈ 5
   localparam int D_RANGE = D_MAX - D_MIN;
 
   logic [COEFF_W-1:0] d_coeff;
@@ -183,9 +261,35 @@ module wah #(
   end
 
   // =========================================================================
+  // Gain-compensated bandpass
+  //
+  // SVF bandpass gain ≈ Q at resonance. Scale by 2*d_coeff (≈ 2/Q) to tame
+  // the resonant peak while keeping wah character (~2× boost at all Q).
+  // 2*d_coeff ≤ 1.0 so result always fits in DATA_W — no saturate needed.
+  // =========================================================================
+  logic signed [DATA_W-1:0] bp_comp;
+
+  always_comb begin
+    bp_comp = DATA_W'((longint'(svf_bp) * longint'(signed'({1'b0, d_coeff}))) >>> (COEFF_FRAC - 1));
+  end
+
+  // =========================================================================
+  // Wah wet signal: bandpass peak + lowpass body (peaked-lowpass response)
+  // Adding 50% of LP preserves bass body like a real inductor-wah circuit.
+  // =========================================================================
+  logic signed [INT_W-1:0] wah_wet_wide;
+  logic signed [DATA_W-1:0] wah_wet;
+
+  always_comb begin
+    wah_wet_wide = INT_W'(signed'(bp_comp)) + (INT_W'(signed'(svf_lp)) >>> 1);
+  end
+
+  saturate #(.IN_W(INT_W), .OUT_W(DATA_W)) u_sat_wah (.din(wah_wet_wide), .dout(wah_wet));
+
+  // =========================================================================
   // Dry/wet mix
   //
-  // mix_val=0: pure dry, 255: pure wet (bandpass)
+  // mix_val=0: pure dry, 255: pure wet (peaked lowpass)
   // =========================================================================
   localparam int MIX_W = DATA_W + CTRL_W + 1;
   logic signed [MIX_W-1:0] mix_sum;
@@ -194,7 +298,7 @@ module wah #(
 
   always_comb begin
     mix_sum = MIX_W'(longint'(audio_in) * longint'(9'(255) - 9'(mix_val))
-            + longint'(svf_bp)          * longint'({1'b0, mix_val}));
+            + longint'(wah_wet)         * longint'({1'b0, mix_val}));
     mix_shifted = mix_sum >>> CTRL_W;
   end
 

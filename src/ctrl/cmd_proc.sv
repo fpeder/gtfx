@@ -406,6 +406,7 @@ module cmd_proc (
       shadow[58] <= 8'hFF;   // depth
       shadow[59] <= 8'h00;   // mode
       shadow[60] <= 8'hFF;   // mix
+      shadow[61] <= 8'h60;   // decay
 
       // Bypass bits - all bypassed at boot
       shadow[7]  <= 8'h01;

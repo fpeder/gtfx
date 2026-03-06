@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-efx_control.py — ncurses controller for FPGA guitar effects (cmd_proc_v2).
+efxctrl.py — ncurses controller for GTFX FPGA guitar effects processor.
 
 Architecture
 ────────────
@@ -26,7 +26,8 @@ Keys (normal mode)
     TAB / Shift-TAB    Cycle effect slots (chain order)
     h / j / k / l      Vim-style navigation (left/down/up/right column)
     UP / DOWN          Navigate parameters (wraps across slots)
-    LEFT / RIGHT       Fine adjust  ±1  (±0x100 for 16-bit params)
+    LEFT / RIGHT       Coarse adjust ±16  (±0x1000 for 16-bit)
+    Shift-LEFT/RIGHT   Fine adjust  ±1  (±0x100 for 16-bit params)
     PgUp / PgDn        Coarse adjust ±16  (±0x1000 for 16-bit)
     SPACE / ENTER      Toggle bypass on/off
     c                  Enter connection editor
@@ -40,9 +41,19 @@ from __future__ import annotations
 
 import argparse
 import curses
+import os
 import sys
 import time
 import threading
+from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    try:
+        import tomli as tomllib  # type: ignore[no-redef]
+    except ModuleNotFoundError:
+        tomllib = None  # type: ignore[assignment]
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
 from typing import Optional
@@ -176,6 +187,82 @@ class Param16(Param):
 
 
 @dataclass
+class ParamPacked(Param):
+    """Param that owns a bit-range within a shared register.
+
+    Two ParamPacked siblings compose into one hardware byte.
+    """
+    bit_lo: int = 0
+    bit_hi: int = 7
+    sibling: ParamPacked | None = field(default=None, repr=False)
+
+    def __post_init__(self):
+        width = self.bit_hi - self.bit_lo + 1
+        self.lo = 0
+        self.hi = (1 << width) - 1
+        if self.value == -1:
+            mask = self.hi
+            self.value = (self.default >> self.bit_lo) & mask
+
+    @property
+    def step_fine(self) -> int:
+        return 1
+
+    @property
+    def step_coarse(self) -> int:
+        return max(1, (self.hi + 1) // 8)
+
+    def _compose(self) -> int:
+        """Build the full hardware byte from self + sibling."""
+        val = self.value << self.bit_lo
+        if self.sibling is not None:
+            val |= self.sibling.value << self.sibling.bit_lo
+        return val & 0xFF
+
+    def format_value(self) -> str:
+        return f"  {self.value:02X}"
+
+    def format_cmd_value(self) -> str:
+        return f"{self._compose():02X}"
+
+
+MODE_LABELS = {0: "DIG", 1: "TAPE", 2: "ANA"}
+
+
+class ParamPackedMode(ParamPacked):
+    """Mode selector with named display values."""
+
+    def __post_init__(self):
+        super().__post_init__()
+        self.hi = len(MODE_LABELS) - 1  # 0..2
+
+    is_enum = True
+
+    def format_value(self) -> str:
+        return f" {MODE_LABELS.get(self.value, '???')}"
+
+
+@dataclass
+class ParamEnum(Param):
+    """Mode selector param with named labels instead of a bar."""
+    labels: dict[int, str] = field(default_factory=dict)
+
+    is_enum = True
+
+    def __post_init__(self):
+        super().__post_init__()
+        if self.labels:
+            self.hi = len(self.labels) - 1
+
+    @property
+    def step_coarse(self) -> int:
+        return 1
+
+    def format_value(self) -> str:
+        return f" {self.labels.get(self.value, '???')}"
+
+
+@dataclass
 class EffectSlot:
     """One effect pedal: parameters + bypass state."""
     tag: str  # 3-char CLI tag  (e.g. "trm")
@@ -224,12 +311,15 @@ EFFECT_DEFS: list[EffectSlot] = [
     EffectSlot("dly",
                "Delay",
                Port.DLY, [
-                   Param("rpt", "Repeats", 0x18, 0x64),
-                   Param("mix", "Mix", 0x19, 0x80),
-                   Param("flt", "Filter", 0x1A, 0xFF),
-                   Param16("tim", "Time", 0x1B, 0x3000),
+                   Param("rpt", "Repeats", 0x18, 0x4C),
+                   Param("mix", "Mix", 0x19, 0x60),
+                   Param("flt", "Filter", 0x1A, 0xB0),
+                   Param16("tim", "Time", 0x1B, 0x5DC0),
                    Param("mod", "Mod", 0x1D, 0x00),
-                   Param("grt", "Grit", 0x1E, 0x00),
+                   ParamPackedMode("grt", "Mode", 0x1E, 0x00,
+                                   bit_lo=0, bit_hi=1),
+                   ParamPacked("grt", "Saturation", 0x1E, 0x00,
+                               bit_lo=2, bit_hi=7),
                ],
                bypass_addr=0x1F),
     EffectSlot("fln",
@@ -266,14 +356,25 @@ EFFECT_DEFS: list[EffectSlot] = [
     EffectSlot("wah",
                "Wah / Auto-Wah",
                Port.WAH, [
-                   Param("frq", "Frequency", 0x38, 0x30),
+                   Param("frq", "Freq/Sens", 0x38, 0x30),
                    Param("res", "Resonance", 0x39, 0x60),
                    Param("dpt", "Depth", 0x3A, 0xFF),
-                   Param("mod", "Mode", 0x3B, 0x01),
+                   ParamEnum("mod", "Mode", 0x3B, 0x02,
+                             labels={0: "MAN", 1: "LFO", 2: "ENV"}),
                    Param("mix", "Mix", 0x3C, 0xFF),
+                   Param("dec", "Decay", 0x3D, 0x60),
                ],
                bypass_addr=0x3F),
 ]
+
+# Link ParamPacked siblings sharing the same address within each slot
+for _slot in EFFECT_DEFS:
+    _packed = [p for p in _slot.params if isinstance(p, ParamPacked)]
+    for i, a in enumerate(_packed):
+        for b in _packed[i + 1:]:
+            if a.addr == b.addr:
+                a.sibling = b
+                b.sibling = a
 
 
 def build_slot_dict() -> dict[str, EffectSlot]:
@@ -616,19 +717,114 @@ NUM_COLS = 2
 COL_GAP = 1  # horizontal gap between columns
 
 
-def _init_colors() -> None:
+ANSI_COLORS = {
+    "black": curses.COLOR_BLACK, "red": curses.COLOR_RED,
+    "green": curses.COLOR_GREEN, "yellow": curses.COLOR_YELLOW,
+    "blue": curses.COLOR_BLUE, "magenta": curses.COLOR_MAGENTA,
+    "cyan": curses.COLOR_CYAN, "white": curses.COLOR_WHITE,
+    "default": -1,
+}
+
+
+def _hex_to_curses(h: str) -> tuple[int, int, int]:
+    h = h.lstrip('#')
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return (r * 1000 // 255, g * 1000 // 255, b * 1000 // 255)
+
+
+def _load_theme(override: str | None = None) -> dict | None:
+    if tomllib is None:
+        return None
+    candidates: list[Path] = []
+    if override:
+        candidates.append(Path(override))
+    else:
+        env = os.environ.get("EFXCTRL_THEME")
+        if env:
+            candidates.append(Path(env))
+        candidates.append(Path.home() / ".config" / "efxctrl" / "theme.toml")
+        candidates.append(Path(__file__).resolve().parent / "efxctrl.rc")
+    for p in candidates:
+        if p.is_file():
+            try:
+                with open(p, "rb") as f:
+                    return tomllib.load(f)
+            except Exception:
+                return None
+    return None
+
+
+def _init_colors(theme: dict | None = None) -> None:
     curses.start_color()
     curses.use_default_colors()
-    curses.init_pair(Color.NORMAL, curses.COLOR_WHITE, -1)
-    curses.init_pair(Color.HEADER, curses.COLOR_BLACK, curses.COLOR_CYAN)
-    curses.init_pair(Color.ACTIVE, curses.COLOR_GREEN, -1)
-    curses.init_pair(Color.BYPASSED, curses.COLOR_BLACK, -1)
-    curses.init_pair(Color.SELECTED, curses.COLOR_BLACK, curses.COLOR_YELLOW)
-    curses.init_pair(Color.BAR, curses.COLOR_GREEN, -1)
-    curses.init_pair(Color.TITLE, curses.COLOR_BLACK, curses.COLOR_WHITE)
-    curses.init_pair(Color.LOG, curses.COLOR_GREEN, -1)
-    curses.init_pair(Color.HELP, curses.COLOR_YELLOW, -1)
-    curses.init_pair(Color.WARN, curses.COLOR_RED, -1)
+
+    pair_names = ["normal", "header", "active", "bypassed", "selected",
+                  "bar", "title", "log", "help", "warn"]
+    pair_ids = {name: getattr(Color, name.upper()) for name in pair_names}
+
+    if curses.can_change_color() and theme and "colors" in theme:
+        # Allocate curses color slots from theme
+        color_map: dict[str, int] = {"default": -1}
+        slot = 17
+        for name, hexval in theme["colors"].items():
+            r, g, b = _hex_to_curses(hexval)
+            curses.init_color(slot, r, g, b)
+            color_map[name] = slot
+            slot += 1
+        pairs = theme.get("pairs", {})
+        for name in pair_names:
+            if name in pairs:
+                fg_name, bg_name = pairs[name]
+                fg = color_map.get(fg_name, -1)
+                bg = color_map.get(bg_name, -1)
+                curses.init_pair(pair_ids[name], fg, bg)
+
+    elif curses.can_change_color() and not theme:
+        # Hard-coded Tokyo Night fallback
+        curses.init_color(17, 663, 694, 839)    # #a9b1d6 fg
+        curses.init_color(18, 478, 635, 969)    # #7aa2f7 blue
+        curses.init_color(19, 753, 788, 961)    # #c0caf5 bright fg
+        curses.init_color(20, 255, 282, 408)    # #414868 dark blue bg
+        curses.init_color(21, 157, 208, 341)    # #283457 selection bg
+        curses.init_color(22, 337, 373, 537)    # #565f89 comment gray
+        curses.init_color(23, 82,  86,  149)    # #15161e dark bg
+        curses.init_color(24, 620, 808, 416)    # #9ece6a green
+        curses.init_color(25, 878, 686, 408)    # #e0af68 yellow
+        curses.init_color(26, 969, 463, 557)    # #f7768e red/pink
+
+        curses.init_pair(Color.NORMAL,   17, -1)
+        curses.init_pair(Color.HEADER,   19, 20)
+        curses.init_pair(Color.ACTIVE,   18, -1)
+        curses.init_pair(Color.BYPASSED, 22, -1)
+        curses.init_pair(Color.SELECTED, 19, 21)
+        curses.init_pair(Color.BAR,      18, -1)
+        curses.init_pair(Color.TITLE,    23, 18)
+        curses.init_pair(Color.LOG,      24, -1)
+        curses.init_pair(Color.HELP,     25, -1)
+        curses.init_pair(Color.WARN,     26, -1)
+
+    elif not curses.can_change_color() and theme and "fallback" in theme:
+        # Use fallback ANSI names from theme
+        fallback = theme["fallback"]
+        for name in pair_names:
+            if name in fallback:
+                fg_name, bg_name = fallback[name]
+                fg = ANSI_COLORS.get(fg_name, -1)
+                bg = ANSI_COLORS.get(bg_name, -1)
+                curses.init_pair(pair_ids[name], fg, bg)
+
+    else:
+        # Hard-coded ANSI fallback
+        curses.init_pair(Color.NORMAL,   curses.COLOR_WHITE, -1)
+        curses.init_pair(Color.HEADER,   curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(Color.ACTIVE,   curses.COLOR_BLUE, -1)
+        curses.init_pair(Color.BYPASSED, curses.COLOR_BLACK, -1)
+        curses.init_pair(Color.SELECTED, curses.COLOR_BLACK, curses.COLOR_BLUE)
+        curses.init_pair(Color.BAR,      curses.COLOR_CYAN, -1)
+        curses.init_pair(Color.TITLE,    curses.COLOR_BLACK, curses.COLOR_BLUE)
+        curses.init_pair(Color.LOG,      curses.COLOR_GREEN, -1)
+        curses.init_pair(Color.HELP,     curses.COLOR_YELLOW, -1)
+        curses.init_pair(Color.WARN,     curses.COLOR_RED, -1)
 
 
 def _cp(c: Color, bold: bool = False) -> int:
@@ -652,8 +848,8 @@ def _safe(win, *args, **kwargs) -> None:
 def draw_bar(win, y: int, x: int, value: int, hi: int, width: int,
              cp: Color) -> None:
     filled = max(0, min(int(value / max(hi, 1) * width), width))
-    _safe(win, y, x, "#" * filled, _cp(cp, bold=True))
-    _safe(win, "." * (width - filled), _cp(Color.NORMAL))
+    _safe(win, y, x, "█" * filled, _cp(cp, bold=True))
+    _safe(win, "░" * (width - filled), _cp(Color.NORMAL))
 
 
 # ── effect slot ──────────────────────────────────────────────────────────
@@ -687,9 +883,9 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
         byp_text = "OFF"
         byp_attr = _cp(Color.WARN)
 
-    # Header row:  + NAME               ON +
+    # Header row:  ╭ NAME               ON ╮
     name_w = w - 2 - 4  # 4 chars for bypass tag + space
-    _safe(win, y, x, "+" + "-" * (w - 2) + "+", hdr)
+    _safe(win, y, x, "╭" + "─" * (w - 2) + "╮", hdr)
     _safe(win, y, x + 1, f" {slot.full_name.upper():<{name_w}}", hdr)
     _safe(win, y, x + 1 + name_w, f"{byp_text} ", byp_attr)
     y += 1
@@ -699,7 +895,7 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
         is_sel = is_active and i == slot.selected_param and not slot.disabled
         if is_sel:
             attr = _cp(Color.SELECTED, bold=True)
-            marker = ">"
+            marker = "▸"
         elif slot.disabled or slot.bypassed:
             attr = _cp(Color.BYPASSED)
             marker = " "
@@ -710,17 +906,20 @@ def draw_slot(win, slot: EffectSlot, y: int, x: int, is_active: bool) -> int:
         body = f"{marker}{p.label:<{_LABEL_W}} {p.format_value()} "
         border_attr = attr if is_sel else hdr
 
-        _safe(win, y, x, "|", border_attr)
+        _safe(win, y, x, "│", border_attr)
         _safe(win, y, x + 1, body, attr)
         bar_x = x + 1 + len(body)
         bar_cp = Color.SELECTED if is_sel else \
                  (Color.BAR if not slot.bypassed else Color.BYPASSED)
-        draw_bar(win, y, bar_x, p.value, p.hi, _BAR_W, bar_cp)
-        _safe(win, y, x + w - 1, "|", border_attr)
+        if getattr(p, 'is_enum', False):
+            _safe(win, y, bar_x, " " * _BAR_W, attr)
+        else:
+            draw_bar(win, y, bar_x, p.value, p.hi, _BAR_W, bar_cp)
+        _safe(win, y, x + w - 1, "│", border_attr)
         y += 1
 
     # Footer
-    _safe(win, y, x, "+" + "-" * (w - 2) + "+", hdr)
+    _safe(win, y, x, "╰" + "─" * (w - 2) + "╯", hdr)
     return y + 1
 
 
@@ -731,7 +930,7 @@ FIXED_BOT = 2  # status line + help bar
 
 
 def draw_title(scr, max_x: int, port: str, baud: int, connected: bool) -> None:
-    title = " EFX Control | cmd_proc_v2 "
+    title = " GTFX "
     conn = f" {port}@{baud}" if connected else " OFFLINE"
     line = f"{title}{conn:>{max_x - len(title) - 1}}"
     _safe(scr, 0, 0, line[:max_x - 1].ljust(max_x - 1), _cp(Color.TITLE))
@@ -741,8 +940,8 @@ def draw_chain(scr, slots: list[EffectSlot]) -> None:
     chain = "ADC"
     for s in slots:
         if not s.disabled and not s.bypassed:
-            chain += f">{s.tag}"
-    chain += ">DAC"
+            chain += f"→{s.tag}"
+    chain += "→DAC"
     _safe(scr, 1, 1, "Chain: ", _cp(Color.HELP))
     _safe(scr, chain, _cp(Color.ACTIVE, bold=True))
 
@@ -796,7 +995,7 @@ def draw_chain_editor(scr, st: "AppState") -> None:
         _safe(scr, 1, cx, f" {tag.upper()} ", attr)
         cx += 5
         if i == len(active) - 1 and disabled:
-            _safe(scr, 1, cx, "|", _cp(Color.NORMAL))
+            _safe(scr, 1, cx, "│", _cp(Color.NORMAL))
             cx += 2
     _safe(scr, 2, 1, " UP/DN:sel  u/d:move  SPC:toggle  Enter:apply  ESC:cancel ",
           _cp(Color.HELP))
@@ -852,9 +1051,9 @@ def draw_scroll_indicators(scr, max_x: int, total_h: int, viewport_h: int,
     if total_h <= viewport_h:
         return
     ind_x = min(1 + SLOT_WIDTH * NUM_COLS + COL_GAP + 1, max_x - 1)
-    _safe(scr, FIXED_TOP, ind_x, "^" if scroll_y > 0 else " ", _cp(Color.HELP))
+    _safe(scr, FIXED_TOP, ind_x, "▲" if scroll_y > 0 else " ", _cp(Color.HELP))
     _safe(scr, FIXED_TOP + viewport_h - 1, ind_x,
-          "v" if scroll_y + viewport_h < total_h else " ", _cp(Color.HELP))
+          "▼" if scroll_y + viewport_h < total_h else " ", _cp(Color.HELP))
 
 
 def draw_status(scr, y: int, max_x: int, msg: str, msg_time: float,
@@ -868,16 +1067,16 @@ def draw_status(scr, y: int, max_x: int, msg: str, msg_time: float,
 def draw_help_bar(scr, max_y: int, max_x: int, mode: "InputMode", raw_buf: str,
                   raw_field: int) -> None:
     if mode == InputMode.CONNECTION:
-        text = " CON | </>:sink  UP/DN:src  Enter:apply  ESC:cancel "
+        text = " CON │ </>:sink  UP/DN:src  Enter:apply  ESC:cancel "
     elif mode == InputMode.CHAIN_EDIT:
-        text = " CHAIN | UP/DN:sel  u/d:move  SPC:toggle  Enter:apply  ESC:cancel "
+        text = " CHAIN │ UP/DN:sel  u/d:move  SPC:toggle  Enter:apply  ESC:cancel "
     elif mode == InputMode.RAW_WRITE:
         if raw_field == 0:
-            text = f" RAW | Addr: {raw_buf}_ | 2 hex, Enter=next, ESC=cancel "
+            text = f" RAW │ Addr: {raw_buf}_ │ 2 hex, Enter=next, ESC=cancel "
         else:
-            text = f" RAW | {raw_buf[:2]}:{raw_buf[2:]}_ | 2 hex, Enter=send "
+            text = f" RAW │ {raw_buf[:2]}:{raw_buf[2:]}_ │ 2 hex, Enter=send "
     else:
-        text = (" TAB:slot hjkl:nav UP/DN:prm <>:+-1 PgU/D:+-16"
+        text = (" TAB:slot hjkl:nav UP/DN:prm <>:±16 S<S>:±1"
                 "  SPC:byp c:con o:chain s:stat w:raw q:quit ")
     _safe(scr, max_y - 1, 0, text[:max_x - 1].ljust(max_x - 1),
           _cp(Color.TITLE))
@@ -924,7 +1123,20 @@ class AppState:
 
     running: bool = True
 
+    def __post_init__(self):
+        self._sync_chain_from_route()
+
     # ── helpers ──────────────────────────────────────────────────────
+
+    def _sync_chain_from_route(self):
+        chain_ports = trace_chain(self.route)
+        self.chain_order = [PORT_TAG[p] for p in chain_ports
+                            if PORT_TAG.get(p, "adc") in self.slot_dict]
+        all_tags = [s.tag for s in EFFECT_DEFS]
+        in_chain = set(self.chain_order)
+        self.chain_disabled_set = {t for t in all_tags if t not in in_chain}
+        for tag, slot in self.slot_dict.items():
+            slot.disabled = tag in self.chain_disabled_set
 
     def flash(self, msg: str) -> None:
         self.status_msg = msg
@@ -955,12 +1167,7 @@ class AppState:
 
     def enter_chain_mode(self) -> None:
         self.mode = InputMode.CHAIN_EDIT
-        chain_ports = trace_chain(self.route)
-        self.chain_order = [PORT_TAG[p] for p in chain_ports
-                            if PORT_TAG.get(p, "adc") in self.slot_dict]
-        all_tags = [s.tag for s in EFFECT_DEFS]
-        in_chain = set(self.chain_order)
-        self.chain_disabled_set = {t for t in all_tags if t not in in_chain}
+        self._sync_chain_from_route()
         self.chain_cursor = 0
         self.flash("Chain: ^v select, u/d move, SPC toggle, Enter apply, ESC cancel")
 
@@ -1037,14 +1244,14 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
 
     # ── value adjust ──
     elif ch in (curses.KEY_RIGHT, curses.KEY_LEFT, curses.KEY_PPAGE,
-                curses.KEY_NPAGE):
+                curses.KEY_NPAGE, curses.KEY_SRIGHT, curses.KEY_SLEFT):
         if not slot.disabled:
             p = slot.params[slot.selected_param]
-            if ch in (curses.KEY_RIGHT, curses.KEY_PPAGE):
-                step = p.step_coarse if ch == curses.KEY_PPAGE else p.step_fine
+            if ch in (curses.KEY_RIGHT, curses.KEY_PPAGE, curses.KEY_SRIGHT):
+                step = p.step_fine if ch == curses.KEY_SRIGHT else p.step_coarse
                 p.value = min(p.value + step, p.hi)
             else:
-                step = p.step_coarse if ch == curses.KEY_NPAGE else p.step_fine
+                step = p.step_fine if ch == curses.KEY_SLEFT else p.step_coarse
                 p.value = max(p.value - step, p.lo)
             st.link.set_param(slot, p)
             st.flash(f"set {slot.tag} {p.name} {p.format_cmd_value()}")
@@ -1056,7 +1263,14 @@ def _handle_normal(ch: int, st: AppState, slots: list[EffectSlot],
             st.link.set_bypass(slot, not slot.bypassed)
             st.flash(f"{slot.full_name}: {'ON' if not slot.bypassed else 'OFF'}")
         else:
-            st.flash(f"{slot.full_name}: not in chain")
+            # Re-enable: remove from disabled set, apply chain
+            st.chain_disabled_set.discard(slot.tag)
+            if slot.tag not in st.chain_order:
+                st.chain_order.append(slot.tag)
+            st.apply_chain()
+            slot.bypassed = False
+            st.link.set_bypass(slot, True)
+            st.flash(f"{slot.full_name}: re-enabled in chain")
 
     # ── hjkl vim navigation (2-column grid) ──
     elif ch in (ord('j'), ord('J'), ord('k'), ord('K'),
@@ -1257,7 +1471,8 @@ def main(stdscr, args: argparse.Namespace) -> None:
     curses.curs_set(0)
     stdscr.nodelay(False)
     stdscr.timeout(100)
-    _init_colors()
+    theme = _load_theme(getattr(args, 'theme', None))
+    _init_colors(theme)
 
     # ── state ──
     link = SerialLink(args.port, args.baud)
@@ -1354,7 +1569,7 @@ def main(stdscr, args: argparse.Namespace) -> None:
 
 def run() -> None:
     parser = argparse.ArgumentParser(
-        description="ncurses GUI for FPGA effects processor (cmd_proc_v2)")
+        description="ncurses GUI for GTFX FPGA effects processor")
     parser.add_argument("--port",
                         "-p",
                         default="/dev/ttyUSB0",
@@ -1367,6 +1582,10 @@ def run() -> None:
     parser.add_argument("--offline",
                         action="store_true",
                         help="Run without serial (demo / preview mode)")
+    parser.add_argument("--theme",
+                        "-t",
+                        default=None,
+                        help="Path to theme .toml file")
     args = parser.parse_args()
 
     if not HAS_SERIAL and not args.offline:
